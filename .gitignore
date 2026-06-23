@@ -1,0 +1,44 @@
+# Build outputs
+*.exe
+*.exe~
+*.dll
+*.so
+*.dylib
+build/bin/
+
+# Test outputs
+*.test
+*.out
+coverage.out
+coverage.html
+
+# e2e build output (innerlink.exe + .stale* test artifacts)
+tests/e2e/bin/
+
+# Frontend (Wails)
+frontend/node_modules/
+frontend/dist/
+frontend/wailsjs/
+
+# Local config & runtime
+*.log
+*.tmp
+.env
+.env.local
+
+# IDE / OS
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# Go workspace
+go.work
+go.work.sum
+
+# innerlink runtime state (created by binary when launched
+# from this checkout's cwd; never source-controlled)
+.innerlink/
+received/
+innerlink.log
