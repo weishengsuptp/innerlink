@@ -118,6 +118,15 @@ type Announcer struct {
 
 	conn   *net.UDPConn   // set on Run, nil before
 	events chan PeerEvent // lifecycle notifications for consumers
+
+	// eventsMu + eventsClosed gate the close() of the events
+	// channel so emit() never panics with "send on closed
+	// channel" while the broadcast / gc loops are still
+	// running. Close happens once, after both inner loops
+	// (gcLoop + read loop) have exited, in Run's ctx.Done
+	// branch.
+	eventsMu     sync.Mutex
+	eventsClosed bool
 }
 
 // PeerEvent is a "peer joined" / "peer left" / "peer updated"
@@ -371,6 +380,12 @@ func (a *Announcer) Run(ctx context.Context) error {
 		case <-ctx.Done():
 			<-gcDone
 			<-readErr
+			// Both inner loops (gcLoop + read loop) have
+			// exited, so emit() can no longer race with us.
+			// Close the consumer events channel so the
+			// caller's `for ev := range Events()` falls out
+			// and the outer Node.Close's wg.Wait() unblocks.
+			a.closeEvents()
 			return ctx.Err()
 		case <-tick.C:
 			if err := a.broadcastOnce(); err != nil {
@@ -531,11 +546,36 @@ func (a *Announcer) gcOnce() {
 // emit sends an event on the events channel, dropping it if the
 // buffer is full. The peer table is authoritative; events are
 // a courtesy.
+//
+// Safe to call from any goroutine, including after Run has
+// called closeEvents (returns silently in that case). Holding
+// eventsMu across the send ensures no concurrent close() call
+// from Run can race with us.
 func (a *Announcer) emit(ev PeerEvent) {
+	a.eventsMu.Lock()
+	defer a.eventsMu.Unlock()
+	if a.eventsClosed {
+		return
+	}
 	select {
 	case a.events <- ev:
 	default:
 		// Consumer fell behind. They'll catch up via Peers() snapshot.
+	}
+}
+
+// closeEvents closes the consumer-facing events channel
+// exactly once. Run calls this after both the broadcast and
+// read loops have exited (in the ctx.Done branch), so emit()
+// is no longer racing with us. After this returns, any
+// in-progress `for ev := range a.Events()` loop unblocks
+// immediately and the goroutine driving it can fall through.
+func (a *Announcer) closeEvents() {
+	a.eventsMu.Lock()
+	defer a.eventsMu.Unlock()
+	if !a.eventsClosed {
+		a.eventsClosed = true
+		close(a.events)
 	}
 }
 
