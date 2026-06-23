@@ -17,7 +17,8 @@ tests/e2e/bin/
 
 # Frontend (Wails)
 frontend/node_modules/
-frontend/dist/
+frontend/dist/*
+!frontend/dist/.gitkeep
 frontend/wailsjs/
 
 # Local config & runtime

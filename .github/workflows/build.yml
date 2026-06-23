@@ -40,10 +40,25 @@ jobs:
           go-version: '1.22.5'
           cache: true
 
+      - name: setup node
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: npm
+          cache-dependency-path: frontend/package-lock.json
+
       - name: enable GOSUMDB for toolchain
         # Wails 2.12.0 依赖里可能拉到 go1.23.x toolchain; GOSUMDB=off 时 verify 失败
         run: go env -w GOSUMDB=sum.golang.org
         shell: bash
+
+      # main.go has //go:embed all:frontend/dist. CI does a clean
+      # checkout of source, so the dist directory is empty (only
+      # the .gitkeep placeholder from the repo). Build the
+      # frontend so the embed pattern matches something real.
+      - name: build frontend
+        working-directory: frontend
+        run: npm ci && npm run build
 
       - name: go test
         run: go test -count=1 -short -timeout 120s ./...
