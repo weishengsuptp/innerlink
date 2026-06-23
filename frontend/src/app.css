@@ -1,1 +1,4 @@
-/* legacy app.css — keep for build, content empty */
+/* app.css kept minimal — main.ts owns layout via injected
+ * HTML. Wails scaffold originally used this for the
+ * "Greet" demo; the demo is gone. Reserved for tiny
+ * resets / font fallbacks if we ever need them. */

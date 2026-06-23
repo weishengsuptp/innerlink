@@ -254,7 +254,7 @@ func (a *App) pumpPeers() {
 // SubscribeMessages' channel is closed.
 func (a *App) pumpMessages() {
 	for msg := range a.nd.SubscribeMessages() {
-		wruntime.EventsEmit(a.ctx, "message", msg)
+		wruntime.EventsEmit(a.ctx, "message:event", msg)
 	}
 }
 
