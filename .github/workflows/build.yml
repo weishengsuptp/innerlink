@@ -52,6 +52,18 @@ jobs:
         run: go env -w GOSUMDB=sum.golang.org
         shell: bash
 
+      # frontend/src/main.ts imports from ../wailsjs/go/app/App and
+      # ../wailsjs/runtime/runtime. Those bindings are auto-generated
+      # by `wails generate module` from the Go App methods. On a
+      # fresh CI checkout, wailsjs/ doesn't exist yet, so tsc fails.
+      # Install the wails CLI and generate the bindings before
+      # building the frontend.
+      - name: install wails CLI v2.12.0
+        run: go install github.com/wailsapp/wails/v2/cmd/wails@v2.12.0
+
+      - name: wails generate module
+        run: wails generate module
+
       # main.go has //go:embed all:frontend/dist. CI does a clean
       # checkout of source, so the dist directory is empty (only
       # the .gitkeep placeholder from the repo). Build the
