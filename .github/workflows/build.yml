@@ -1,0 +1,151 @@
+# innerlink build + test
+#
+# 三平台 build + 跑 protocol 单元测试 + 上传 binary artifact.
+#
+# Runner pin (踩过坑, 千万别升):
+#   - ubuntu-22.04  (24.04 noble 没 webkit2gtk-4.0, Wails 2.12 链接报错)
+#   - windows-latest (Wails 2.12 + Win10/11 2022H2 都行)
+#   - macos-14      (26.x sonoma+ 的 dyld 严格 LC_UUID, Wails 2.12 CLI
+#                    没这 section 起不来. 官方 v3 升了再考虑回 latest)
+#
+# Wails CLI 必须 pin v2.12.0, 跟 go.mod 一致.
+
+name: build
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    name: test (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-22.04, windows-latest, macos-14]
+    steps:
+      - name: checkout
+        uses: actions/checkout@v4
+
+      - name: setup go
+        uses: actions/setup-go@v5
+        with:
+          go-version: '1.22.5'
+          cache: true
+
+      - name: enable GOSUMDB for toolchain
+        # Wails 2.12.0 依赖里可能拉到 go1.23.x toolchain; GOSUMDB=off 时 verify 失败
+        run: go env -w GOSUMDB=sum.golang.org
+        shell: bash
+
+      - name: go test
+        run: go test -count=1 -short -timeout 120s ./...
+
+  build:
+    name: build (${{ matrix.os }})
+    needs: test
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-22.04
+            platform: linux/amd64
+            artifact: innerlink-linux-amd64
+            wails_args: ""
+          - os: windows-latest
+            platform: windows/amd64
+            artifact: innerlink-windows-amd64.exe
+            wails_args: ""
+          - os: macos-14
+            platform: darwin/universal
+            artifact: innerlink-macos-universal
+            wails_args: ""
+    steps:
+      - name: checkout
+        uses: actions/checkout@v4
+
+      - name: setup go
+        uses: actions/setup-go@v5
+        with:
+          go-version: '1.22.5'
+          cache: true
+
+      - name: setup node
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: npm
+          cache-dependency-path: frontend/package-lock.json
+
+      - name: linux prereqs (webkit2gtk-4.0)
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libwebkit2gtk-4.0-dev
+
+      - name: enable GOSUMDB for toolchain
+        run: go env -w GOSUMDB=sum.golang.org
+        shell: bash
+
+      - name: install wails CLI v2.12.0
+        run: go install github.com/wailsapp/wails/v2/cmd/wails@v2.12.0
+
+      - name: wails build
+        run: wails build -clean -platform ${{ matrix.platform }} ${{ matrix.wails_args }}
+
+      - name: verify binary exists
+        shell: bash
+        run: |
+          set -e
+          BIN="build/bin/innerlink"
+          if [ "$RUNNER_OS" == "Windows" ]; then
+            BIN="build/bin/innerlink.exe"
+          fi
+          if [ "$RUNNER_OS" == "macOS" ]; then
+            BIN="build/bin/innerlink.app/Contents/MacOS/innerlink"
+            test -d build/bin/innerlink.app
+          fi
+          test -x "$BIN" || (echo "binary not executable: $BIN" && exit 1)
+          ls -la "$BIN"
+
+      - name: upload artifact (linux)
+        if: runner.os == 'Linux'
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.artifact }}
+          path: build/bin/innerlink
+          if-no-files-found: error
+          retention-days: 30
+
+      - name: upload artifact (windows)
+        if: runner.os == 'Windows'
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.artifact }}
+          path: build/bin/innerlink.exe
+          if-no-files-found: error
+          retention-days: 30
+
+      - name: upload artifact (macos, tar app bundle)
+        if: runner.os == 'macOS'
+        run: |
+          cd build/bin
+          tar czf innerlink-macos-universal.tar.gz innerlink.app
+        shell: bash
+
+      - name: upload artifact (macos)
+        if: runner.os == 'macOS'
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.artifact }}
+          path: build/bin/innerlink-macos-universal.tar.gz
+          if-no-files-found: error
+          retention-days: 30
