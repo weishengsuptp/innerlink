@@ -509,11 +509,24 @@ func (n *Node) wrapChannel(conn *transport.Conn, sess *handshake.Session) {
 	// prefixed with file:// (frontend parses this).
 	rcv.SetOnComplete(func(name, finalPath string) {
 		log.Printf("[FILE] received %s -> %s (peer=%s)", name, finalPath, peerHexStr)
+		// Same body shape as SendFile: "file://<name>|<size>".
+		// Size is read from the saved copy on disk; falls
+		// back to bare name on stat error (UI just hides
+		// the size).
+		sizeStr := ""
+		if info, err := os.Stat(finalPath); err == nil {
+			sizeStr = humanSize(info.Size())
+		}
+		body := "file://" + name
+		if sizeStr != "" {
+			body += "|" + sizeStr
+		}
 		n.publishMessage(Message{
 			PeerID:    peerHexStr,
-			Body:      "file://" + name,
+			Body:      body,
 			Timestamp: time.Now().UTC(),
 			Direction: DirIn,
+			LocalPath: finalPath,
 		})
 	})
 	if !n.channels.set(sess.RemotePeerID, &channelState{ch: ch, rcv: rcv, peerID: append([]byte(nil), sess.RemotePeerID...)}) {

@@ -242,6 +242,42 @@ body {
 }
 .file-name { font-size: 13px; font-weight: 600; }
 .file-meta { font-size: 11px; color: var(--muted); margin-top: 2px; font-family: 'JetBrains Mono', monospace; }
+/* Outgoing file bubble: file-meta is muted gray on a
+ * green background, which is illegible. Override to a
+ * translucent white that adapts to whatever the
+ * self-bubble color is. */
+.msg.self .file-meta { color: rgba(255, 255, 255, 0.78); }
+.msg.self .file-icon { background: rgba(255, 255, 255, 0.18); color: rgba(255, 255, 255, 0.95); }
+/* Cursor + hover affordance: file bubbles are clickable. */
+.bubble.file-bubble { cursor: pointer; user-select: none; }
+.bubble.file-bubble:hover { filter: brightness(0.97); }
+.msg.self .bubble.file-bubble:hover { filter: brightness(1.06); }
+
+/* Right-click context menu for file bubbles. */
+.ctx-menu {
+  position: fixed;
+  z-index: 2000;
+  min-width: 200px;
+  background: var(--surface);
+  border: 1px solid var(--border-strong);
+  border-radius: 8px;
+  box-shadow: var(--shadow-md);
+  padding: 4px;
+  font-size: 12.5px;
+}
+.ctx-item {
+  padding: 7px 12px;
+  border-radius: 5px;
+  cursor: pointer;
+  color: var(--text);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.ctx-item:hover { background: var(--primary-soft); }
+.ctx-item.ctx-info { color: var(--muted); cursor: default; font-family: 'JetBrains Mono', monospace; font-size: 11px; }
+.ctx-item.ctx-info:hover { background: transparent; }
+.ctx-sep { height: 1px; background: var(--border); margin: 4px 0; }
 
 /* ========== Composer ========== */
 .composer {

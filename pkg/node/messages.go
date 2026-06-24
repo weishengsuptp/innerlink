@@ -3,7 +3,9 @@
 import (
 	"context"
 	"errors"
+	"fmt"
 	"log"
+	"os"
 	"strings"
 	"time"
 
@@ -26,6 +28,13 @@ type Message struct {
 	Body      string    // text body (UTF-8)
 	Timestamp time.Time // UTC; UI may render in local tz
 	Direction string    // DirIn or DirOut
+	// LocalPath is set for "file://" messages. It is the
+	// absolute path of the file on the local filesystem
+	// (the file the user picked / dropped for outbound;
+	// the saved copy in <data-dir>/received/ for inbound).
+	// The frontend uses it to wire up "double-click to
+	// open" and "right-click to reveal in folder".
+	LocalPath string
 }
 
 // SubscribeMessages returns a channel of every chat
@@ -146,11 +155,24 @@ func (n *Node) SendFile(peerRef, path string) error {
 		if i := strings.LastIndexAny(base, "/\\"); i >= 0 {
 			base = base[i+1:]
 		}
+		// Size: stat the file we just sent. Logged as
+		// human-readable in the file: message body so the
+		// GUI can show "2.4 MiB · SM4-GCM 加密" without a
+		// second fs call.
+		sizeStr := ""
+		if info, err := os.Stat(path); err == nil {
+			sizeStr = humanSize(info.Size())
+		}
+		body := "file://" + base
+		if sizeStr != "" {
+			body += "|" + sizeStr
+		}
 		n.publishMessage(Message{
 			PeerID:    peerHexStr,
-			Body:      "file://" + base,
+			Body:      body,
 			Timestamp: time.Now().UTC(),
 			Direction: DirOut,
+			LocalPath: path,
 		})
 		// Also append to the encrypted chat log so the
 		// file event persists across restarts and the GUI
@@ -160,7 +182,7 @@ func (n *Node) SendFile(peerRef, path string) error {
 			From:      n.id.PeerIDHex(),
 			To:        peerHexStr,
 			Direction: "out",
-			Body:      "file://" + base,
+			Body:      body,
 			MsgID:     "",
 		})
 	}()
@@ -261,4 +283,26 @@ func pickOther(from, to, self string) string {
 		return to
 	}
 	return from
+}
+
+// humanSize formats a byte count for the file: message
+// meta line (e.g. "2.4 MiB", "496 B"). Kept here (rather
+// than in filetransfer) because it's a UI concern, not
+// a protocol concern.
+func humanSize(n int64) string {
+	const (
+		KiB = 1024
+		MiB = 1024 * 1024
+		GiB = 1024 * 1024 * 1024
+	)
+	switch {
+	case n < KiB:
+		return fmt.Sprintf("%d B", n)
+	case n < MiB:
+		return fmt.Sprintf("%.1f KiB", float64(n)/KiB)
+	case n < GiB:
+		return fmt.Sprintf("%.1f MiB", float64(n)/MiB)
+	default:
+		return fmt.Sprintf("%.2f GiB", float64(n)/GiB)
+	}
 }

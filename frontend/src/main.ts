@@ -35,8 +35,11 @@ import {
   DialAddr,
   History,
   ListPeers,
+  OpenPath,
   Ping,
+  ReceivedFilePath,
   RemoveAlias,
+  RevealInFolder,
   Scan,
   SelfPeerID,
   SendFile,
@@ -429,22 +432,29 @@ function renderMessage(m: node.Message, peerId: string): string {
   const peer = state.peers.find(p => p.PeerID === peerId);
   const avChar = isOut ? '我' : avatarChar(peer ? peerDisplay(peer) : '');
 
-  // File message: Body has prefix "file:" (used by core
-  // filetransfer to publish a "file" message to the chat
-  // log so it shows up alongside text).
-  if (m.Body.startsWith('file:')) {
-    const name = m.Body.slice('file:'.length).split('|')[0];
-    const size = m.Body.split('|')[1] || '';
+  // File message: Body has prefix "file://" (per core
+  // pkg/node/messages.go SendFile + OnComplete), with an
+  // optional "|size" suffix for the meta line.
+  if (m.Body.startsWith('file://')) {
+    const rest = m.Body.slice('file://'.length);
+    const pipe = rest.indexOf('|');
+    const name = pipe >= 0 ? rest.slice(0, pipe) : rest;
+    const size = pipe >= 0 ? rest.slice(pipe + 1) : '';
+    // LocalPath is set by core for live messages; for
+    // history reloads (chat.enc) LocalPath is empty but
+    // the file may still be in <data-dir>/received/.
+    // The click handler resolves the actual path.
+    const dataPath = m.LocalPath || '';
     return `
       <div class="msg ${sideClass}">
         <div class="av">${escapeHtml(avChar)}</div>
         <div>
-          <div class="bubble">
+          <div class="bubble file-bubble" data-file-name="${escapeHtml(name)}" data-file-path="${escapeHtml(dataPath)}" title="双击打开 · 右键更多">
             <div class="file-msg">
               <div class="file-icon">
                 <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><path d="M14 2v6h6"/></svg>
               </div>
-              <div>
+              <div class="file-info">
                 <div class="file-name">${escapeHtml(name)}</div>
                 <div class="file-meta">${size ? escapeHtml(size) + ' · ' : ''}SM4-GCM 加密</div>
               </div>
@@ -587,7 +597,7 @@ function promptMore() {
 //
 // Files are sent on selection (📎 picker) or drop, not
 // staged into a pending card. The core publishes a
-// "file:" chat message on completion, so the receiver
+// "file://" chat message on completion, so the receiver
 // sees the file bubble in the conversation and the sender
 // sees their own outgoing file bubble — no need for an
 // intermediate "ready to send" UI step.
@@ -601,6 +611,74 @@ async function sendPickerFile(file: File) {
   const buf = new Uint8Array(await file.arrayBuffer());
   const r = await SendFileContent(state.selectedId, file.name, Array.from(buf));
   if (r) toast(`发文件失败: ${r}`);
+}
+
+// resolveFilePath returns the on-disk path for a file
+// message. Live messages carry LocalPath; history
+// reloads don't, so we fall back to the core's
+// ReceivedFilePath(<name>) which scans <data-dir>/received/.
+// Returns "" if the file can't be located.
+async function resolveFilePath(name: string, dataPath: string): Promise<string> {
+  if (dataPath) return dataPath;
+  const p = await ReceivedFilePath(name);
+  return p || '';
+}
+
+async function openFileMessage(name: string, dataPath: string) {
+  const path = await resolveFilePath(name, dataPath);
+  if (!path) {
+    toast('找不到文件: ' + name);
+    return;
+  }
+  const r = await OpenPath(path);
+  if (r) toast('打开失败: ' + r);
+}
+
+async function revealFileMessage(name: string, dataPath: string) {
+  const path = await resolveFilePath(name, dataPath);
+  if (!path) {
+    toast('找不到文件: ' + name);
+    return;
+  }
+  const r = await RevealInFolder(path);
+  if (r) toast('打开文件夹失败: ' + r);
+}
+
+// showFileContextMenu renders a small action menu at the
+// given screen coords. Used by the right-click handler on
+// .file-bubble. We re-use the same menu shape for any
+// file message (incoming or outgoing) — the actions
+// resolve the path the same way either direction.
+function showFileContextMenu(x: number, y: number, name: string, dataPath: string) {
+  hideFileContextMenu();
+  const menu = document.createElement('div');
+  menu.className = 'ctx-menu';
+  menu.id = 'file-ctx-menu';
+  menu.innerHTML = `
+    <div class="ctx-item" data-act="open">打开文件</div>
+    <div class="ctx-item" data-act="reveal">打开文件所在文件夹</div>
+    <div class="ctx-sep"></div>
+    <div class="ctx-item ctx-info" data-act="copy">复制文件名: ${escapeHtml(name)}</div>
+  `;
+  menu.style.left = x + 'px';
+  menu.style.top = y + 'px';
+  document.body.appendChild(menu);
+  menu.querySelector<HTMLElement>('[data-act="open"]')!.addEventListener('click', () => {
+    hideFileContextMenu();
+    void openFileMessage(name, dataPath);
+  });
+  menu.querySelector<HTMLElement>('[data-act="reveal"]')!.addEventListener('click', () => {
+    hideFileContextMenu();
+    void revealFileMessage(name, dataPath);
+  });
+  menu.querySelector<HTMLElement>('[data-act="copy"]')!.addEventListener('click', () => {
+    hideFileContextMenu();
+    void navigator.clipboard.writeText(name);
+  });
+}
+
+function hideFileContextMenu() {
+  document.getElementById('file-ctx-menu')?.remove();
 }
 
 // ----- event wiring -----
@@ -670,6 +748,39 @@ function wireEvents() {
   const messagesEl = document.getElementById('messages')!;
   messagesEl.addEventListener('scroll', () => {
     state.nearBottom = isNearBottom(messagesEl);
+  });
+
+  // File message interactions: double-click opens with
+  // the OS default app, right-click shows an action menu
+  // (open / reveal in folder / copy name). The handlers
+  // are bound at the messages container (not per bubble)
+  // so they survive every innerHTML rewrite from
+  // renderMessages.
+  messagesEl.addEventListener('dblclick', (ev) => {
+    const t = ev.target as HTMLElement;
+    const bubble = t.closest('.file-bubble') as HTMLElement | null;
+    if (!bubble) return;
+    const name = bubble.getAttribute('data-file-name') || '';
+    const dataPath = bubble.getAttribute('data-file-path') || '';
+    void openFileMessage(name, dataPath);
+  });
+  messagesEl.addEventListener('contextmenu', (ev) => {
+    const t = ev.target as HTMLElement;
+    const bubble = t.closest('.file-bubble') as HTMLElement | null;
+    if (!bubble) return;
+    ev.preventDefault();
+    const name = bubble.getAttribute('data-file-name') || '';
+    const dataPath = bubble.getAttribute('data-file-path') || '';
+    showFileContextMenu(ev.clientX, ev.clientY, name, dataPath);
+  });
+  // Click outside the menu to close it.
+  document.addEventListener('click', (ev) => {
+    const t = ev.target as HTMLElement;
+    if (!t.closest('#file-ctx-menu')) hideFileContextMenu();
+  });
+  // Esc closes the menu.
+  document.addEventListener('keydown', (ev) => {
+    if (ev.key === 'Escape') hideFileContextMenu();
   });
 
   // Live event streams from Go.

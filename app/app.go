@@ -34,7 +34,9 @@ import (
 	"context"
 	"fmt"
 	"log"
+	"net/url"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"runtime"
 	"time"
@@ -256,6 +258,113 @@ func (a *App) SendFileContent(peerRef, name string, content []byte) string {
 	}()
 	if err := a.nd.SendFile(peerRef, tmpPath); err != nil {
 		return err.Error()
+	}
+	return ""
+}
+
+// OpenPath opens a local file or folder with the OS
+// default application. Used by the GUI to wire
+// "double-click a file message to open" and
+// "right-click → 打开所在文件夹". Returns "" on success
+// or an error message on failure (e.g. file not found).
+//
+// Platform notes:
+//   - Windows: `cmd /c start "" <path>` hands the path to
+//     the shell's file-association handler. The empty
+//     quoted title is required (start treats the first
+//     quoted arg as a window title otherwise).
+//   - macOS: `open <path>`.
+//   - Linux: `xdg-open <path>`.
+func (a *App) OpenPath(path string) string {
+	if path == "" {
+		return "path is empty"
+	}
+	if _, err := os.Stat(path); err != nil {
+		return "file not found: " + path
+	}
+	var cmd *exec.Cmd
+	switch runtime.GOOS {
+	case "windows":
+		cmd = exec.Command("cmd", "/c", "start", "", path)
+	case "darwin":
+		cmd = exec.Command("open", path)
+	default:
+		cmd = exec.Command("xdg-open", path)
+	}
+	if err := cmd.Start(); err != nil {
+		return "open failed: " + err.Error()
+	}
+	// Release so the child process isn't tied to our
+	// lifecycle (we don't want a stuck shell to block
+	// the GUI exit).
+	go func() { _ = cmd.Wait() }()
+	return ""
+}
+
+// RevealInFolder opens the OS file manager with the
+// given file selected. Used by the right-click menu
+// "打开文件所在文件夹" item. If path is a directory it
+// just opens the directory without a selection.
+//
+// Platform notes:
+//   - Windows: `explorer /select,<path>`.
+//   - macOS: `open -R <path>` reveals in Finder.
+//   - Linux: no standard reveal; falls back to opening
+//     the parent directory via xdg-open.
+func (a *App) RevealInFolder(path string) string {
+	if path == "" {
+		return "path is empty"
+	}
+	info, err := os.Stat(path)
+	if err != nil {
+		return "file not found: " + path
+	}
+	var cmd *exec.Cmd
+	switch runtime.GOOS {
+	case "windows":
+		// explorer.exe takes /select,<path> with no
+		// space after the comma. Quoting the path is
+		// fine; explorer handles either.
+		cmd = exec.Command("explorer", "/select,"+path)
+	case "darwin":
+		cmd = exec.Command("open", "-R", path)
+	default:
+		target := path
+		if !info.IsDir() {
+			target = filepath.Dir(path)
+		}
+		cmd = exec.Command("xdg-open", target)
+	}
+	if err := cmd.Start(); err != nil {
+		return "reveal failed: " + err.Error()
+	}
+	go func() { _ = cmd.Wait() }()
+	return ""
+}
+
+// ReceivedFilePath returns the absolute path to a
+// previously-received file by its base name, or "" if
+// no such file is in <data-dir>/received/. The frontend
+// uses this to make file messages in the chat history
+// (re-loaded from chat.enc on startup, where the live
+// LocalPath was lost) clickable again.
+func (a *App) ReceivedFilePath(name string) string {
+	if name == "" {
+		return ""
+	}
+	dir := filepath.Join(a.dataDir(), "received")
+	// Try the name as-is first, then URL-decode (some
+	// browsers / file-association flows percent-encode
+	// non-ASCII names; we try both).
+	candidates := []string{name}
+	if decoded, err := url.PathUnescape(name); err == nil && decoded != name {
+		candidates = append(candidates, decoded)
+	}
+	for _, c := range candidates {
+		p := filepath.Join(dir, c)
+		if info, err := os.Stat(p); err == nil && !info.IsDir() {
+			return p
+		}
 	}
 	return ""
 }
