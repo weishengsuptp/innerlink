@@ -213,42 +213,50 @@ func (a *App) SendText(peerRef, text string) string {
 }
 
 // SendFile starts an out-of-band file transfer. path is
-// the local file; peerRef is the recipient. The receiver
-// sees the on-disk basename of path as the file's name
-// (no offerName override; the caller — the GUI drag-and-
-// drop route — already knows the user's intended name).
+// the local file; peerRef is the recipient. The file
+// is read in-place from `path` on the sender's disk
+// (no copy, no temp), so:
+//   - the chat message on the sender's side uses the
+//     original name (path's basename) and LocalPath =
+//     path, so double-click / right-click in the
+//     sender's chat opens the user's actual source file.
+//   - the receiver gets the original name as the offer
+//     name; if a file with that name already exists in
+//     <data-dir>/received/, the receiver's rename
+//     logic appends a counter ("name (1).ext") on its
+//     own.
 func (a *App) SendFile(peerRef, path string) string {
 	if a.nd == nil {
 		return "node not started"
 	}
-	if err := a.nd.SendFile(peerRef, path, ""); err != nil {
+	if err := a.nd.SendFile(peerRef, path, "", path); err != nil {
 		return err.Error()
 	}
 	return ""
 }
 
-// SendFileContent writes content to a permanent file in
-// <data-dir>/sent/, then calls SendFile with the user's
-// original name as offerName. The receiver saves under
-// that name (no timestamp prefix; the file message
-// references the user's original filename and the local
-// path is the <data-dir>/sent/ copy so double-click in
-// the chat opens it).
+// SendFileContent writes content to a temp file in
+// <data-dir>/outbox/, then calls SendFile on it. The temp
+// file is removed after the transfer completes (success
+// or error). Used by the GUI's <input type="file"> picker
+// which can't supply a real path (WebView2 has no
+// File.path accessor; Wails v2.12 has no OpenFileDialog
+// runtime API). The frontend reads the File via FileReader
+// and passes the bytes here.
 //
-// Used by the GUI's <input type="file"> picker which
-// can't supply a real path (WebView2 has no File.path
-// accessor; Wails v2.12 has no OpenFileDialog runtime
-// API). The frontend reads the File via FileReader and
-// passes the bytes here.
+// On the sender's side, the chat message:
+//   - has the user's original name (the File object's
+//     name, no timestamp prefix, no rename),
+//   - has LocalPath="" because the File API hides the
+//     real on-disk path; the user knows where they
+//     picked the file from and can find it themselves.
 //
-// We previously wrote to <data-dir>/outbox/ with a
-// "gui-<timestamp>-" prefix and deleted the temp file
-// after the transfer, but that:
-//   - mangled the receiver-side filename (got a
-//     "gui-1782269375800776800-download.png" instead of
-//     the user's "download.png"),
-//   - made the file unopenable from the chat afterwards
-//     (the temp file was already gone).
+// We do NOT keep a permanent copy of picker-sourced
+// files. The earlier "<data-dir>/sent/" copy was wrong:
+// it re-renamed the file on collision and made the
+// "open in chat" feature broken (the path the user
+// clicked on was a copy in sent/, not the user's
+// actual file).
 func (a *App) SendFileContent(peerRef, name string, content []byte) string {
 	if a.nd == nil {
 		return "node not started"
@@ -267,30 +275,31 @@ func (a *App) SendFileContent(peerRef, name string, content []byte) string {
 	if cleanName == "" || cleanName == "." || cleanName == "/" {
 		return "invalid file name: " + name
 	}
-	// derive data dir from the persisted state. node.Options
-	// defaults DataDir to <cwd>/.innerlink/ which is where
-	// logx put us. We mirror that: walk the active layout
-	// via the node's persisted store dir.
-	//
-	// We write under <data-dir>/sent/ (a permanent copy,
-	// not a temp file) so the file message's LocalPath
-	// points to a file the user can still open after the
-	// transfer completes. If a file with this name already
-	// exists in sent/ (consecutive sends of the same file
-	// from the picker), append a counter so we don't
-	// silently overwrite.
-	sentDir := filepath.Join(a.dataDir(), "sent")
-	if err := os.MkdirAll(sentDir, 0o755); err != nil {
-		return fmt.Sprintf("mkdir sent: %v", err)
+	// Write to <data-dir>/outbox/<name> as a temp file
+	// and clean it up after the transfer. We use the
+	// user's exact name (no timestamp, no "gui-" prefix,
+	// no uniquePath suffix) so the on-the-wire offer
+	// name matches what the user picked.
+	outbox := filepath.Join(a.dataDir(), "outbox")
+	if err := os.MkdirAll(outbox, 0o755); err != nil {
+		return fmt.Sprintf("mkdir outbox: %v", err)
 	}
-	finalPath := uniquePath(sentDir, cleanName)
-	if err := os.WriteFile(finalPath, content, 0o644); err != nil {
-		return fmt.Sprintf("write sent: %v", err)
+	tmpPath := filepath.Join(outbox, cleanName)
+	if err := os.WriteFile(tmpPath, content, 0o644); err != nil {
+		return fmt.Sprintf("write outbox: %v", err)
 	}
-	// Pass the user's original name as the offer name so
-	// the receiver saves under that name (not whatever we
-	// ended up with on disk after collision handling).
-	if err := a.nd.SendFile(peerRef, finalPath, cleanName); err != nil {
+	// Best-effort cleanup; SendFile may copy + stream so
+	// we give it a moment, then delete. The temp file is
+	// short-lived by design — we don't want it sticking
+	// around in outbox/ after the transfer.
+	defer func() {
+		time.Sleep(500 * time.Millisecond)
+		_ = os.Remove(tmpPath)
+	}()
+	// Pass the user's original name (cleanName) as the
+	// offer name. LocalPath="" because we don't have a
+	// real source path on the sender's disk.
+	if err := a.nd.SendFile(peerRef, tmpPath, cleanName, ""); err != nil {
 		return err.Error()
 	}
 	return ""
@@ -426,7 +435,14 @@ func revealInExplorer(path string) error {
 	if runtime.GOOS != "windows" {
 		return fmt.Errorf("revealInExplorer: not Windows")
 	}
-	cmd := exec.Command("explorer", "/select,"+path)
+	// Two-arg form: Go's runtime properly quotes the
+	// second arg, so paths with spaces / parentheses
+	// ("download (1).png") survive intact. The
+	// single-arg "/select,<path>" form lost the spaces
+	// in some Go runtime / Windows combos and the
+	// Explorer window opened but the file selection
+	// silently failed.
+	cmd := exec.Command("explorer.exe", "/select,", path)
 	cmd.SysProcAttr = &syscall.SysProcAttr{HideWindow: true}
 	return cmd.Start()
 }

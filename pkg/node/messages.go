@@ -110,12 +110,22 @@ func (n *Node) SendText(peerRef, text string) error {
 // display. If empty, the on-disk basename of path is
 // used. The GUI's picker route passes the user's
 // original filename here (the actual bytes live in a
-// temp file in <data-dir>/outbox/).
+// temp file in <data-dir>/outbox/ — which is deleted
+// shortly after the transfer, so we never want to
+// advertise the temp path as the "open me" location).
 //
-// Progress is logged to the configured log sink. UI
-// callers wanting in-app progress should subscribe to
-// the file-receiver events (TODO when we add them).
-func (n *Node) SendFile(peerRef, path, offerName string) error {
+// localPath is what the GUI should hand to the
+// double-click / right-click "open" handler on the
+// sender's chat bubble:
+//   - drag-and-drop route: the source file path on the
+//     user's disk (so opening reveals the user's own
+//     folder, not a temp copy).
+//   - picker route: "" (the File API hides the real
+//     on-disk path; the user knows where they picked
+//     the file from and can find it themselves).
+//
+// Progress is logged to the configured log sink.
+func (n *Node) SendFile(peerRef, path, offerName, localPath string) error {
 	if n.ctx == nil {
 		return errors.New("node: not started")
 	}
@@ -142,7 +152,8 @@ func (n *Node) SendFile(peerRef, path, offerName string) error {
 		log.Printf("[FILE] sending %s to %s  %d/%d bytes (%d%%)",
 			path, peerHexStr, sent, total, pct)
 	}
-	log.Printf("[FILE] start send peer=%s path=%s offerName=%s", peerHexStr, path, offerName)
+	log.Printf("[FILE] start send peer=%s path=%s offerName=%s localPath=%q",
+		peerHexStr, path, offerName, localPath)
 	n.wg.Add(1)
 	go func() {
 		defer n.wg.Done()
@@ -173,12 +184,17 @@ func (n *Node) SendFile(peerRef, path, offerName string) error {
 		if sizeStr != "" {
 			body += "|" + sizeStr
 		}
+		// Use the LocalPath the caller gave us, not the
+		// on-disk path of the temp/source file. For the
+		// picker route the caller passes "" because the
+		// temp file is going to be deleted.
+		outLocalPath := localPath
 		n.publishMessage(Message{
 			PeerID:    peerHexStr,
 			Body:      body,
 			Timestamp: time.Now().UTC(),
 			Direction: DirOut,
-			LocalPath: path,
+			LocalPath: outLocalPath,
 		})
 		// Also append to the encrypted chat log so the
 		// file event persists across restarts and the GUI

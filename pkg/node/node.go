@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"log"
 	"os"
+	"path/filepath"
 	"strings"
 	"sync"
 	"time"
@@ -509,15 +510,18 @@ func (n *Node) wrapChannel(conn *transport.Conn, sess *handshake.Session) {
 	// prefixed with file:// (frontend parses this).
 	rcv.SetOnComplete(func(name, finalPath string) {
 		log.Printf("[FILE] received %s -> %s (peer=%s)", name, finalPath, peerHexStr)
-		// Same body shape as SendFile: "file://<name>|<size>".
-		// Size is read from the saved copy on disk; falls
-		// back to bare name on stat error (UI just hides
-		// the size).
+		// The body's name field reflects what the receiver
+		// ACTUALLY saved, not the original offer name. If
+		// the receiver had to rename on collision (e.g.
+		// "download.png" -> "download (1).png"), the chat
+		// card on the receiver side should show the renamed
+		// name so the user can find the file in Explorer.
+		savedName := filepath.Base(finalPath)
 		sizeStr := ""
 		if info, err := os.Stat(finalPath); err == nil {
 			sizeStr = humanSize(info.Size())
 		}
-		body := "file://" + name
+		body := "file://" + savedName
 		if sizeStr != "" {
 			body += "|" + sizeStr
 		}
