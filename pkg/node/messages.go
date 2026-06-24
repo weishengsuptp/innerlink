@@ -106,10 +106,16 @@ func (n *Node) SendText(peerRef, text string) error {
 // minutes for GiB-sized files); this method returns
 // immediately once the goroutine is launched.
 //
+// offerName is the name the receiver should save and
+// display. If empty, the on-disk basename of path is
+// used. The GUI's picker route passes the user's
+// original filename here (the actual bytes live in a
+// temp file in <data-dir>/outbox/).
+//
 // Progress is logged to the configured log sink. UI
 // callers wanting in-app progress should subscribe to
 // the file-receiver events (TODO when we add them).
-func (n *Node) SendFile(peerRef, path string) error {
+func (n *Node) SendFile(peerRef, path, offerName string) error {
 	if n.ctx == nil {
 		return errors.New("node: not started")
 	}
@@ -136,11 +142,11 @@ func (n *Node) SendFile(peerRef, path string) error {
 		log.Printf("[FILE] sending %s to %s  %d/%d bytes (%d%%)",
 			path, peerHexStr, sent, total, pct)
 	}
-	log.Printf("[FILE] start send peer=%s path=%s", peerHexStr, path)
+	log.Printf("[FILE] start send peer=%s path=%s offerName=%s", peerHexStr, path, offerName)
 	n.wg.Add(1)
 	go func() {
 		defer n.wg.Done()
-		if err := filetransfer.Send(context.Background(), st.ch, path, progress, st.rcv.WaitForReply); err != nil {
+		if err := filetransfer.Send(context.Background(), st.ch, path, offerName, progress, st.rcv.WaitForReply); err != nil {
 			log.Printf("[ERROR] sendfile: %v", err)
 			return
 		}

@@ -88,7 +88,7 @@ func TestSendFile_WithSharedChannelPump(t *testing.T) {
 	// the Accept reply route to a registry that no
 	// chA-side dispatcher is writing to, and the
 	// sender would deadlock on wait accept.
-	if err := ft.Send(ctx, chA, srcPath, nil, senderRcv.WaitForReply); err != nil {
+	if err := ft.Send(ctx, chA, srcPath, "", nil, senderRcv.WaitForReply); err != nil {
 		t.Fatalf("Send: %v", err)
 	}
 

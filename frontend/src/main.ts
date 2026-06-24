@@ -131,19 +131,36 @@ function peerState(p: node.PeerInfo): 'online' | 'recent' | 'offline' {
 // timeAgo formats a timestamp as a Chinese relative
 // phrase. Online peers get "在线"; recent peers get
 // "刚刚" / "5 分钟前" / "30 分钟前" / "X 小时前";
-// older timestamps get days / months / years.
+// older timestamps get days / months / calendar-year
+// diff. We use calendar-year diff (now.getFullYear() -
+// t.getFullYear()) rather than elapsed time so the
+// output matches user intuition: an entry from 2024
+// is "2 年前" in 2026, not "1 年前" (elapsed 18 months
+// floors to 1 year, but the year boundary crossed).
 function timeAgo(ts: any, online: boolean): string {
   if (online) return '在线';
   if (!ts) return '';
-  const t = new Date(ts).getTime();
-  if (isNaN(t)) return '';
-  const diff = Date.now() - t;
+  const t = new Date(ts);
+  if (isNaN(t.getTime())) return '';
+  const now = new Date();
+  const diff = now.getTime() - t.getTime();
+  if (diff < 0) return ''; // future timestamp, skip
   if (diff < 60 * 1000) return '刚刚';
   if (diff < 60 * 60 * 1000) return `${Math.floor(diff / 60000)} 分钟前`;
   if (diff < 24 * 60 * 60 * 1000) return `${Math.floor(diff / 3600000)} 小时前`;
-  if (diff < 30 * 24 * 60 * 60 * 1000) return `${Math.floor(diff / 86400000)} 天前`;
-  if (diff < 365 * 24 * 60 * 60 * 1000) return `${Math.floor(diff / 2592000000)} 月前`;
-  return `${Math.floor(diff / 31536000000)} 年前`;
+  if (diff < 30 * 24 * 60 * 60 * 1000) {
+    const d = Math.floor(diff / 86400000);
+    return d === 1 ? '昨天' : `${d} 天前`;
+  }
+  // Calendar-aware: 30+ days uses year/month/day diff
+  // rather than raw elapsed milliseconds, so a Feb 2024
+  // entry in Jun 2026 reads "2 年前", not "2 年 4 个月前".
+  const yearDiff = now.getFullYear() - t.getFullYear();
+  if (yearDiff >= 1) return `${yearDiff} 年前`;
+  // Same year but 30+ days ago: count months.
+  const monthDiff = now.getMonth() - t.getMonth();
+  if (monthDiff >= 1) return `${monthDiff} 个月前`;
+  return '1 个月前';
 }
 
 // dayLabel returns the Chinese day header for a message

@@ -39,6 +39,8 @@ import (
 	"os/exec"
 	"path/filepath"
 	"runtime"
+	"strings"
+	"syscall"
 	"time"
 
 	wruntime "github.com/wailsapp/wails/v2/pkg/runtime"
@@ -211,25 +213,42 @@ func (a *App) SendText(peerRef, text string) string {
 }
 
 // SendFile starts an out-of-band file transfer. path is
-// the local file; peerRef is the recipient.
+// the local file; peerRef is the recipient. The receiver
+// sees the on-disk basename of path as the file's name
+// (no offerName override; the caller — the GUI drag-and-
+// drop route — already knows the user's intended name).
 func (a *App) SendFile(peerRef, path string) string {
 	if a.nd == nil {
 		return "node not started"
 	}
-	if err := a.nd.SendFile(peerRef, path); err != nil {
+	if err := a.nd.SendFile(peerRef, path, ""); err != nil {
 		return err.Error()
 	}
 	return ""
 }
 
-// SendFileContent writes content to a temp file in
-// <data-dir>/outbox/, then calls SendFile on it. The temp
-// file is removed after the transfer completes (success or
-// error). Used by the GUI's <input type="file"> picker
-// which can't supply a real path (WebView2 has no
-// File.path accessor; Wails v2.12 has no OpenFileDialog
-// runtime API). The frontend reads the File via FileReader
-// and passes the bytes here.
+// SendFileContent writes content to a permanent file in
+// <data-dir>/sent/, then calls SendFile with the user's
+// original name as offerName. The receiver saves under
+// that name (no timestamp prefix; the file message
+// references the user's original filename and the local
+// path is the <data-dir>/sent/ copy so double-click in
+// the chat opens it).
+//
+// Used by the GUI's <input type="file"> picker which
+// can't supply a real path (WebView2 has no File.path
+// accessor; Wails v2.12 has no OpenFileDialog runtime
+// API). The frontend reads the File via FileReader and
+// passes the bytes here.
+//
+// We previously wrote to <data-dir>/outbox/ with a
+// "gui-<timestamp>-" prefix and deleted the temp file
+// after the transfer, but that:
+//   - mangled the receiver-side filename (got a
+//     "gui-1782269375800776800-download.png" instead of
+//     the user's "download.png"),
+//   - made the file unopenable from the chat afterwards
+//     (the temp file was already gone).
 func (a *App) SendFileContent(peerRef, name string, content []byte) string {
 	if a.nd == nil {
 		return "node not started"
@@ -237,26 +256,41 @@ func (a *App) SendFileContent(peerRef, name string, content []byte) string {
 	if len(content) == 0 {
 		return "empty file content"
 	}
+	if name == "" {
+		return "empty file name"
+	}
+	// Sanitize: strip any directory components. The
+	// user-facing name comes from a browser File object
+	// and is already a basename, but we belt-and-suspenders
+	// here so a future caller can't escape the data dir.
+	cleanName := filepath.Base(name)
+	if cleanName == "" || cleanName == "." || cleanName == "/" {
+		return "invalid file name: " + name
+	}
 	// derive data dir from the persisted state. node.Options
 	// defaults DataDir to <cwd>/.innerlink/ which is where
 	// logx put us. We mirror that: walk the active layout
 	// via the node's persisted store dir.
-	outbox := filepath.Join(a.dataDir(), "outbox")
-	if err := os.MkdirAll(outbox, 0o755); err != nil {
-		return fmt.Sprintf("mkdir outbox: %v", err)
+	//
+	// We write under <data-dir>/sent/ (a permanent copy,
+	// not a temp file) so the file message's LocalPath
+	// points to a file the user can still open after the
+	// transfer completes. If a file with this name already
+	// exists in sent/ (consecutive sends of the same file
+	// from the picker), append a counter so we don't
+	// silently overwrite.
+	sentDir := filepath.Join(a.dataDir(), "sent")
+	if err := os.MkdirAll(sentDir, 0o755); err != nil {
+		return fmt.Sprintf("mkdir sent: %v", err)
 	}
-	tmpName := fmt.Sprintf("gui-%d-%s", time.Now().UnixNano(), filepath.Base(name))
-	tmpPath := filepath.Join(outbox, tmpName)
-	if err := os.WriteFile(tmpPath, content, 0o644); err != nil {
-		return fmt.Sprintf("write temp: %v", err)
+	finalPath := uniquePath(sentDir, cleanName)
+	if err := os.WriteFile(finalPath, content, 0o644); err != nil {
+		return fmt.Sprintf("write sent: %v", err)
 	}
-	// best-effort cleanup; SendFile may copy + stream so we
-	// give it a moment, then delete.
-	defer func() {
-		time.Sleep(500 * time.Millisecond)
-		_ = os.Remove(tmpPath)
-	}()
-	if err := a.nd.SendFile(peerRef, tmpPath); err != nil {
+	// Pass the user's original name as the offer name so
+	// the receiver saves under that name (not whatever we
+	// ended up with on disk after collision handling).
+	if err := a.nd.SendFile(peerRef, finalPath, cleanName); err != nil {
 		return err.Error()
 	}
 	return ""
@@ -266,13 +300,21 @@ func (a *App) SendFileContent(peerRef, name string, content []byte) string {
 // default application. Used by the GUI to wire
 // "double-click a file message to open" and
 // "right-click → 打开所在文件夹". Returns "" on success
-// or an error message on failure (e.g. file not found).
+// or an error message on failure (e.g. file not found,
+// or no association registered for that file type).
+//
+// On success, returns "". On Windows when the file has
+// no default app association, we fall back to revealing
+// the file in Explorer (which gives the user a chance to
+// double-click it, and on first launch Windows shows
+// the "Open with..." picker for the file type).
 //
 // Platform notes:
-//   - Windows: `cmd /c start "" <path>` hands the path to
-//     the shell's file-association handler. The empty
-//     quoted title is required (start treats the first
-//     quoted arg as a window title otherwise).
+//   - Windows: `rundll32 url.dll,FileProtocolHandler <path>`
+//     uses the registered file handler without spawning
+//     a visible cmd window (unlike `cmd /c start`).
+//     We HideWindow anyway for the no-association case
+//     where the underlying call may briefly create one.
 //   - macOS: `open <path>`.
 //   - Linux: `xdg-open <path>`.
 func (a *App) OpenPath(path string) string {
@@ -282,23 +324,58 @@ func (a *App) OpenPath(path string) string {
 	if _, err := os.Stat(path); err != nil {
 		return "file not found: " + path
 	}
-	var cmd *exec.Cmd
-	switch runtime.GOOS {
-	case "windows":
-		cmd = exec.Command("cmd", "/c", "start", "", path)
-	case "darwin":
-		cmd = exec.Command("open", path)
-	default:
-		cmd = exec.Command("xdg-open", path)
+	err := openWithOS(path)
+	if err == nil {
+		return ""
 	}
-	if err := cmd.Start(); err != nil {
+	// Fallback for Windows: when there's no default app
+	// for the file type, the OS shows a "no association"
+	// error popup. Reveal the file in Explorer instead —
+	// the user can double-click it (which will show the
+	// "Open with..." picker the first time) or pick
+	// another file.
+	if runtime.GOOS == "windows" {
+		revealErr := revealInExplorer(path)
+		if revealErr == nil {
+			return ""
+		}
 		return "open failed: " + err.Error()
 	}
-	// Release so the child process isn't tied to our
-	// lifecycle (we don't want a stuck shell to block
-	// the GUI exit).
-	go func() { _ = cmd.Wait() }()
-	return ""
+	return err.Error()
+}
+
+// openWithOS is the per-OS "open with default app"
+// launcher. Returns an error on failure (e.g. no
+// association registered for the file type).
+func openWithOS(path string) error {
+	switch runtime.GOOS {
+	case "windows":
+		// rundll32 url.dll,FileProtocolHandler <path> — the
+		// "shell open" path the browser uses; opens with
+		// the registered handler and stays out of the way.
+		// HideWindow avoids a brief console popup.
+		cmd := exec.Command("rundll32", "url.dll,FileProtocolHandler", path)
+		cmd.SysProcAttr = &syscall.SysProcAttr{HideWindow: true}
+		if err := cmd.Start(); err != nil {
+			return err
+		}
+		go func() { _ = cmd.Wait() }()
+		return nil
+	case "darwin":
+		cmd := exec.Command("open", path)
+		if err := cmd.Start(); err != nil {
+			return err
+		}
+		go func() { _ = cmd.Wait() }()
+		return nil
+	default:
+		cmd := exec.Command("xdg-open", path)
+		if err := cmd.Start(); err != nil {
+			return err
+		}
+		go func() { _ = cmd.Wait() }()
+		return nil
+	}
 }
 
 // RevealInFolder opens the OS file manager with the
@@ -322,10 +399,10 @@ func (a *App) RevealInFolder(path string) string {
 	var cmd *exec.Cmd
 	switch runtime.GOOS {
 	case "windows":
-		// explorer.exe takes /select,<path> with no
-		// space after the comma. Quoting the path is
-		// fine; explorer handles either.
-		cmd = exec.Command("explorer", "/select,"+path)
+		if err := revealInExplorer(path); err != nil {
+			return "reveal failed: " + err.Error()
+		}
+		return ""
 	case "darwin":
 		cmd = exec.Command("open", "-R", path)
 	default:
@@ -340,6 +417,18 @@ func (a *App) RevealInFolder(path string) string {
 	}
 	go func() { _ = cmd.Wait() }()
 	return ""
+}
+
+// revealInExplorer is the per-OS "reveal" helper.
+// Split out from RevealInFolder so OpenPath's
+// fallback can reuse it on Windows.
+func revealInExplorer(path string) error {
+	if runtime.GOOS != "windows" {
+		return fmt.Errorf("revealInExplorer: not Windows")
+	}
+	cmd := exec.Command("explorer", "/select,"+path)
+	cmd.SysProcAttr = &syscall.SysProcAttr{HideWindow: true}
+	return cmd.Start()
 }
 
 // ReceivedFilePath returns the absolute path to a
@@ -367,6 +456,35 @@ func (a *App) ReceivedFilePath(name string) string {
 		}
 	}
 	return ""
+}
+
+// uniquePath returns a path in dir for a file named
+// `name` that doesn't yet exist. If `name` itself is
+// free, it's returned as-is. Otherwise, "name (1)",
+// "name (2)", ... are tried. The result is in the
+// format "stem (N).ext" so the suffix is recognisable
+// in Explorer / Finder / Nautilus.
+//
+// We don't ask the user "overwrite / rename / cancel"
+// for v0.1 — the product copy says direct-save with
+// collision-safe names.
+func uniquePath(dir, name string) string {
+	candidate := filepath.Join(dir, name)
+	if _, err := os.Stat(candidate); err != nil {
+		return candidate
+	}
+	ext := filepath.Ext(name)
+	stem := strings.TrimSuffix(name, ext)
+	for i := 1; i < 10000; i++ {
+		c := filepath.Join(dir, fmt.Sprintf("%s (%d)%s", stem, i, ext))
+		if _, err := os.Stat(c); err != nil {
+			return c
+		}
+	}
+	// pathological fallback: 10000 collisions on the same
+	// stem. Append a nanosecond stamp to keep the file
+	// from being silently overwritten.
+	return filepath.Join(dir, fmt.Sprintf("%s-%d%s", stem, time.Now().UnixNano(), ext))
 }
 
 // dataDir returns the persistent state directory used by

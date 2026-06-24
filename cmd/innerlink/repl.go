@@ -84,7 +84,7 @@ func cmdSendFile(nd *node.Node, parts []string) {
 		log.Println("[ERROR] sendfile: peer ref is empty")
 		return
 	}
-	if err := nd.SendFile(parts[1], parts[2]); err != nil {
+	if err := nd.SendFile(parts[1], parts[2], ""); err != nil {
 		log.Printf("[ERROR] %v", err)
 	}
 }

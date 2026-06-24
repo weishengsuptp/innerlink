@@ -11,6 +11,7 @@ import (
 	"log"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"time"
 
@@ -406,7 +407,7 @@ func (r *Receiver) finalize(ctx context.Context, pf *partFile) error {
 	if pf.hashWhole.SumHex() != pf.offer.SHA256 {
 		return errors.New("full-file sha256 mismatch")
 	}
-	finalPath := filepath.Join(r.saveDir, pf.offer.Name)
+	finalPath := uniquePath(r.saveDir, pf.offer.Name)
 	if err := os.Rename(pf.path, finalPath); err != nil {
 		// Cross-device rename: fall back to copy + unlink.
 		if err := copyFile(pf.path, finalPath); err != nil {
@@ -457,4 +458,30 @@ func copyFile(src, dst string) error {
 		return err
 	}
 	return out.Close()
+}
+
+// uniquePath returns a non-existing path in dir for a
+// file named `name`. If `name` is free, returns it
+// as-is; otherwise tries "name (1)", "name (2)", ...
+// matching Windows Explorer's "copy of" / macOS Finder's
+// " 2" suffix convention. The on-complete callback gets
+// the final path so the GUI's LocalPath always points at
+// the actual on-disk file.
+func uniquePath(dir, name string) string {
+	candidate := filepath.Join(dir, name)
+	if _, err := os.Stat(candidate); err != nil {
+		return candidate
+	}
+	ext := filepath.Ext(name)
+	stem := strings.TrimSuffix(name, ext)
+	for i := 1; i < 10000; i++ {
+		c := filepath.Join(dir, fmt.Sprintf("%s (%d)%s", stem, i, ext))
+		if _, err := os.Stat(c); err != nil {
+			return c
+		}
+	}
+	// 10000 collisions on the same stem is implausible
+	// in any real P2P session; fall back to a nanosecond
+	// stamp so we never silently overwrite.
+	return filepath.Join(dir, fmt.Sprintf("%s-%d%s", stem, time.Now().UnixNano(), ext))
 }

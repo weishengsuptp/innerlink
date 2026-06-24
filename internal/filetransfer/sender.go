@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"path/filepath"
 	"time"
 
 	"github.com/weishengsuptp/innerlink/internal/protocol"
@@ -81,7 +82,7 @@ type WaitForReplyFunc func(ctx context.Context, wantType protocol.MsgType, fileI
 // goroutine that calls ch.Recv. Pass nil only if Send is the
 // sole reader of ch.Recv (e.g. in a file-only loopback test
 // where the cmd dispatcher pattern is not in use).
-func Send(ctx context.Context, ch *protocol.Channel, path string, progress ProgressFn, waitForReply WaitForReplyFunc) error {
+func Send(ctx context.Context, ch *protocol.Channel, path, offerName string, progress ProgressFn, waitForReply WaitForReplyFunc) error {
 	if waitForReply == nil {
 		waitForReply = defaultWaitForReply(ch)
 	}
@@ -99,6 +100,20 @@ func Send(ctx context.Context, ch *protocol.Channel, path string, progress Progr
 		return fmt.Errorf("filetransfer: not a regular file: %s", path)
 	}
 
+	// Resolve the offer name. The caller (the GUI's picker
+	// route, the CLI's `send` command) decides what the
+	// receiver should see. If the caller passed an empty
+	// name we fall back to the on-disk basename. We then
+	// sanitize: strip any directory components so a buggy
+	// caller can't let the receiver escape the save dir.
+	name := filepath.Base(offerName)
+	if name == "" || name == "." || name == "/" {
+		name = stat.Name()
+	}
+	if name == "" {
+		return fmt.Errorf("filetransfer: empty offer name")
+	}
+
 	// Hash the whole file up front so the Offer carries the
 	// full-file checksum. For multi-GB files this means the
 	// sender reads the file once for hashing, then a second
@@ -112,7 +127,7 @@ func Send(ctx context.Context, ch *protocol.Channel, path string, progress Progr
 	totalChunks := uint32((stat.Size() + int64(ChunkSize) - 1) / int64(ChunkSize))
 	offer := FileOffer{
 		FileID:      NewFileID(),
-		Name:        stat.Name(),
+		Name:        name,
 		Size:        stat.Size(),
 		SHA256:      fullHash,
 		TotalChunks: totalChunks,
