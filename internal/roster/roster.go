@@ -184,6 +184,17 @@ func Open(path string) (*Store, error) {
 // updated only if the new source is non-empty, and
 // Reset is sticky (existing Reset=true is preserved).
 //
+// Dedup scan (2026-06-24+): when we Add an entry with
+// a hostname + at least one addr, scan the existing
+// table for any (hostname, IP-overlap) entry with a
+// DIFFERENT peerID. Mark those Reset=true once. This
+// catches the "ghost of the previous install at this
+// address" case whether the new entry came from gossip
+// OR from the local self-entry Add at startup — the
+// latter was the source of the bug where a regenerated
+// device.key left the old self-entry visible as a peer
+// in the user's own UI.
+//
 // Returns true if the entry is new (didn't exist
 // before). Callers use this to decide whether to push
 // the new entry to connected peers for gossip.
@@ -207,6 +218,31 @@ func (s *Store) Add(e Entry) (added bool, err error) {
 	}
 	if e.LastSeen.IsZero() {
 		e.LastSeen = time.Now().UTC()
+	}
+	// Dedup scan: same as MergeFromGossip. We run it
+	// from BOTH Add and MergeFromGossip so that ghosts
+	// are caught no matter which path learns about the
+	// new peerID first. The scan only marks ghosts
+	// reset; it never overwrites or deletes them, so
+	// double-scanning is harmless.
+	if len(e.Addrs) > 0 && e.Hostname != "" {
+		for existingPID, ghost := range s.m {
+			if existingPID == e.PeerID {
+				continue
+			}
+			if ghost.Reset {
+				continue
+			}
+			if ghost.Hostname != e.Hostname {
+				continue
+			}
+			if !addrsOverlap(ghost.Addrs, e.Addrs) {
+				continue
+			}
+			ghost.Reset = true
+			s.m[existingPID] = ghost
+			s.dirty = true
+		}
 	}
 	s.m[e.PeerID] = e
 	s.dirty = true
@@ -331,20 +367,29 @@ func (s *Store) MarkReset(peerID string) error {
 
 // MergeFromGossip is the entry point for the gossip
 // protocol. It applies a remote peer's roster view
-// into our local one. Existing entries are NOT
-// refreshed (local direct observation is authoritative —
-// gossip can be stale, and we have a direct channel
-// that gives us fresher info); new entries are added;
-// missing entries are NOT removed.
+// into our local one.
+//
+// Existing entries — UPDATE RULE (2026-06-24+):
+//   - alias is the peer's OWN self-display-name. The
+//     owner is the authoritative source, so gossip
+//     always updates alias (even on existing entries).
+//     This is what makes "改了别名要广播给其他客户端"
+//     work: when A changes its alias, A's next
+//     RosterSync updates B's local alias for A.
+//   - hostname / addrs stay "local direct observation
+//     is authoritative" — gossip can be stale, and a
+//     direct channel gives fresher info. (Pre-2026-06-24
+//     behavior.) Future: same trust rule as alias if a
+//     use case shows up.
+//
+// New entries are added.
 //
 // Dedup (2026-06-24+): before adding a new entry, scan
 // the existing map for any (IP, hostname) collision
 // with a different peerID. The existing entry is the
 // "previous install at this address"; we mark it
 // Reset=true once. The new entry is then added
-// normally. The reset marker is sticky (subsequent
-// Add() calls won't un-reset), so the old peerID stays
-// hidden even if it somehow comes back online.
+// normally. The reset marker is sticky.
 //
 // Returns the list of peerIDs that were newly added —
 // the caller uses this to decide whether to schedule
@@ -361,11 +406,22 @@ func (s *Store) MergeFromGossip(remote []Entry) (newlyAdded []string, err error)
 			// prevent the rest from being adopted.
 			continue
 		}
-		if _, exists := s.m[e.PeerID]; exists {
-			// Existing entry: leave alone. Local direct
-			// observation is authoritative. Skip the
-			// dedup scan too — the (IP, hostname) we
-			// have is already the freshest known.
+		if existing, exists := s.m[e.PeerID]; exists {
+			// Same peerID: refresh only the alias.
+			// Hostname/addrs are locally authoritative.
+			// We always apply the gossip's alias, even
+			// if it equals what we already have (this
+			// also handles the "clear" path: a gossip
+			// entry with empty alias — omitempty on the
+			// wire means a cleared alias doesn't reach
+			// us, so this branch is mostly for explicit
+			// empty strings if a future wire change
+			// adds them).
+			if existing.Alias != e.Alias {
+				existing.Alias = e.Alias
+				s.m[e.PeerID] = existing
+				s.dirty = true
+			}
 			continue
 		}
 		// New entry. Dedup scan: any existing entry
@@ -386,10 +442,6 @@ func (s *Store) MergeFromGossip(remote []Entry) (newlyAdded []string, err error)
 				if !addrsOverlap(ghost.Addrs, e.Addrs) {
 					continue
 				}
-				// Mark the old entry reset. We don't
-				// touch its other fields — its alias,
-				// last_seen etc. are now stale but
-				// invisible.
 				ghost.Reset = true
 				s.m[existingPID] = ghost
 				s.dirty = true

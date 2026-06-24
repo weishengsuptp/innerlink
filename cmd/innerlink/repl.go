@@ -37,6 +37,8 @@ func replDispatch(nd *node.Node, cmd, line string, parts []string) {
 		cmdAlias(nd, parts)
 	case "unalias":
 		cmdUnalias(nd, parts)
+	case "myalias":
+		cmdMyAlias(nd, parts[1:])
 	case "peers":
 		cmdPeers(nd)
 	case "roster":
@@ -135,6 +137,45 @@ func cmdUnalias(nd *node.Node, parts []string) {
 	log.Printf("[INFO ] unaliased %s", parts[1])
 }
 
+// cmdMyAlias handles the new (2026-06-24+) self-alias
+// system: how I want other peers to call me. Distinct
+// from the legacy `alias` command (which is the per-peer
+// local nickname table). Self-alias is broadcast via
+// M5 RosterSync on every change, so the other side sees
+// the update immediately — no restart required.
+//
+//   myalias            -- show current self-alias
+//   myalias <name>     -- set self-alias to <name>
+//   myalias ""         -- clear (the empty token, after
+//                         stripping surrounding quotes
+//                         the REPL sees, signals "clear")
+//   myalias clear      -- explicit clear (avoids the
+//                         shell-quote ambiguity)
+//
+// Multiple words allowed: "myalias 老大 永远" sets the
+// alias to "老大 永远".
+func cmdMyAlias(nd *node.Node, parts []string) {
+	if len(parts) == 0 {
+		log.Printf("[MYALIAS] %q", nd.GetSelfAlias())
+		return
+	}
+	// Multiple words allowed; join with single space.
+	name := strings.Join(parts, " ")
+	// Detect "clear" intent explicitly.
+	if name == "clear" || name == "-" {
+		name = ""
+	}
+	if err := nd.SetSelfAlias(name); err != nil {
+		log.Printf("[ERROR] myalias: %v", err)
+		return
+	}
+	if name == "" {
+		log.Printf("[MYALIAS] cleared")
+	} else {
+		log.Printf("[MYALIAS] set to %q", nd.GetSelfAlias())
+	}
+}
+
 func listAliases(nd *node.Node) {
 	aliases := nd.ListAliases()
 	if len(aliases) == 0 {
@@ -179,7 +220,16 @@ func cmdPeers(nd *node.Node) {
 	})
 	log.Printf("[PEERS] %d known peer(s):", len(peers))
 	for _, p := range peers {
-		name := p.Name
+		// Display-name order (2026-06-24+):
+		//   SelfAlias (broadcast from M5) > Hostname > "(unnamed)"
+		// The legacy per-peer local-nickname (p.Name) is no
+		// longer shown here — it's the old "alias <name> <peer>"
+		// REPL command's table and isn't surfaced in the UI
+		// either.
+		name := p.SelfAlias
+		if name == "" {
+			name = p.Hostname
+		}
 		if name == "" {
 			name = "(unnamed)"
 		}
@@ -274,6 +324,7 @@ func cmdHelp() {
 	log.Println("[HELP ] alias                            -- show all aliases")
 	log.Println("[HELP ] alias <name> <peer-id-hex>      -- name a peer")
 	log.Println("[HELP ] unalias <name-or-peer-id>       -- drop an alias")
+	log.Println("[HELP ] myalias [name]                   -- set/show your broadcast self-alias (empty = clear)")
 	log.Println("[HELP ] peers                            -- list known peers + aliases")
 	log.Println("[HELP ] roster                           -- list LAN peer directory (M5 gossip)")
 	log.Println("[HELP ] roster forget <peer-id-or-alias> -- drop a peer from the local directory")
