@@ -622,6 +622,7 @@ func (n *Node) wrapChannel(conn *transport.Conn, sess *handshake.Session) {
 					remote = append(remote, roster.Entry{
 						PeerID:    e.PeerID,
 						Hostname:  e.Hostname,
+						Alias:     e.Alias,
 						Addrs:     e.Addrs,
 						FirstSeen: e.FirstSeen,
 					})
@@ -650,7 +651,12 @@ func (n *Node) wrapChannel(conn *transport.Conn, sess *handshake.Session) {
 						}
 					}
 				} else {
-					log.Printf("[ROSTER] sync from %s: 0 new (already known)", peerHexStr)
+					// Look for any alias updates in this gossip
+					// (MergeFromGossip updates aliases on existing
+					// entries even when no new entries arrive). We
+					// don't have a "what changed" return value from
+					// MergeFromGossip today, so just note the sync.
+					log.Printf("[ROSTER] sync from %s: 0 new (already known; alias may have updated)", peerHexStr)
 				}
 			case protocol.TypeScanHistory:
 				var sh protocol.ScanHistory

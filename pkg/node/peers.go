@@ -124,11 +124,23 @@ func (n *Node) ListPeers() []PeerInfo {
 	// roster entry, or roster-only with no alias).
 	out := make(map[string]*PeerInfo)
 
-	// Source 1: alias table (gives Name + LastSeen for
-	// any peer we've ever seen, including those we
-	// haven't heard from in a while). The legacy
+// Source 1: alias table (gives Name + LastSeen for
+	// any peer the USER has explicitly named). The legacy
 	// local-nickname system.
+	//
+	// IMPORTANT: aliasStore.Touch() is also called on
+	// every channel-ready / peer event (in pkg/node/node.go)
+	// to bump last_seen. Touch inserts a placeholder
+	// row with Name="" if the peer has no name yet. Those
+	// placeholders are NOT user-assigned names — they're
+	// just last-seen bookkeeping. We MUST skip them here,
+	// otherwise ghost peerIDs (e.g. a previous device.key
+	// of the same physical host that has been replaced) leak
+	// into the UI as offline "unnamed" peers.
 	for _, row := range n.aliasStore.ListWithNames() {
+		if strings.TrimSpace(row.Name) == "" {
+			continue
+		}
 		info, ok := out[row.PeerID]
 		if !ok {
 			info = &PeerInfo{PeerID: row.PeerID}
@@ -138,7 +150,7 @@ func (n *Node) ListPeers() []PeerInfo {
 		info.LastSeen = row.LastSeen
 	}
 
-	// Source 2: roster (gives Hostname + SelfAlias +
+// Source 2: roster (gives Hostname + SelfAlias +
 	// Addrs). Use ListActive() so Reset=true ghosts are
 	// filtered here, BEFORE we build PeerInfo, so the
 	// dedup logic is invisible to the UI layer.
