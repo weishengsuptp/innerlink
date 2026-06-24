@@ -24,8 +24,21 @@ type PeerInfo struct {
 	// PeerID is the 32-char lowercase hex SM2-derived ID.
 	PeerID string
 
-	// Name is the user-assigned alias, or "" if unnamed.
+	// Name is the legacy per-peer local nickname from
+	// internal/alias (the old "alias <name> <peer>"
+	// REPL table). Kept for backward compatibility with
+	// the legacy REPL commands; the GUI does NOT use
+	// this field — see SelfAlias below.
 	Name string
+
+	// SelfAlias is the peer's broadcast self-display-name
+	// (from <DataDir>/alias.txt on their side, propagated
+	// via M5 RosterSync). "" if the peer hasn't set one
+	// yet. For our own entry (IsSelf=true), this is our
+	// own self-alias from our own alias.txt. The GUI
+	// uses this field as the primary display name,
+	// falling back to Hostname and then to a placeholder.
+	SelfAlias string
 
 	// Hostname is the remote machine's hostname as
 	// announced via M5 gossip. "" if unknown.
@@ -49,6 +62,15 @@ type PeerInfo struct {
 	// (always present in the roster so we can publish
 	// "how to reach me" on the first channel-ready).
 	IsSelf bool
+
+	// Reset is the dedup one-shot marker. When true,
+	// this entry is the ghost of a previous install at
+	// the same (IP, hostname) as a newer peerID. ListPeers
+	// already filters Reset=true out (UI never sees it),
+	// but the field is exposed for diagnostic / test
+	// use. Production callers should treat any Reset=true
+	// PeerInfo as a bug.
+	Reset bool
 }
 
 // PeerEventType enumerates the kinds of transitions
@@ -84,8 +106,15 @@ func (n *Node) SubscribePeers() <-chan PeerEvent {
 
 // ListPeers returns the current view of every peer we
 // know about. Combines the alias table (for names +
-// last-seen) with the roster (for hostnames + addresses)
-// and the channel registry (for live online state).
+// last-seen) with the roster (for hostnames + addresses
+// + broadcast self-aliases) and the channel registry
+// (for live online state).
+//
+// Roster entries marked Reset=true (the dedup ghost of
+// a previous install at the same IP+hostname) are
+// filtered out here — the UI never sees them, even if
+// the underlying roster.json still has them. The filter
+// is sticky across restarts.
 //
 // Safe to call from any goroutine.
 func (n *Node) ListPeers() []PeerInfo {
@@ -97,7 +126,8 @@ func (n *Node) ListPeers() []PeerInfo {
 
 	// Source 1: alias table (gives Name + LastSeen for
 	// any peer we've ever seen, including those we
-	// haven't heard from in a while).
+	// haven't heard from in a while). The legacy
+	// local-nickname system.
 	for _, row := range n.aliasStore.ListWithNames() {
 		info, ok := out[row.PeerID]
 		if !ok {
@@ -108,22 +138,33 @@ func (n *Node) ListPeers() []PeerInfo {
 		info.LastSeen = row.LastSeen
 	}
 
-	// Source 2: roster (gives Hostname + Addrs).
-	for _, e := range n.rosterStore.List() {
+	// Source 2: roster (gives Hostname + SelfAlias +
+	// Addrs). Use ListActive() so Reset=true ghosts are
+	// filtered here, BEFORE we build PeerInfo, so the
+	// dedup logic is invisible to the UI layer.
+	for _, e := range n.rosterStore.ListActive() {
 		info, ok := out[e.PeerID]
 		if !ok {
 			info = &PeerInfo{PeerID: e.PeerID}
 			out[e.PeerID] = info
 		}
 		info.Hostname = e.Hostname
+		info.SelfAlias = e.Alias
 		info.Addrs = append([]string(nil), e.Addrs...)
 	}
 
 	// Source 3: channel registry (gives Online + isSelf
-	// + RemoteAddr as a fallback for Addrs).
+	// + RemoteAddr as a fallback for Addrs). The channel
+	// registry already filters out Reset ghosts because
+	// we never open a channel to one — but defensively
+	// skip any Reset=true entry here too, in case the
+	// channel registry ever changes that policy.
 	selfHex := n.id.PeerIDHex()
 	for _, st := range n.channels.snapshot() {
 		ph := peerHex(st.peerID)
+		if existing, ok := out[ph]; ok && existing.Reset {
+			continue
+		}
 		info, ok := out[ph]
 		if !ok {
 			info = &PeerInfo{PeerID: ph}
@@ -146,10 +187,12 @@ func (n *Node) ListPeers() []PeerInfo {
 		// the roster yet (race during construction),
 		// synthesize it from identity.
 		out[selfHex] = &PeerInfo{
-			PeerID: selfHex, IsSelf: true,
-			Hostname: localHostname(),
-			Addrs:    []string{n.ann.LocalAddr()},
-			LastSeen: time.Now(),
+			PeerID:    selfHex,
+			IsSelf:    true,
+			Hostname:  localHostname(),
+			SelfAlias: n.selfAlias.Get(),
+			Addrs:     []string{n.ann.LocalAddr()},
+			LastSeen:  time.Now(),
 		}
 	}
 

@@ -46,6 +46,7 @@ type Node struct {
 	chatStore   *storage.Store
 	aliasStore  *alias.Store
 	rosterStore *roster.Store
+	selfAlias   *selfAliasStore
 
 	// Networking.
 	ann       *discovery.Announcer
@@ -137,6 +138,13 @@ func New(opts Options) (*Node, error) {
 		_ = aliasStore.Close()
 		return nil, fmt.Errorf("open roster: %w", err)
 	}
+	selfAliasStore, err := loadSelfAlias(filepath.Join(layout.DataDir, "alias.txt"))
+	if err != nil {
+		_ = chatStore.Close()
+		_ = aliasStore.Close()
+		_ = rosterStore.Close()
+		return nil, fmt.Errorf("open self alias: %w", err)
+	}
 
 	n := &Node{
 		opts:        opts,
@@ -145,6 +153,7 @@ func New(opts Options) (*Node, error) {
 		chatStore:   chatStore,
 		aliasStore:  aliasStore,
 		rosterStore: rosterStore,
+		selfAlias:   selfAliasStore,
 		channels:    newChannelRegistry(),
 		messageCh:   make(chan Message, 64),
 		peerEventCh: make(chan PeerEvent, 64),
@@ -152,15 +161,23 @@ func New(opts Options) (*Node, error) {
 
 	// Self entry in the roster: always include ourselves
 	// so the first channel-ready send already tells the
-	// other side "this is how you reach me".
+	// other side "this is how you reach me". The alias
+	// field is the broadcast self-display-name (loaded
+	// from <DataDir>/alias.txt above; "" if unset).
 	announcer := discovery.NewAnnouncerOnPortBind(id, hostname(), uint16(opts.TCPPort), uint16(opts.UDPPort), opts.BindIP)
 	selfEntry := roster.Entry{
 		PeerID:   id.PeerIDHex(),
 		Hostname: hostname(),
+		Alias:    selfAliasStore.Get(),
 		Addrs:    []string{announcer.LocalAddr()},
 	}
 	if _, err := rosterStore.Add(selfEntry); err != nil {
 		return nil, fmt.Errorf("roster: add self: %w", err)
+	}
+	if selfEntry.Alias != "" {
+		log.Printf("[INFO ] self alias:      %q", selfEntry.Alias)
+	} else {
+		log.Printf("[INFO ] self alias:      (unset — click your sidebar header to set)")
 	}
 	log.Printf("[INFO ] self in roster: %s @ %s (%s)",
 		selfEntry.PeerID, selfEntry.Hostname, selfEntry.Addrs[0])
@@ -170,6 +187,7 @@ func New(opts Options) (*Node, error) {
 	n.autoScan = newAutoScanState(n.myIPs)
 
 	log.Printf("[INFO ] alias file: %s", layout.Aliases)
+	log.Printf("[INFO ] self-alias file: %s", filepath.Join(layout.DataDir, "alias.txt"))
 	log.Printf("[INFO ] roster file: %s", layout.Roster)
 	log.Printf("[INFO ] chat log: %d records loaded", 0) // placeholder; filled in Start
 
@@ -332,6 +350,11 @@ func (n *Node) Close() error {
 	if n.rosterStore != nil {
 		if err := n.rosterStore.Close(); err != nil {
 			log.Printf("[ERROR] close roster: %v", err)
+		}
+	}
+	if n.selfAlias != nil {
+		if err := n.selfAlias.Save(); err != nil {
+			log.Printf("[ERROR] close self alias: %v", err)
 		}
 	}
 	_ = logx.Close()
@@ -656,7 +679,12 @@ func (n *Node) wrapChannel(conn *transport.Conn, sess *handshake.Session) {
 }
 
 // sendRosterSync encodes the local roster and ships it
-// to a single peer.
+// to a single peer. Each entry carries the peer's
+// broadcast self-alias (alias.txt field) so the
+// receiver learns every peer's display name in one
+// message. Alias is omitted from the wire when empty
+// (json:"omitempty") — older clients that don't know
+// the field will see it as missing and default to "".
 func (n *Node) sendRosterSync(ch *protocol.Channel) {
 	entries := n.rosterStore.List()
 	wire := protocol.RosterSync{
@@ -666,6 +694,7 @@ func (n *Node) sendRosterSync(ch *protocol.Channel) {
 		wire.Entries = append(wire.Entries, protocol.RosterEntry{
 			PeerID:    e.PeerID,
 			Hostname:  e.Hostname,
+			Alias:     e.Alias,
 			Addrs:     e.Addrs,
 			FirstSeen: e.FirstSeen,
 		})
@@ -685,7 +714,7 @@ func (n *Node) sendRosterSync(ch *protocol.Channel) {
 
 // broadcastRosterToAll fans the local roster out to
 // every active channel except the one specified by
-// exclude (the peer we just received from 鈥?pushing
+// exclude (the peer we just received from — pushing
 // back to it is wasted bytes).
 func (n *Node) broadcastRosterToAll(exclude []byte) {
 	all := n.channels.snapshot()
@@ -695,6 +724,63 @@ func (n *Node) broadcastRosterToAll(exclude []byte) {
 		}
 		n.sendRosterSync(st.ch)
 	}
+}
+
+// GetSelfAlias returns our broadcast display name (the
+// string from <DataDir>/alias.txt, "" if unset). This
+// is what other peers will see when our roster entry
+// reaches them.
+func (n *Node) GetSelfAlias() string {
+	return n.selfAlias.Get()
+}
+
+// SetSelfAlias sets our broadcast display name. Empty
+// string clears it. Returns nil on success, or one of
+// the sentinel errors from selfalias.go (ErrNameTooLong,
+// ErrNameHasNewline) on bad input.
+//
+// When the value actually changes (compared against
+// the in-memory current), the change is persisted to
+// disk AND broadcast to every connected peer via
+// RosterSync. This satisfies the user requirement
+// "改了别名要广播给其他客户端 (只要变就广播)" — the
+// broadcast happens on every change, not just on
+// startup. Peers that come online later will pull our
+// roster on their first channel-ready, so they also
+// learn the current alias without us needing to
+// retain undelivered messages.
+func (n *Node) SetSelfAlias(name string) error {
+	changed, err := n.selfAlias.Set(name)
+	if err != nil {
+		return err
+	}
+	if !changed {
+		return nil
+	}
+	if err := n.selfAlias.Save(); err != nil {
+		// Roll back in-memory state? No — disk write
+		// failure is rare and the next SetSelfAlias
+		// call will retry. Logging is enough.
+		log.Printf("[ERROR] self alias save: %v", err)
+		return err
+	}
+	// Update the local self-entry in the roster so the
+	// next RosterSync we send carries the new alias
+	// for ourselves.
+	selfHex := n.id.PeerIDHex()
+	if existing, err := n.rosterStore.Get(selfHex); err == nil {
+		existing.Alias = n.selfAlias.Get()
+		if _, addErr := n.rosterStore.Add(existing); addErr != nil {
+			log.Printf("[WARN ] roster self-alias refresh: %v", addErr)
+		}
+	}
+	log.Printf("[INFO ] self alias updated: %q", n.selfAlias.Get())
+	// Broadcast to every connected peer (exclude nil —
+	// we want EVERY peer to get this, including the
+	// ones that just received our old alias in their
+	// last RosterSync; they need the update too).
+	n.broadcastRosterToAll(nil)
+	return nil
 }
 
 // sendScanHistory sends the v0.5.3 scan-history gossip

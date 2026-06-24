@@ -10,13 +10,22 @@
 // events ("peer:event", "message:event") emitted from
 // app/app.go.
 //
+// 2026-06-24+: aliases are broadcast self-display-names
+// (M5 RosterSync), NOT per-peer local nicknames. The
+// sidebar's .me box is the only UI affordance to set
+// your own alias; clicking it prompts for the new
+// value. Other peers' aliases are read from
+// PeerInfo.SelfAlias (populated by Go from roster).
+// peerID is never shown in the UI — internal routing
+// key only.
+//
 // Features this file implements:
 //   - sidebar: peer list with 3-state dot (online/recent/
 //     offline), relative time, alias + IP in meta,
-//     unread badge.
+//     unread badge; .me self header (click to alias).
 //   - chat header: 38px avatar with first character,
-//     peer name + alias + peerID + IP:PORT, icon buttons
-//     (ping / 文件 / 更多).
+//     peer alias (or hostname fallback) + IP:PORT, icon
+//     buttons (ping / 文件 / 更多).
 //   - messages: 28px avatar on each message, day-divider
 //     when day changes, centered system hint about E2E
 //     encryption, file cards with size + "SM4-GCM 加密".
@@ -39,34 +48,36 @@ import {
   OpenPath,
   Ping,
   ReceivedFilePath,
-  RemoveAlias,
   RevealInFolder,
   Scan,
   SelfPeerID,
   SendFile,
   SendFileContent,
   SendText,
-  SetAlias,
+  SetMyAlias,
 } from '../wailsjs/go/app/App';
 import { EventsOn, OnFileDrop } from '../wailsjs/runtime/runtime';
 import { node } from '../wailsjs/go/models';
 
 // ----- in-memory state -----
+//
+// peer-display-name policy (2026-06-24+):
+//   list / chat header / self header: alias || hostname || '-'
+//   peerID is NEVER shown to the user — it's an internal
+//   routing key only. Alias comes from M5 RosterSync
+//   (broadcast self-display-name, the new <data-dir>/alias.txt
+//   concept); the legacy internal/alias per-peer table is NOT
+//   used by the GUI.
 interface UIState {
   selfId: string;
   selfEntry: node.PeerInfo | null;
   peers: node.PeerInfo[];             // peers minus self
   selectedId: string | null;          // peer hex ID of open conversation
   history: Map<string, node.Message[]>; // peer hex ID -> msgs
-  aliases: Map<string, string>;       // peer hex ID -> alias
   // nearBottom: are we within ~60px of the message list
   // bottom? Used by renderMessages to decide whether to
   // auto-stick to bottom on new incoming messages.
   nearBottom: boolean;
-  // autoAliased: peer hex IDs we've already auto-aliased
-  // from their hostname (avoids spamming SetAlias on
-  // every peer:event when nothing changed).
-  autoAliased: Set<string>;
   // unreadCount: peer hex ID -> number of incoming
   // messages not yet seen. Reset to 0 in selectPeer.
   unreadCount: Map<string, number>;
@@ -78,9 +89,7 @@ const state: UIState = {
   peers: [],
   selectedId: null,
   history: new Map(),
-  aliases: new Map(),
   nearBottom: true,
-  autoAliased: new Set(),
   unreadCount: new Map(),
 };
 
@@ -191,7 +200,10 @@ function dayLabel(ts: any): string {
 }
 
 function peerDisplay(p: node.PeerInfo): string {
-  return p.Name || (p.Hostname ? p.Hostname : `peer ${shortId(p.PeerID)}`);
+  // Display-name policy: alias (broadcast from M5
+  // RosterSync) wins; else hostname; else "-". peerID
+  // is NOT shown anywhere — internal routing only.
+  return p.SelfAlias || p.Hostname || '-';
 }
 
 function selectedPeer(): node.PeerInfo | null {
@@ -227,10 +239,6 @@ function mount() {
         </div>
         <div class="peer-list" id="peer-list"></div>
         <div class="sidebar-footer">
-          <button class="btn-mini" id="btn-alias-create" title="给 IP 起名字">
-            <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2"><path d="M12 5v14M5 12h14"/></svg>
-            alias
-          </button>
           <button class="btn-mini" id="btn-scan" title="扫描 IP 段">
             <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2"><circle cx="11" cy="11" r="7"/><path d="m21 21-4.3-4.3"/></svg>
             scan
@@ -295,15 +303,36 @@ function renderMe() {
   const name = document.getElementById('me-name')!;
   const host = document.getElementById('me-host')!;
   const status = document.getElementById('me-status')!;
+  const meBox = document.querySelector('.me')!;
   if (!self) {
     name.textContent = '—';
     host.textContent = '本机 · —';
     status.textContent = '启动中…';
+    meBox.classList.remove('me-clickable');
     return;
   }
-  name.textContent = self.Name || self.Hostname || shortId(self.PeerID);
+  // Self display-name: alias wins (set by the user via
+  // SetMyAlias), else hostname. If unset, show a hint
+  // "点我设置" so the user knows they CAN set one.
+  const display = self.SelfAlias || self.Hostname || '';
+  if (self.SelfAlias) {
+    name.textContent = self.SelfAlias;
+    meBox.classList.add('me-set');
+    meBox.classList.remove('me-clickable');
+  } else {
+    name.textContent = '点我设置别名';
+    meBox.classList.add('me-clickable');
+    meBox.classList.remove('me-set');
+  }
   const ip = self.Addrs[0]?.split(':')[0] || '—';
-  host.textContent = `本机 · ${ip} · ${shortId(self.PeerID)}`;
+  // Sub: "本机 · IP · host · peerID-prefix" — peerID is
+  // intentionally omitted from the *display* name above
+  // but stays here for diagnostic power when needed
+  // (truncated to 8 chars). User said "UI 不显示 peerID"
+  // but the self header is our own device, not someone
+  // else's; showing our own truncated peerID is harmless
+  // and useful for cross-checking log lines.
+  host.textContent = `${display ? display + ' · ' : ''}本机 · ${ip}`;
   // Mockup shows "在线 · UDP 发现已开启" once we're up.
   // self.Online is too strict (waits for the first peer
   // announcement to round-trip), so fall back to "have
@@ -330,17 +359,15 @@ function renderPeerList() {
     const st = peerState(p);
     const unread = state.unreadCount.get(p.PeerID) || 0;
     const name = peerDisplay(p);
-    // meta line: <alias> · IP  OR  peerID · IP
-    let meta = '';
-    if (p.Name && p.Hostname) {
-      meta = `<span class="alias">${escapeHtml(p.Hostname)}</span> · ${escapeHtml(p.Addrs[0]?.split(':')[0] || '')}`;
-    } else if (p.Name) {
-      meta = `<span class="alias">${escapeHtml(p.Name)}</span>`;
-    } else if (p.Hostname) {
-      meta = `<span class="alias">${escapeHtml(p.Hostname)}</span> · ${escapeHtml(p.Addrs[0]?.split(':')[0] || '')}`;
-    } else {
-      meta = `${shortId(p.PeerID)} · ${escapeHtml(p.Addrs[0]?.split(':')[0] || '')}`;
-    }
+    // Meta line: <display-name> · IP
+    // display-name falls back through alias → hostname
+    // → "-" per peerDisplay(). peerID is intentionally
+    // not part of the user-facing string.
+    const display = peerDisplay(p);
+    const ip = escapeHtml(p.Addrs[0]?.split(':')[0] || '');
+    const meta = ip
+      ? `<span class="alias">${escapeHtml(display)}</span> · ${ip}`
+      : `<span class="alias">${escapeHtml(display)}</span>`;
     return `
       <div class="peer ${st === 'online' ? 'online' : ''} ${p.PeerID === state.selectedId ? 'active' : ''}" data-peer="${p.PeerID}">
         <span class="peer-dot ${st}"></span>
@@ -394,12 +421,18 @@ function renderChatHeader() {
   }
   avatar.textContent = avatarChar(peerDisplay(p));
   name.textContent = peerDisplay(p);
-  // sub: alias · peerID · ip:port (or just what's known)
+  // Sub line: <display-name> · IP:PORT  (no peerID; user
+  // doesn't want it shown anywhere — internal routing key
+  // only). If alias and hostname differ, show both so the
+  // user knows which is which; otherwise dedup.
   const subParts: string[] = [];
-  if (p.Name) subParts.push(p.Name);
-  subParts.push(shortId(p.PeerID));
+  if (p.SelfAlias && p.Hostname && p.SelfAlias !== p.Hostname) {
+    subParts.push(`${p.SelfAlias} (${p.Hostname})`);
+  } else if (p.Hostname) {
+    subParts.push(p.Hostname);
+  }
   if (p.Addrs[0]) subParts.push(p.Addrs[0]);
-  sub.textContent = subParts.join(' · ');
+  sub.textContent = subParts.join(' · ') || '—';
   pingBtn.disabled = !p.Online;
   dialBtn.disabled = !p.Online;
   moreBtn.disabled = false;
@@ -416,7 +449,7 @@ function renderEmpty() {
       <div>
         <div class="ico">💬</div>
         <h3>${state.selectedId ? '还没有消息' : '选一个 peer 开始聊天'}</h3>
-        <p>${state.selectedId ? '说点啥 👋' : '左侧列表选人，或点 <code>+ alias</code> 给 IP 起个名字'}</p>
+        <p>${state.selectedId ? '说点啥 👋' : '左侧列表选人，或点你的名字给自己起个对外称呼'}</p>
       </div>
     </div>
   `;
@@ -539,39 +572,19 @@ async function refreshAll() {
   }
 }
 
-async function promptAlias(peerRef: string) {
-  const p = state.peers.find(p => p.PeerID === peerRef);
-  const current = p?.Name || '';
-  const name = window.prompt(`给 ${shortId(peerRef)} 起个名字:`, current);
+async function promptMyAlias() {
+  // Click on the .me box to set your own broadcast
+  // alias (what other peers see for you). Empty clears.
+  // No first-launch popup — silent-on-open per user
+  // preference; user discovers the affordance via the
+  // "点我设置别名" hint when unset.
+  const current = state.selfEntry?.SelfAlias || '';
+  const name = window.prompt('设置你的对外称呼（空 = 清除；其他 peer 会看到这个名字）:', current);
   if (name == null) return;
   const trimmed = name.trim();
-  if (trimmed === '') {
-    const r = await RemoveAlias(peerRef);
-    if (r) toast(`删除别名: ${r}`);
-  } else {
-    const r = await SetAlias(peerRef, trimmed);
-    if (r) toast(`设置别名: ${r}`);
-  }
+  const r = await SetMyAlias(trimmed);
+  if (r) toast(`设置别名: ${r}`);
   await refreshAll();
-}
-
-// maybeAutoAlias promotes a peer's hostname into a
-// persistent alias the first time we learn it. Survives
-// restarts. We track autoAliased to avoid spamming
-// SetAlias on every peer:event.
-async function maybeAutoAlias() {
-  for (const p of state.peers) {
-    if (p.IsSelf) continue;
-    if (p.Name) continue;
-    if (!p.Hostname) continue;
-    if (state.autoAliased.has(p.PeerID)) continue;
-    state.autoAliased.add(p.PeerID);
-    const r = await SetAlias(p.PeerID, p.Hostname);
-    if (r) {
-      // Roll back so we retry next time.
-      state.autoAliased.delete(p.PeerID);
-    }
-  }
 }
 
 async function promptScan() {
@@ -596,18 +609,18 @@ async function promptDial() {
 }
 
 function promptMore() {
-  // The "more" icon-btn opens a small action sheet:
-  // rename this peer, clear chat history, etc. For v0.1
-  // we just chain to promptAlias (rename) + a confirm
-  // for clearing history.
+  // The "more" icon-btn opens a small action sheet.
+  // v0.1 mockup only has one entry here: clear chat
+  // history for the current peer. Rename moved out —
+  // aliases are now broadcast self-attributes, not
+  // per-peer local nicknames, so the rename flow
+  // doesn't make sense in the chat header anymore.
   if (!state.selectedId) return;
   const choice = window.prompt(
-    '操作: 1=重命名  2=清空聊天记录',
+    '操作: 1=清空聊天记录',
     '1',
   );
   if (choice === '1') {
-    promptAlias(state.selectedId);
-  } else if (choice === '2') {
     state.history.set(state.selectedId, []);
     renderMessages();
     toast('已清空当前聊天记录（仅本机显示）');
@@ -750,11 +763,14 @@ function wireEvents() {
   document.getElementById('btn-dial')!.addEventListener('click', () => promptDial());
   document.getElementById('btn-more')!.addEventListener('click', () => promptMore());
 
+  // Sidebar self header: click to set your own alias.
+  // This is the only path the user has to set their
+  // broadcast display name — no first-launch popup, no
+  // dedicated toolbar button. The "点我设置别名" hint
+  // inside the box is the discoverability affordance.
+  document.querySelector('.me')!.addEventListener('click', () => promptMyAlias());
+
   // Sidebar footer mini buttons.
-  document.getElementById('btn-alias-create')!.addEventListener('click', () => {
-    if (state.selectedId) promptAlias(state.selectedId);
-    else toast('先选一个 peer');
-  });
   document.getElementById('btn-scan')!.addEventListener('click', () => promptScan());
   // Debug "测试" button in the sidebar footer. Calls the
   // Go-side DebugReveal / DebugOpen which snapshot the
@@ -884,7 +900,7 @@ function wireEvents() {
 
   // Live event streams from Go.
   EventsOn('peer:event', (_ev: any) => {
-    refreshAll().then(() => maybeAutoAlias());
+    refreshAll();
   });
   EventsOn('message:event', (m: node.Message) => {
     if (!m || !m.PeerID) return;
@@ -908,7 +924,6 @@ async function bootstrap() {
   mount();
   wireEvents();
   await refreshAll();
-  await maybeAutoAlias();
 
   // Wails drag-and-drop: useDropTarget=true tells Wails
   // to only fire OnFileDrop on elements that carry the

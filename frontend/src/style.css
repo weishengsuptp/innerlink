@@ -68,6 +68,17 @@ body {
   padding: 18px 18px 14px;
   border-bottom: 1px solid var(--border);
   flex: 0 0 auto;            /* never shrink; stay at content size */
+  cursor: default;           /* default state — alias is set */
+  transition: background-color 0.12s ease;
+}
+.me.me-clickable {
+  cursor: pointer;           /* alias unset → click to set */
+}
+.me.me-clickable:hover { background-color: var(--hover, rgba(0,0,0,0.04)); }
+.me.me-clickable .me-name {
+  color: var(--muted);       /* dimmed hint when unset */
+  font-style: italic;
+  font-weight: 500;
 }
 .me-label { font-size: 11px; color: var(--muted); text-transform: uppercase; letter-spacing: 0.08em; margin-bottom: 6px; }
 .me-name { font-size: 15px; font-weight: 600; color: var(--text); display: flex; align-items: center; gap: 8px; }

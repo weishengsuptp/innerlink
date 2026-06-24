@@ -148,9 +148,18 @@ type Envelope struct {
 // format stays self-contained: the protocol package
 // never imports roster, and the conversion from
 // roster.Entry to RosterEntry lives in the cmd layer.
+//
+// 2026-06-24+: added Alias (the peer's self-chosen
+// display name, broadcast from <data-dir>/alias.txt).
+// Older senders omit the field — receivers default
+// to "" via json's missing-field semantics, which is
+// the same as "no alias set". The forward-compat path
+// (new sender → old receiver) is automatic because
+// old receivers ignore unknown fields.
 type RosterEntry struct {
 	PeerID    string    `json:"peer_id"`
 	Hostname  string    `json:"hostname"`
+	Alias     string    `json:"alias,omitempty"`
 	Addrs     []string  `json:"addrs"`
 	FirstSeen time.Time `json:"first_seen"`
 }

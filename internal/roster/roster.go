@@ -13,6 +13,10 @@
 //
 //   - peerID      : the 16-byte SM3-derived identifier (hex)
 //   - hostname    : the device's self-declared name
+//   - alias       : the device's self-chosen display name,
+//                   broadcast via M5 RosterSync (2026-06-24+)
+//                   and stored in <data-dir>/alias.txt. Owner
+//                   edits it, others only view.
 //   - addrs       : the IP:port pairs the peer is reachable at
 //                   (a multi-NIC machine publishes several)
 //   - first_seen  : when we first heard about this peer
@@ -20,10 +24,18 @@
 //
 // What does NOT go in the book (kept local):
 //
-//   - alias       : a friendly name is each user's own preference
-//                   (A wants to call B "老板", C wants to call
-//                    B "老大" — neither is "wrong", neither is
-//                    shared). See package alias.
+//   - reset       : one-shot dedup marker. When we see a NEW
+//                   (peerID, IP, hostname) come online that
+//                   collides on (IP, hostname) with an old
+//                   OFFLINE entry having a different peerID,
+//                   the old entry is "the previous host that
+//                   lived at this IP+hostname before being
+//                   reinstalled". We mark the old entry
+//                   reset=true once and hide it from the UI
+//                   forever. Reset is sticky: even if the old
+//                   peerID comes back, we keep it hidden so the
+//                   state doesn't flicker (the user said:
+//                   "一次性, 防止状态反复").
 //   - presence    : whether a peer is currently online is a
 //                   real-time local observation derived from
 //                   the active channel state. You can't trust
@@ -46,7 +58,11 @@ import (
 
 // CurrentVersion is the on-disk file format version. Bump
 // this if the JSON layout changes incompatibly.
-const CurrentVersion = 1
+//
+//   v1 (initial)         : peer_id / hostname / addrs / first_seen / last_seen / source
+//   v2 (2026-06-24+)     : + alias (broadcast self-display-name from M5 gossip)
+//                          + reset  (one-shot dedup marker — see MarkReset / MergeFromGossip)
+const CurrentVersion = 2
 
 // peerIDSize is the length of a PeerID in hex chars.
 // Kept identical to identity.PeerIDSize (32) — we
@@ -65,6 +81,11 @@ type Entry struct {
 	// change over time (DHCP, user rename); the latest
 	// gossip wins.
 	Hostname string `json:"hostname"`
+	// Alias is the device's self-chosen display name,
+	// broadcast over M5 RosterSync (added in v2). Empty
+	// when the peer hasn't set one yet. Synced across
+	// the LAN via gossip; the latest write wins.
+	Alias string `json:"alias,omitempty"`
 	// Addrs is the set of IP:port pairs this peer is
 	// reachable at. A machine with multiple NICs
 	// publishes multiple. Order is not significant.
@@ -81,6 +102,15 @@ type Entry struct {
 	// peer directly (UDP discovery or direct dial).
 	// Used for trust-chain debugging, not enforced.
 	Source string `json:"source,omitempty"`
+	// Reset is the one-shot dedup marker. When set, the
+	// UI hides this entry forever, even if the underlying
+	// peerID comes back. Set by MergeFromGossip when an
+	// online (peerID=A, IP=X, hostname=foo) collides on
+	// (IP=X, hostname=foo) with an existing offline
+	// entry (peerID=B) — meaning A is the new install
+	// at the same address, B is the ghost of the old
+	// device. Not synced; purely local.
+	Reset bool `json:"reset,omitempty"`
 }
 
 // fileFormat is the on-disk JSON shape. The "v" field
@@ -116,6 +146,12 @@ type Store struct {
 // A corrupt or unparseable file is a hard error —
 // silently starting with an empty book would be the
 // "we lost your data" failure mode.
+//
+// v1 → v2 migration: the schema added `alias` and
+// `reset` fields in v2. Both default to their zero
+// value (alias="", reset=false) when reading v1
+// data, so no special per-entry transform is needed;
+// we just bump V on the next Save.
 func Open(path string) (*Store, error) {
 	s := &Store{
 		path: path,
@@ -132,7 +168,7 @@ func Open(path string) (*Store, error) {
 	if err := json.Unmarshal(data, &f); err != nil {
 		return nil, fmt.Errorf("roster: parse %s: %w", path, err)
 	}
-	if f.V != CurrentVersion {
+	if f.V != 1 && f.V != CurrentVersion {
 		return nil, fmt.Errorf("roster: %s: unsupported version %d", path, f.V)
 	}
 	if f.Entry != nil {
@@ -143,9 +179,10 @@ func Open(path string) (*Store, error) {
 
 // Add inserts or updates an entry. Empty peerID is an
 // error (caller bug). If the entry already exists, the
-// hostname and addrs are refreshed, first_seen is kept,
-// last_seen is updated to now, and source is updated
-// only if the new source is non-empty.
+// hostname, alias, and addrs are refreshed, first_seen
+// is kept, last_seen is updated to now, source is
+// updated only if the new source is non-empty, and
+// Reset is sticky (existing Reset=true is preserved).
 //
 // Returns true if the entry is new (didn't exist
 // before). Callers use this to decide whether to push
@@ -158,8 +195,12 @@ func (s *Store) Add(e Entry) (added bool, err error) {
 	defer s.mu.Unlock()
 	existing, ok := s.m[e.PeerID]
 	if ok {
-		// Merge: keep first_seen, refresh the rest.
+		// Merge: keep first_seen; refresh hostname/alias/addrs;
+		// preserve Reset (sticky once marked).
 		e.FirstSeen = existing.FirstSeen
+		if existing.Reset {
+			e.Reset = true
+		}
 	}
 	if e.FirstSeen.IsZero() {
 		e.FirstSeen = time.Now().UTC()
@@ -221,6 +262,12 @@ func (s *Store) Touch(peerID string) {
 // PeerID (so the on-disk file and the gossip message
 // have a stable order — easier to diff in tests and
 // log analysis).
+//
+// List INCLUDES reset entries — callers that want
+// the user-facing subset should use ListActive().
+// Internal use (gossip payload, save) keeps the full
+// table so the on-disk file is the source of truth
+// and reset state survives restarts.
 func (s *Store) List() []Entry {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
@@ -234,16 +281,75 @@ func (s *Store) List() []Entry {
 	return out
 }
 
+// ListActive is the UI-facing view: every entry
+// except those marked Reset=true. Used by PeerInfo
+// aggregation in pkg/node so the user never sees a
+// ghost of the previous install at the same IP.
+//
+// Reset is sticky across restarts (lives in
+// roster.json), so this filter is stable too — once
+// an entry drops out of ListActive, it stays out.
+func (s *Store) ListActive() []Entry {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	out := make([]Entry, 0, len(s.m))
+	for _, e := range s.m {
+		if e.Reset {
+			continue
+		}
+		out = append(out, e)
+	}
+	sort.Slice(out, func(i, j int) bool {
+		return out[i].PeerID < out[j].PeerID
+	})
+	return out
+}
+
+// MarkReset sets Reset=true on the entry for peerID.
+// No-op if the entry doesn't exist or is already
+// reset. Idempotent (the whole point — "一次性,
+// 防止状态反复"). The dirty flag is set so the
+// change reaches disk on the next Save.
+func (s *Store) MarkReset(peerID string) error {
+	if !validPeerID(peerID) {
+		return fmt.Errorf("roster: peer id must be %d lowercase hex chars", peerIDSize)
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	e, ok := s.m[peerID]
+	if !ok {
+		return ErrNotFound
+	}
+	if e.Reset {
+		return nil
+	}
+	e.Reset = true
+	s.m[peerID] = e
+	s.dirty = true
+	return nil
+}
+
 // MergeFromGossip is the entry point for the gossip
 // protocol. It applies a remote peer's roster view
-// into our local one. Existing entries are refreshed
-// (hostname/addrs); new entries are added; missing
-// entries are NOT removed (we don't trust gossip
-// enough to delete locally-observed peers).
+// into our local one. Existing entries are NOT
+// refreshed (local direct observation is authoritative —
+// gossip can be stale, and we have a direct channel
+// that gives us fresher info); new entries are added;
+// missing entries are NOT removed.
+//
+// Dedup (2026-06-24+): before adding a new entry, scan
+// the existing map for any (IP, hostname) collision
+// with a different peerID. The existing entry is the
+// "previous install at this address"; we mark it
+// Reset=true once. The new entry is then added
+// normally. The reset marker is sticky (subsequent
+// Add() calls won't un-reset), so the old peerID stays
+// hidden even if it somehow comes back online.
 //
 // Returns the list of peerIDs that were newly added —
 // the caller uses this to decide whether to schedule
-// a dial to those peers (presence probe).
+// a dial to those peers (presence probe). Reset
+// victims are NOT included.
 func (s *Store) MergeFromGossip(remote []Entry) (newlyAdded []string, err error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -255,20 +361,73 @@ func (s *Store) MergeFromGossip(remote []Entry) (newlyAdded []string, err error)
 			// prevent the rest from being adopted.
 			continue
 		}
-		if _, ok := s.m[e.PeerID]; !ok {
-			if e.FirstSeen.IsZero() {
-				e.FirstSeen = time.Now().UTC()
-			}
-			if e.LastSeen.IsZero() {
-				e.LastSeen = time.Now().UTC()
-			}
-			s.m[e.PeerID] = e
-			s.dirty = true
-			newlyAdded = append(newlyAdded, e.PeerID)
+		if _, exists := s.m[e.PeerID]; exists {
+			// Existing entry: leave alone. Local direct
+			// observation is authoritative. Skip the
+			// dedup scan too — the (IP, hostname) we
+			// have is already the freshest known.
+			continue
 		}
+		// New entry. Dedup scan: any existing entry
+		// with a matching (IP, hostname) but DIFFERENT
+		// peerID is a "ghost of the previous install"
+		// — mark it reset.
+		if len(e.Addrs) > 0 && e.Hostname != "" {
+			for existingPID, ghost := range s.m {
+				if existingPID == e.PeerID {
+					continue
+				}
+				if ghost.Reset {
+					continue
+				}
+				if ghost.Hostname != e.Hostname {
+					continue
+				}
+				if !addrsOverlap(ghost.Addrs, e.Addrs) {
+					continue
+				}
+				// Mark the old entry reset. We don't
+				// touch its other fields — its alias,
+				// last_seen etc. are now stale but
+				// invisible.
+				ghost.Reset = true
+				s.m[existingPID] = ghost
+				s.dirty = true
+			}
+		}
+		if e.FirstSeen.IsZero() {
+			e.FirstSeen = time.Now().UTC()
+		}
+		if e.LastSeen.IsZero() {
+			e.LastSeen = time.Now().UTC()
+		}
+		s.m[e.PeerID] = e
+		s.dirty = true
+		newlyAdded = append(newlyAdded, e.PeerID)
 	}
 	sort.Strings(newlyAdded)
 	return newlyAdded, nil
+}
+
+// addrsOverlap returns true if two addr lists share
+// at least one IP:port. Used by MergeFromGossip to
+// decide whether two roster entries likely describe
+// the same physical host (same IP). Order-insensitive;
+// nil/empty addr lists never overlap.
+func addrsOverlap(a, b []string) bool {
+	if len(a) == 0 || len(b) == 0 {
+		return false
+	}
+	seen := make(map[string]struct{}, len(a))
+	for _, x := range a {
+		seen[x] = struct{}{}
+	}
+	for _, y := range b {
+		if _, ok := seen[y]; ok {
+			return true
+		}
+	}
+	return false
 }
 
 // Save writes the current state to disk. Idempotent.

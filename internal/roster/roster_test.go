@@ -1,6 +1,7 @@
 package roster
 
 import (
+	"os"
 	"path/filepath"
 	"strings"
 	"sync"
@@ -240,5 +241,218 @@ func TestStore_ListSorted(t *testing.T) {
 		if got[i].PeerID != w {
 			t.Errorf("List[%d].PeerID = %q, want %q", i, got[i].PeerID, w)
 		}
+	}
+}
+
+// TestStore_DedupResetOnMerge (2026-06-24+): when a
+// new (peerID, IP, hostname) arrives via gossip that
+// collides on (IP, hostname) with an existing OFFLINE
+// entry having a DIFFERENT peerID, the existing entry
+// gets Reset=true. The new entry is added normally.
+// The reset marker is sticky — even if the new entry
+// comes back with a stale state, the old one stays
+// reset.
+//
+// Scenario: VM was wiped + reinstalled (same IP,
+// same hostname, new peerID). Old peerID's ghost must
+// not flicker back into the UI when the VM comes back
+// online.
+func TestStore_DedupResetOnMerge(t *testing.T) {
+	tmp := filepath.Join(t.TempDir(), "roster.json")
+	s, _ := Open(tmp)
+
+	// Old ghost: peer A used to be at this IP+hostname,
+	// now offline. We'll seed it directly via Add.
+	const ghostID = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+	const newID = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+	s.Add(Entry{
+		PeerID:   ghostID,
+		Hostname: "vm-1",
+		Addrs:    []string{"192.168.40.5:4748"},
+	})
+
+	// Gossip arrives: new peerID B, same hostname, same IP.
+	remote := []Entry{{
+		PeerID:   newID,
+		Hostname: "vm-1",
+		Addrs:    []string{"192.168.40.5:4748"},
+	}}
+	newly, err := s.MergeFromGossip(remote)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(newly) != 1 || newly[0] != newID {
+		t.Errorf("newly added = %v, want [%s]", newly, newID)
+	}
+
+	// Old ghost should be reset.
+	ghost, _ := s.Get(ghostID)
+	if !ghost.Reset {
+		t.Errorf("old peerID %s not marked reset after dedup merge", ghostID)
+	}
+	// New entry should be present and not reset.
+	fresh, _ := s.Get(newID)
+	if fresh.Reset {
+		t.Errorf("new peerID %s should not be reset", newID)
+	}
+	if fresh.Hostname != "vm-1" {
+		t.Errorf("new Hostname = %q, want vm-1", fresh.Hostname)
+	}
+
+	// ListActive() filters the ghost out; List() keeps it
+	// (on-disk source of truth).
+	active := s.ListActive()
+	found := false
+	for _, e := range active {
+		if e.PeerID == ghostID {
+			found = true
+		}
+	}
+	if found {
+		t.Errorf("ListActive still includes reset ghost %s", ghostID)
+	}
+	all := s.List()
+	found = false
+	for _, e := range all {
+		if e.PeerID == ghostID {
+			found = true
+		}
+	}
+	if !found {
+		t.Errorf("List does not include ghost %s (on-disk source of truth)", ghostID)
+	}
+}
+
+// TestStore_DedupOnlyWhenColliding: dedup is keyed on
+// (IP, hostname) BOTH matching. Same hostname but
+// different IP must NOT dedup (could be a separate
+// machine that happens to share a name). Same IP but
+// different hostname must NOT dedup either.
+func TestStore_DedupOnlyWhenColliding(t *testing.T) {
+	tmp := filepath.Join(t.TempDir(), "roster.json")
+	s, _ := Open(tmp)
+	const oldA = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+	const oldB = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+
+	// Ghost: same hostname, different IP.
+	s.Add(Entry{PeerID: oldA, Hostname: "shared-host", Addrs: []string{"10.0.0.1:4748"}})
+	// Ghost: different hostname, same IP.
+	s.Add(Entry{PeerID: oldB, Hostname: "different-host", Addrs: []string{"192.168.40.5:4748"}})
+
+	// New entry: shared-host + 192.168.40.5 — neither
+	// ghost matches both fields.
+	s.MergeFromGossip([]Entry{{
+		PeerID:   "cccccccccccccccccccccccccccccccc",
+		Hostname: "shared-host",
+		Addrs:    []string{"192.168.40.5:4748"},
+	}})
+
+	for _, id := range []string{oldA, oldB} {
+		e, _ := s.Get(id)
+		if e.Reset {
+			t.Errorf("ghost %s wrongly marked reset (collided on only one field)", id)
+		}
+	}
+}
+
+// TestStore_DedupIsOneShot: a second collision on the
+// same ghost does NOT re-trigger any work, AND any
+// subsequent state change on the ghost (e.g. another
+// Add with a different hostname) does NOT un-reset it.
+// "一次性, 防止状态反复" — user requirement.
+func TestStore_DedupIsOneShot(t *testing.T) {
+	tmp := filepath.Join(t.TempDir(), "roster.json")
+	s, _ := Open(tmp)
+	const ghostID = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+	const newID1 = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+	const newID2 = "cccccccccccccccccccccccccccccccc"
+
+	s.Add(Entry{PeerID: ghostID, Hostname: "vm-1", Addrs: []string{"192.168.40.5:4748"}})
+	// First collision: ghost gets reset.
+	s.MergeFromGossip([]Entry{{PeerID: newID1, Hostname: "vm-1", Addrs: []string{"192.168.40.5:4748"}}})
+	if e, _ := s.Get(ghostID); !e.Reset {
+		t.Fatal("ghost not reset after first collision")
+	}
+
+	// Second collision: nothing changes.
+	s.MergeFromGossip([]Entry{{PeerID: newID2, Hostname: "vm-1", Addrs: []string{"192.168.40.5:4748"}}})
+	ghost, _ := s.Get(ghostID)
+	if !ghost.Reset {
+		t.Errorf("ghost reset state lost after second collision")
+	}
+
+	// Re-Add the ghost (e.g. some other code path
+	// touches it). Reset must stick.
+	s.Add(Entry{PeerID: ghostID, Hostname: "vm-1-updated", Addrs: []string{"192.168.40.5:4748"}})
+	ghost, _ = s.Get(ghostID)
+	if !ghost.Reset {
+		t.Errorf("ghost Reset cleared by Add — must be sticky")
+	}
+}
+
+// TestStore_MarkReset exercises the explicit API as
+// well as the idempotency contract: marking twice is
+// a no-op, marking a missing peerID is an error.
+func TestStore_MarkReset(t *testing.T) {
+	tmp := filepath.Join(t.TempDir(), "roster.json")
+	s, _ := Open(tmp)
+	const pid = "0123456789abcdef0123456789abcdef"
+	s.Add(Entry{PeerID: pid, Hostname: "x"})
+
+	// First mark: success.
+	if err := s.MarkReset(pid); err != nil {
+		t.Fatal(err)
+	}
+	if e, _ := s.Get(pid); !e.Reset {
+		t.Errorf("after MarkReset, entry.Reset = false")
+	}
+	// Second mark: idempotent no-op (no error).
+	if err := s.MarkReset(pid); err != nil {
+		t.Errorf("second MarkReset returned err = %v, want nil", err)
+	}
+	// Missing peerID: ErrNotFound.
+	if err := s.MarkReset("ffffffffffffffffffffffffffffffff"); err != ErrNotFound {
+		t.Errorf("MarkReset on missing peerID returned err = %v, want ErrNotFound", err)
+	}
+}
+
+// TestStore_OpenV1Compat: a v1 file (no alias, no
+// reset) must still load cleanly. The schema bumped
+// to v2 in 2026-06-24 to add alias + reset; v1 files
+// from before that must still work.
+func TestStore_OpenV1Compat(t *testing.T) {
+	tmp := filepath.Join(t.TempDir(), "roster.json")
+	// Hand-craft a v1 file with one entry.
+	const v1 = `{
+  "v": 1,
+  "entries": {
+    "0123456789abcdef0123456789abcdef": {
+      "peer_id": "0123456789abcdef0123456789abcdef",
+      "hostname": "legacy-host",
+      "addrs": ["192.168.40.5:4748"],
+      "first_seen": "2025-12-31T23:59:59Z",
+      "last_seen": "2025-12-31T23:59:59Z"
+    }
+  }
+}`
+	if err := os.WriteFile(tmp, []byte(v1), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	s, err := Open(tmp)
+	if err != nil {
+		t.Fatalf("Open on v1 file: %v", err)
+	}
+	e, err := s.Get("0123456789abcdef0123456789abcdef")
+	if err != nil {
+		t.Fatalf("Get on legacy entry: %v", err)
+	}
+	if e.Hostname != "legacy-host" {
+		t.Errorf("legacy Hostname = %q, want legacy-host", e.Hostname)
+	}
+	if e.Alias != "" {
+		t.Errorf("legacy Alias = %q, want empty", e.Alias)
+	}
+	if e.Reset {
+		t.Errorf("legacy Reset = true, want false")
 	}
 }

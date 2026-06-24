@@ -712,6 +712,43 @@ func (a *App) RemoveAlias(ref string) string {
 	return ""
 }
 
+// GetMyAlias returns our broadcast self-display-name
+// ("" if unset). This is the alias that other peers
+// see for us, sourced from <data-dir>/alias.txt and
+// propagated via M5 RosterSync. The frontend calls
+// this once at startup to render the sidebar's "me"
+// header.
+//
+// Distinct from ListAliases (the legacy per-peer
+// local-nickname table used by the `alias` REPL
+// command): GetMyAlias is the new self-attribute,
+// ListAliases is the old per-peer mapping.
+func (a *App) GetMyAlias() string {
+	if a.nd == nil {
+		return ""
+	}
+	return a.nd.GetSelfAlias()
+}
+
+// SetMyAlias sets our broadcast self-display-name.
+// Empty string clears it. On success, returns ""
+// (no error); on validation failure, returns the
+// error message (the user sees this via toast).
+//
+// Setting the alias triggers an immediate RosterSync
+// to every connected peer, so the change is visible
+// across the LAN within one round-trip — no need to
+// wait for the next gossip cycle.
+func (a *App) SetMyAlias(name string) string {
+	if a.nd == nil {
+		return "node not started"
+	}
+	if err := a.nd.SetSelfAlias(name); err != nil {
+		return err.Error()
+	}
+	return ""
+}
+
 // History returns the in-memory chat history for one
 // peer. JS calls this when opening a chat panel.
 func (a *App) History(peerRef string) []node.Message {
