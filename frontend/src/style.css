@@ -131,6 +131,15 @@ body {
   display: flex;
   flex-direction: column;
   background: var(--surface);
+  /* Grid item needs explicit min-height: 0 to shrink to the
+   * row track. Without it, the default min-height: auto
+   * makes the chat column grow with its content and the
+   * composer (last flex child of .chat) gets pushed off
+   * the bottom of the viewport as soon as the message
+   * list scrolls. overflow: hidden is the belt-and-suspenders
+   * companion — same trick the .messages flex child uses. */
+  min-height: 0;
+  overflow: hidden;
 }
 
 .chat-header {
