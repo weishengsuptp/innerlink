@@ -779,53 +779,85 @@ function wireEvents() {
     state.nearBottom = isNearBottom(messagesEl);
   });
 
-  // File message interactions: double-click opens with
-  // the OS default app, right-click shows an action menu
-  // (open / reveal in folder / copy name).
+  // File message interactions.
   //
-  // We bind on the document (not on messagesEl) so the
-  // handlers survive every innerHTML rewrite from
-  // renderMessages AND so we don't depend on the event
-  // bubbling through messagesEl specifically — on the
-  // receiver the messages container can be re-mounted in
-  // a way that breaks the older delegation. Document-
-  // level delegation with closest('.file-bubble') is the
-  // most robust option.
-  document.addEventListener('dblclick', (ev) => {
-    const t = ev.target as HTMLElement;
-    if (!t) return;
+  // Three trigger paths to be paranoid about WebView2
+  // event quirks on different hosts:
+  //   1. dblclick       → open file with default app
+  //   2. contextmenu    → show action menu
+  //   3. mousedown(btn2)→ show action menu (fallback if
+  //                       contextmenu is swallowed)
+  //   4. click          → show action menu (last-resort
+  //                       fallback; also helps users who
+  //                       don't know about right-click)
+  //
+  // All four are bound on the document with closest
+  // delegation so they survive every innerHTML rewrite
+  // from renderMessages AND work no matter which element
+  // inside the bubble the user clicked.
+  const findBubble = (target: EventTarget | null): {
+    bubble: HTMLElement;
+    name: string;
+    dataPath: string;
+  } | null => {
+    const t = target as HTMLElement;
+    if (!t) return null;
     const bubble = t.closest('.file-bubble') as HTMLElement | null;
-    if (!bubble) return;
-    const name = bubble.getAttribute('data-file-name') || '';
-    const dataPath = bubble.getAttribute('data-file-path') || '';
-    void openFileMessage(name, dataPath);
-  });
-  // Right-click handling. We bind BOTH contextmenu AND
-  // mousedown(button=2). Some WebView2 versions on the
-  // receiver's Windows host were observed to swallow
-  // contextmenu entirely when the message was just
-  // rendered (no observable reaction). mousedown always
-  // fires, so we use it as a fallback that calls the
-  // same handler.
-  const onFileRightClick = (ev: MouseEvent) => {
-    const t = ev.target as HTMLElement;
-    if (!t) return;
-    const bubble = t.closest('.file-bubble') as HTMLElement | null;
-    if (!bubble) return;
+    if (!bubble) return null;
+    return {
+      bubble,
+      name: bubble.getAttribute('data-file-name') || '',
+      dataPath: bubble.getAttribute('data-file-path') || '',
+    };
+  };
+  const showMenu = (ev: MouseEvent, info: { name: string; dataPath: string }) => {
     ev.preventDefault();
     ev.stopPropagation();
-    const name = bubble.getAttribute('data-file-name') || '';
-    const dataPath = bubble.getAttribute('data-file-path') || '';
-    showFileContextMenu(ev.clientX, ev.clientY, name, dataPath);
+    showFileContextMenu(ev.clientX, ev.clientY, info.name, info.dataPath);
   };
-  document.addEventListener('contextmenu', onFileRightClick as EventListener);
-  document.addEventListener('mousedown', (ev) => {
-    if (ev.button === 2) onFileRightClick(ev);
+  document.addEventListener('dblclick', (ev) => {
+    const info = findBubble(ev.target);
+    if (!info) return;
+    void openFileMessage(info.name, info.dataPath);
   });
-  // Click outside the menu to close it.
+  document.addEventListener('contextmenu', (ev) => {
+    const info = findBubble(ev.target);
+    if (!info) return;
+    showMenu(ev as MouseEvent, info);
+  });
+  document.addEventListener('mousedown', (ev) => {
+    if (ev.button !== 2) return; // right button only
+    const info = findBubble(ev.target);
+    if (!info) return;
+    showMenu(ev, info);
+  });
+  // Last-resort: left-click on a file bubble shows the
+  // menu. This guarantees the user has SOME way to
+  // interact with the file even if the WebView2 host
+  // has stripped all right-click behaviors. The handler
+  // is run BEFORE the outside-click closer below, but
+  // because both are 'click' listeners on document, the
+  // one registered later runs first; the outside-click
+  // is registered after this one, so it fires first and
+  // closes any existing menu before we open a new one
+  // (the old menu is hidden, the new one is shown).
+  document.addEventListener('click', (ev) => {
+    const target = ev.target as HTMLElement;
+    if (!target) return;
+    const info = findBubble(ev.target);
+    if (!info) return;
+    showFileContextMenu(ev.clientX, ev.clientY, info.name, info.dataPath);
+  });
+  // Click outside the menu (and outside any file bubble)
+  // to close it. Registered AFTER the file-bubble click
+  // handler so this fires first; if the click target is
+  // not a file bubble, we just close the menu.
   document.addEventListener('click', (ev) => {
     const t = ev.target as HTMLElement;
-    if (!t.closest('#file-ctx-menu')) hideFileContextMenu();
+    if (!t) return;
+    if (t.closest('#file-ctx-menu')) return;
+    if (t.closest('.file-bubble')) return; // bubble click handled above
+    hideFileContextMenu();
   });
   // Esc closes the menu.
   document.addEventListener('keydown', (ev) => {

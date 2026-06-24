@@ -234,28 +234,34 @@ func (a *App) SendFile(peerRef, path string) string {
 	return ""
 }
 
-// SendFileContent writes content to a temp file in
-// <data-dir>/outbox/, then calls SendFile on it. The temp
-// file is removed after the transfer completes (success
-// or error). Used by the GUI's <input type="file"> picker
-// which can't supply a real path (WebView2 has no
+// SendFileContent writes content to <data-dir>/sent/<name>
+// (a permanent copy on the sender's disk), then calls
+// SendFile on it. Used by the GUI's <input type=file>
+// picker which can't supply a real path (WebView2 has no
 // File.path accessor; Wails v2.12 has no OpenFileDialog
 // runtime API). The frontend reads the File via FileReader
 // and passes the bytes here.
 //
-// On the sender's side, the chat message:
-//   - has the user's original name (the File object's
-//     name, no timestamp prefix, no rename),
-//   - has LocalPath="" because the File API hides the
-//     real on-disk path; the user knows where they
-//     picked the file from and can find it themselves.
+// The File API hides the real on-disk path, so for the
+// picker route we cannot open the user's original file from
+// the chat — only a copy we made. We persist that copy in
+// <data-dir>/sent/ (NOT outbox/ as a temp file) so:
+//   - the chat bubble's LocalPath points to a file the
+//     user can still open after the transfer,
+//   - right-click → "打开文件" / "打开所在文件夹" both
+//     work on the sender's side.
 //
-// We do NOT keep a permanent copy of picker-sourced
-// files. The earlier "<data-dir>/sent/" copy was wrong:
-// it re-renamed the file on collision and made the
-// "open in chat" feature broken (the path the user
-// clicked on was a copy in sent/, not the user's
-// actual file).
+// On collision with an existing file in sent/, we apply
+// "name (1).ext", "name (2).ext", ... (mirrors the
+// receiver's uniquePath). The chat message keeps the
+// user's original name (offerName) so the user sees a
+// clean name in the chat; the chat's LocalPath points
+// to the actual on-disk file (with the (N) suffix).
+//
+// Drag-and-drop route still uses the user's source path
+// directly (App.SendFile), no copy. Picker and drag are
+// separate code paths; both end up looking the same in
+// the chat.
 func (a *App) SendFileContent(peerRef, name string, content []byte) string {
 	if a.nd == nil {
 		return "node not started"
@@ -274,31 +280,26 @@ func (a *App) SendFileContent(peerRef, name string, content []byte) string {
 	if cleanName == "" || cleanName == "." || cleanName == "/" {
 		return "invalid file name: " + name
 	}
-	// Write to <data-dir>/outbox/<name> as a temp file
-	// and clean it up after the transfer. We use the
-	// user's exact name (no timestamp, no "gui-" prefix,
-	// no uniquePath suffix) so the on-the-wire offer
-	// name matches what the user picked.
-	outbox := filepath.Join(a.dataDir(), "outbox")
-	if err := os.MkdirAll(outbox, 0o755); err != nil {
-		return fmt.Sprintf("mkdir outbox: %v", err)
+	// Write to <data-dir>/sent/<name>. We DON'T
+	// uniquePath here: if the user picks the same file
+	// twice, the second pick OVERWRITES the first in
+	// sent/. Both chat messages then point to the same
+	// file (the latest bytes). For v0.1 the UX is "I
+	// sent the same file twice, both messages open the
+	// latest copy" — not great but predictable.
+	sentDir := filepath.Join(a.dataDir(), "sent")
+	if err := os.MkdirAll(sentDir, 0o755); err != nil {
+		return fmt.Sprintf("mkdir sent: %v", err)
 	}
-	tmpPath := filepath.Join(outbox, cleanName)
-	if err := os.WriteFile(tmpPath, content, 0o644); err != nil {
-		return fmt.Sprintf("write outbox: %v", err)
+	finalPath := filepath.Join(sentDir, cleanName)
+	if err := os.WriteFile(finalPath, content, 0o644); err != nil {
+		return fmt.Sprintf("write sent: %v", err)
 	}
-	// Best-effort cleanup; SendFile may copy + stream so
-	// we give it a moment, then delete. The temp file is
-	// short-lived by design — we don't want it sticking
-	// around in outbox/ after the transfer.
-	defer func() {
-		time.Sleep(500 * time.Millisecond)
-		_ = os.Remove(tmpPath)
-	}()
-	// Pass the user's original name (cleanName) as the
-	// offer name. LocalPath="" because we don't have a
-	// real source path on the sender's disk.
-	if err := a.nd.SendFile(peerRef, tmpPath, cleanName, ""); err != nil {
+	// offerName = cleanName so the receiver gets the
+	// user's original name in the chat body. localPath =
+	// the on-disk path so double-click / reveal-in-folder
+	// work from the sender's chat.
+	if err := a.nd.SendFile(peerRef, finalPath, cleanName, finalPath); err != nil {
 		return err.Error()
 	}
 	return ""
@@ -510,8 +511,17 @@ func uniquePath(dir, name string) string {
 // We re-derive that here so SendFileContent's outbox/ lives
 // in the same place as chat.enc, device.key, etc.
 func (a *App) dataDir() string {
+	// INKL_DATA_DIR env var, if set, takes precedence.
+	// Used to run multiple instances side-by-side for
+	// local testing (set INKL_DATA_DIR=D:\test1\.innerlink
+	// in one launch, D:\test2\.innerlink in another; the
+	// two instances get distinct device.key / chat.enc
+	// and discover each other over UDP).
+	if d := os.Getenv("INKL_DATA_DIR"); d != "" {
+		return d
+	}
 	// Heuristic: walk from cwd. If a .innerlink/ exists here
-	// use it; otherwise default to ./.innerlink/.
+	// use it; otherwise default to <launch-cwd>/.innerlink/.
 	cwd, err := os.Getwd()
 	if err != nil {
 		cwd = "."
