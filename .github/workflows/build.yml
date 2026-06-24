@@ -56,6 +56,8 @@ jobs:
         # 不需要 wails generate / npm build. go test 不编译 main.go
         # 的 wails runtime, 只校验 //go:embed 找到 frontend/dist/
         # 目录即可; .gitkeep 入库保证该目录在 fresh clone 存在.
+        # Skip the TestDebugReveal / TestDebugOpen / TestSetSysProcAttr
+        # group via -short (those are skipped automatically).
         run: go test -count=1 -short -timeout 120s ./...
 
   build:
@@ -100,6 +102,25 @@ jobs:
 
       - name: enable GOSUMDB for toolchain
         run: go env -w GOSUMDB=sum.golang.org
+        shell: bash
+
+      - name: install wails CLI v2.12.0
+        # `wails build` (used below) is the wails CLI. Each
+        # build runner is a fresh VM with no Go-side
+        # packages pre-installed; the CLI lives at
+        # $(go env GOPATH)/bin after this step. We add
+        # that dir to PATH so the next step's `wails build`
+        # resolves. Without this step, the build job fails
+        # with "wails: command not found" on all 3 platforms.
+        run: go install github.com/wailsapp/wails/v2/cmd/wails@v2.12.0
+        shell: bash
+
+      - name: add GOPATH/bin to PATH
+        # `go install` puts binaries at $(go env GOPATH)/bin.
+        # The next step's `wails build` needs that on PATH.
+        # On Linux/macOS GITHUB_PATH already includes it
+        # for some runners, but not all — set explicitly.
+        run: echo "$(go env GOPATH)/bin" >> "$GITHUB_PATH"
         shell: bash
 
       # wails build 一步到位: wails generate module + npm install +
