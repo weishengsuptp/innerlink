@@ -642,6 +642,14 @@ async function resolveFilePath(name: string, dataPath: string): Promise<string> 
 }
 
 async function openFileMessage(name: string, dataPath: string) {
+  // Picker route: dataPath is empty because the browser
+  // File API hides the real on-disk path. The user
+  // knows where they picked the file from; tell them
+  // that instead of "file not found".
+  if (!dataPath) {
+    toast('此文件来自文件选择器，本地路径不可用；请用拖拽重发');
+    return;
+  }
   const path = await resolveFilePath(name, dataPath);
   if (!path) {
     toast('找不到文件: ' + name);
@@ -652,6 +660,10 @@ async function openFileMessage(name: string, dataPath: string) {
 }
 
 async function revealFileMessage(name: string, dataPath: string) {
+  if (!dataPath) {
+    toast('此文件来自文件选择器，本地路径不可用；请用拖拽重发');
+    return;
+  }
   const path = await resolveFilePath(name, dataPath);
   if (!path) {
     toast('找不到文件: ' + name);
@@ -769,20 +781,28 @@ function wireEvents() {
 
   // File message interactions: double-click opens with
   // the OS default app, right-click shows an action menu
-  // (open / reveal in folder / copy name). The handlers
-  // are bound at the messages container (not per bubble)
-  // so they survive every innerHTML rewrite from
-  // renderMessages.
-  messagesEl.addEventListener('dblclick', (ev) => {
+  // (open / reveal in folder / copy name).
+  //
+  // We bind on the document (not on messagesEl) so the
+  // handlers survive every innerHTML rewrite from
+  // renderMessages AND so we don't depend on the event
+  // bubbling through messagesEl specifically — on the
+  // receiver the messages container can be re-mounted in
+  // a way that breaks the older delegation. Document-
+  // level delegation with closest('.file-bubble') is the
+  // most robust option.
+  document.addEventListener('dblclick', (ev) => {
     const t = ev.target as HTMLElement;
+    if (!t) return;
     const bubble = t.closest('.file-bubble') as HTMLElement | null;
     if (!bubble) return;
     const name = bubble.getAttribute('data-file-name') || '';
     const dataPath = bubble.getAttribute('data-file-path') || '';
     void openFileMessage(name, dataPath);
   });
-  messagesEl.addEventListener('contextmenu', (ev) => {
+  document.addEventListener('contextmenu', (ev) => {
     const t = ev.target as HTMLElement;
+    if (!t) return;
     const bubble = t.closest('.file-bubble') as HTMLElement | null;
     if (!bubble) return;
     ev.preventDefault();
