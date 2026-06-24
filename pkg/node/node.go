@@ -503,6 +503,19 @@ func (n *Node) wrapChannel(conn *transport.Conn, sess *handshake.Session) {
 		_ = ch.Close()
 		return
 	}
+	// GUI chat panel: announce received file with a
+	// "file://<name>" message so the chat UI can render
+	// a file card next to the drop. Body is intentionally
+	// prefixed with file:// (frontend parses this).
+	rcv.SetOnComplete(func(name, finalPath string) {
+		log.Printf("[FILE] received %s -> %s (peer=%s)", name, finalPath, peerHexStr)
+		n.publishMessage(Message{
+			PeerID:    peerHexStr,
+			Body:      "file://" + name,
+			Timestamp: time.Now().UTC(),
+			Direction: DirIn,
+		})
+	})
 	if !n.channels.set(sess.RemotePeerID, &channelState{ch: ch, rcv: rcv, peerID: append([]byte(nil), sess.RemotePeerID...)}) {
 		log.Printf("[INFO ] channel superseded peer=%s (keeping existing)", peerHexStr)
 		_ = ch.Close()

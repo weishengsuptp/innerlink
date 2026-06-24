@@ -34,14 +34,23 @@ type ReceivedFile struct {
 // is nil is to accept every offer.
 type OnOffer func(offer FileOffer, fromPeer string) error
 
+// OnComplete is a callback fired after a file transfer
+// finishes successfully (finalize passed). The Receiver
+// passes the final saved path (under saveDir) and the
+// human-readable file name. Used by the GUI to publish a
+// chat message announcing "you received foo.txt" so the
+// chat panel can render a file card next to the drop.
+type OnComplete func(name, finalPath string)
+
 // Receiver handles incoming file offers on a Channel. Run Loop
 // in its own goroutine; it returns when ctx is cancelled or
 // the channel is closed.
 type Receiver struct {
-	ch       *protocol.Channel
-	saveDir  string
-	onOffer  OnOffer
-	fromPeer string
+	ch         *protocol.Channel
+	saveDir    string
+	onOffer    OnOffer
+	onComplete OnComplete
+	fromPeer   string
 	// in-memory state for resume support. In v0.1 we keep this
 	// for the lifetime of a single Receiver instance, so a
 	// partial transfer can be resumed if the channel comes
@@ -109,6 +118,14 @@ func NewReceiver(ch *protocol.Channel, saveDir string, onOffer OnOffer, fromPeer
 		replyWaiters:   make(map[string]chan<- protocol.Envelope),
 		pendingReplies: make(map[string]protocol.Envelope),
 	}, nil
+}
+
+// SetOnComplete installs a callback fired after a file
+// transfer successfully finalizes. The Receiver owns the
+// channel lifecycle; the upper layer (Node) wires this so
+// the GUI chat panel can render an "incoming file" card.
+func (r *Receiver) SetOnComplete(cb OnComplete) {
+	r.onComplete = cb
 }
 
 // Loop reads envelopes from the channel until ctx is cancelled
@@ -396,6 +413,14 @@ func (r *Receiver) finalize(ctx context.Context, pf *partFile) error {
 			return err
 		}
 		_ = os.Remove(pf.path)
+	}
+	// Notify the upper layer (Node) so the GUI chat
+	// panel can render a file card. We fire AFTER the
+	// rename so the file is fully on disk by the time
+	// the callback runs; the callback may post-process
+	// the file (size check, etc.) without races.
+	if r.onComplete != nil {
+		r.onComplete(pf.offer.Name, finalPath)
 	}
 	return r.sendDone(ctx, pf, true, "")
 }

@@ -26,6 +26,7 @@ import (
 	"log"
 
 	"github.com/wailsapp/wails/v2"
+	"github.com/wailsapp/wails/v2/pkg/logger"
 	"github.com/wailsapp/wails/v2/pkg/options"
 	"github.com/wailsapp/wails/v2/pkg/options/assetserver"
 
@@ -52,8 +53,31 @@ func main() {
 		// HTML loads.
 		BackgroundColour: &options.RGBA{R: 0xF7, G: 0xF8, B: 0xF4, A: 1},
 
-		OnStartup:  a.Startup,
-		OnShutdown: a.Shutdown,
+		// Wails-level logging: emit everything (DEBUG for
+		// window + WebView2 lifecycle, frontend console
+		// passthrough). Critical for diagnosing the close
+		// bug — Wails' internal quit chain has its own
+		// messages we can't otherwise see. NewDefaultLogger
+		// writes to stderr.
+		Logger:   logger.NewDefaultLogger(),
+		LogLevel: logger.DEBUG,
+
+		// Drag-and-drop: enable Wails file-drop event +
+		// restrict acceptance to elements marked with
+		// `--wails-drop-target: drop` (the .composer-wrap
+		// in the frontend). DisableWebViewDrop is false
+		// because we still want the webview's default file
+		// drop to be off (we handle drops via OnFileDrop).
+		DragAndDrop: &options.DragAndDrop{
+			EnableFileDrop:     true,
+			DisableWebViewDrop: true,
+			CSSDropProperty:    "--wails-drop-target",
+			CSSDropValue:       "drop",
+		},
+
+		OnStartup:    a.Startup,
+		OnShutdown:   a.Shutdown,
+		OnBeforeClose: a.BeforeClose,
 		// OnBeforeClose intentionally NOT set. See top of
 		// this file for why (and docs/CLOSE-EXIT.md).
 		Bind: []interface{}{a},

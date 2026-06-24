@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"log"
+	"strings"
 	"time"
 
 	"github.com/weishengsuptp/innerlink/internal/filetransfer"
@@ -135,6 +136,33 @@ func (n *Node) SendFile(peerRef, path string) error {
 			return
 		}
 		log.Printf("[FILE] done peer=%s path=%s", peerHexStr, path)
+		// GUI chat panel: announce the sent file so the
+		// chat UI can render a file card. Body uses
+		// "file://<basename>" prefix (frontend parses).
+		// The basename rather than full path because
+		// the receiver already has its own copy and we
+		// don't want to leak the sender's local layout.
+		base := path
+		if i := strings.LastIndexAny(base, "/\\"); i >= 0 {
+			base = base[i+1:]
+		}
+		n.publishMessage(Message{
+			PeerID:    peerHexStr,
+			Body:      "file://" + base,
+			Timestamp: time.Now().UTC(),
+			Direction: DirOut,
+		})
+		// Also append to the encrypted chat log so the
+		// file event persists across restarts and the GUI
+		// can re-render the file card on relaunch.
+		n.chatStore.Append(&storage.Record{
+			Timestamp: time.Now().UTC(),
+			From:      n.id.PeerIDHex(),
+			To:        peerHexStr,
+			Direction: "out",
+			Body:      "file://" + base,
+			MsgID:     "",
+		})
 	}()
 	return nil
 }
