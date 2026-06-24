@@ -32,6 +32,7 @@ import './style.css';
 import './app.css';
 
 import {
+  DebugReveal,
   DialAddr,
   History,
   ListPeers,
@@ -233,6 +234,9 @@ function mount() {
           <button class="btn-mini" id="btn-scan" title="扫描 IP 段">
             <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2"><circle cx="11" cy="11" r="7"/><path d="m21 21-4.3-4.3"/></svg>
             scan
+          </button>
+          <button class="btn-mini" id="btn-test-reveal" title="测试 RevealInFolder: 弹资源管理器选 device.key">
+            测试
           </button>
         </div>
       </aside>
@@ -752,6 +756,20 @@ function wireEvents() {
     else toast('先选一个 peer');
   });
   document.getElementById('btn-scan')!.addEventListener('click', () => promptScan());
+  // Debug "测试" button in the sidebar footer. Calls the
+  // Go-side DebugReveal / DebugOpen which snapshot the
+  // process table before and after the launch to detect
+  // whether explorer.exe / Finder / nautilus actually
+  // started. The result is shown in a toast so we can
+  // see at a glance whether the launch path works.
+  document.getElementById('btn-test-reveal')!.addEventListener('click', async () => {
+    const r = await DebugReveal('');
+    if (r.startsWith('OK')) {
+      toast('reveal: ' + r);
+    } else {
+      toast('reveal FAIL: ' + r);
+    }
+  });
 
   // 📎 picker: open a hidden <input type=file>, read its
   // bytes via FileReader, then call SendFileContent

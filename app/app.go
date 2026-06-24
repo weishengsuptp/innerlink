@@ -546,6 +546,137 @@ func (a *App) Ping(peerRef string) string {
 	return ""
 }
 
+// DebugReveal opens a known-bad path to verify the
+// Explorer / file-manager launch path is working at
+// all. Returns a structured report:
+//
+//	"OK"                       — explorer.exe started
+//	"OK:pid=1234"              — pid of the spawned process
+//	"FAIL:<error message>"     — could not start explorer
+//
+// Why this exists: the right-click "打开文件所在文件夹"
+// action keeps failing on the user's VM. We need a way
+// to verify the Go side is actually launching a
+// process without going through the Wails binding +
+// frontend click path (which has too many moving parts
+// to debug). The frontend exposes a "测试" button that
+// calls this with a hard-coded path under
+// <data-dir>/received/.
+//
+// Cross-platform:
+//   - Windows: `explorer.exe /select, <path>`
+//   - macOS:   `open -R <path>`
+//   - Linux:   `xdg-open <parent dir>` (no select in std)
+func (a *App) DebugReveal(path string) string {
+	if path == "" {
+		// Pick a known file under the data dir so the
+		// caller can at least confirm the launch path
+		// works. <data-dir>/device.key always exists
+		// after first launch.
+		path = filepath.Join(a.dataDir(), "device.key")
+	}
+	info, err := os.Stat(path)
+	if err != nil {
+		return "FAIL:stat " + path + ": " + err.Error()
+	}
+	// Just spawn; we don't try to verify a new window
+	// appeared. explorer.exe on Windows is a
+	// singleton-per-user — tasklist always has many
+	// explorer processes, and /select re-uses the
+	// existing one. Diffing pre/post by name is
+	// unreliable; the user can confirm visually.
+	if runtime.GOOS == "windows" {
+		if err := revealInExplorer(path); err != nil {
+			return "FAIL:explorer " + err.Error()
+		}
+	} else {
+		_ = info
+		if r := a.RevealInFolder(path); r != "" {
+			return "FAIL:reveal " + r
+		}
+	}
+	return "OK:explorer launched (visual check required)"
+}
+
+// DebugOpen opens a known path with the default app
+// (same as the chat-bubble "open file" action).
+func (a *App) DebugOpen(path string) string {
+	if path == "" {
+		path = filepath.Join(a.dataDir(), "device.key")
+	}
+	if r := a.OpenPath(path); r != "" {
+		return "FAIL:open " + r
+	}
+	return "OK:open launched (visual check required)"
+}
+
+// procSnap is a small snapshot of running processes by
+// name. We use it in DebugReveal / DebugOpen to detect
+// "did the launch actually spawn a new explorer.exe /
+// Finder / etc." without depending on UI feedback.
+type procSnap map[string]int // exe name -> pid (any one of)
+
+func snapshotProcs() procSnap {
+	snap := make(procSnap)
+	if runtime.GOOS != "windows" {
+		// ps -A | awk '{print $4}' is portable across
+		// macOS and Linux. Windows uses tasklist below.
+		out, err := exec.Command("ps", "-A", "-o", "comm=").Output()
+		if err == nil {
+			for _, line := range strings.Split(string(out), "\n") {
+				name := strings.TrimSpace(line)
+				if name == "" {
+					continue
+				}
+				if _, ok := snap[name]; !ok {
+					snap[name] = 0
+				}
+			}
+		}
+		return snap
+	}
+	// Windows: tasklist /FO CSV /NH
+	out, err := exec.Command("tasklist", "/FO", "CSV", "/NH").Output()
+	if err != nil {
+		return snap
+	}
+	// CSV header is "Image Name","PID","Session Name","Session#","Mem Usage"
+	for _, line := range strings.Split(string(out), "\n") {
+		line = strings.TrimSpace(line)
+		if line == "" {
+			continue
+		}
+		// First field is the image name (quoted).
+		if !strings.HasPrefix(line, "\"") {
+			continue
+		}
+		end := strings.Index(line[1:], "\"")
+		if end < 0 {
+			continue
+		}
+		name := line[1 : end+1]
+		if _, ok := snap[name]; !ok {
+			snap[name] = 0
+		}
+	}
+	return snap
+}
+
+func diffProcs(pre, post procSnap) []procInfo {
+	var out []procInfo
+	for name := range post {
+		if _, ok := pre[name]; !ok {
+			out = append(out, procInfo{Name: name, Pid: post[name]})
+		}
+	}
+	return out
+}
+
+type procInfo struct {
+	Name string
+	Pid  int
+}
+
 // DialAddr connects to a specific "ip:port" without
 // relying on UDP discovery (e.g. across subnets).
 func (a *App) DialAddr(addr string) string {

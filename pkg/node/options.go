@@ -1,6 +1,8 @@
 ﻿package node
 
 import (
+	"os"
+
 	"github.com/weishengsuptp/innerlink/internal/discovery"
 	"github.com/weishengsuptp/innerlink/internal/transport"
 )
@@ -75,6 +77,17 @@ func (o Options) applyDefaults() Options {
 	}
 	if o.LogLevel == "" {
 		o.LogLevel = "info"
+	}
+	// INKL_DATA_DIR, if set, overrides DataDir. Lets
+	// the same binary be launched multiple times on
+	// one machine (each with its own data dir) for
+	// local e2e / manual testing. The Wails app's
+	// app.DataDir() reads the same env var, so chat /
+	// file paths agree across the core + GUI.
+	if o.DataDir == "" {
+		if d := os.Getenv("INKL_DATA_DIR"); d != "" {
+			o.DataDir = d
+		}
 	}
 	return o
 }
