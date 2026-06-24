@@ -8,7 +8,14 @@
 #   - macos-14      (26.x sonoma+ 的 dyld 严格 LC_UUID, Wails 2.12 CLI
 #                    没这 section 起不来. 官方 v3 升了再考虑回 latest)
 #
-# Wails CLI 必须 pin v2.12.0, 跟 go.mod 一致.
+# 命令风格:
+#   - 凡是 build / 编译 / 打包 相关的, 一律 `wails build` 一把梭
+#     (它会自己跑 wails generate module + npm install + npm run build
+#      + go build + embed + NSIS 打包)
+#   - test job 只跑 `go test ./...`, 不重复 build 步骤
+#     (go test 不编译 main.go 的 wails runtime 部分, 不需要
+#      frontend/wailsjs/ 存在; .gitkeep 保证 frontend/dist/ 目录在
+#      fresh clone 也存在, //go:embed 能编译过)
 
 name: build
 
@@ -40,39 +47,15 @@ jobs:
           go-version: '1.22.5'
           cache: true
 
-      - name: setup node
-        uses: actions/setup-node@v4
-        with:
-          node-version: '20'
-          cache: npm
-          cache-dependency-path: frontend/package-lock.json
-
       - name: enable GOSUMDB for toolchain
         # Wails 2.12.0 依赖里可能拉到 go1.23.x toolchain; GOSUMDB=off 时 verify 失败
         run: go env -w GOSUMDB=sum.golang.org
         shell: bash
 
-      # frontend/src/main.ts imports from ../wailsjs/go/app/App and
-      # ../wailsjs/runtime/runtime. Those bindings are auto-generated
-      # by `wails generate module` from the Go App methods. On a
-      # fresh CI checkout, wailsjs/ doesn't exist yet, so tsc fails.
-      # Install the wails CLI and generate the bindings before
-      # building the frontend.
-      - name: install wails CLI v2.12.0
-        run: go install github.com/wailsapp/wails/v2/cmd/wails@v2.12.0
-
-      - name: wails generate module
-        run: wails generate module
-
-      # main.go has //go:embed all:frontend/dist. CI does a clean
-      # checkout of source, so the dist directory is empty (only
-      # the .gitkeep placeholder from the repo). Build the
-      # frontend so the embed pattern matches something real.
-      - name: build frontend
-        working-directory: frontend
-        run: npm ci && npm run build
-
       - name: go test
+        # 不需要 wails generate / npm build. go test 不编译 main.go
+        # 的 wails runtime, 只校验 //go:embed 找到 frontend/dist/
+        # 目录即可; .gitkeep 入库保证该目录在 fresh clone 存在.
         run: go test -count=1 -short -timeout 120s ./...
 
   build:
@@ -86,15 +69,12 @@ jobs:
           - os: ubuntu-22.04
             platform: linux/amd64
             artifact: innerlink-linux-amd64
-            wails_args: ""
           - os: windows-latest
             platform: windows/amd64
             artifact: innerlink-windows-amd64.exe
-            wails_args: ""
           - os: macos-14
             platform: darwin/universal
             artifact: innerlink-macos-universal
-            wails_args: ""
     steps:
       - name: checkout
         uses: actions/checkout@v4
@@ -122,11 +102,11 @@ jobs:
         run: go env -w GOSUMDB=sum.golang.org
         shell: bash
 
-      - name: install wails CLI v2.12.0
-        run: go install github.com/wailsapp/wails/v2/cmd/wails@v2.12.0
-
+      # wails build 一步到位: wails generate module + npm install +
+      # npm run build + go build + embed + 打包. 不要在 CI 重复其中
+      # 任何步骤 (邪门歪道).
       - name: wails build
-        run: wails build -clean -platform ${{ matrix.platform }} ${{ matrix.wails_args }}
+        run: wails build -clean -platform ${{ matrix.platform }}
 
       - name: verify binary exists
         shell: bash
@@ -161,7 +141,7 @@ jobs:
           if-no-files-found: error
           retention-days: 30
 
-      - name: upload artifact (macos, tar app bundle)
+      - name: tar macos app bundle
         if: runner.os == 'macOS'
         run: |
           cd build/bin
