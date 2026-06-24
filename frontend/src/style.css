@@ -8,7 +8,6 @@
  * Additions on top of the mockup:
  *   - Wails drag-and-drop zone (.composer receives
  *     --wails-drop-target + wails-drop-target-active)
- *   - .pending-file card for staged but unsent file
  *   - .badge for unread message count in sidebar
  *   - .empty icon style (re-used for "no peer" state)
  */
@@ -48,38 +47,10 @@ body {
 }
 
 /* ========== App layout ========== */
-#app {
-  display: flex;
-  flex-direction: column;
-}
-.app-header {
-  height: 36px;
-  flex-shrink: 0;
-  border-bottom: 1px solid var(--border);
-  background: var(--surface);
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
-  padding: 0 16px;
-}
-.brand { display: flex; align-items: center; gap: 8px; }
-.brand-mark {
-  width: 12px; height: 12px; border-radius: 3px;
-  background: linear-gradient(135deg, var(--primary), #0e9b6f);
-}
-.brand-name { font-size: 13px; font-weight: 600; color: var(--text); letter-spacing: 0.01em; }
-.brand-tag {
-  font-size: 10px; color: var(--muted);
-  padding: 1px 5px; border: 1px solid var(--border);
-  border-radius: 3px; font-family: 'JetBrains Mono', monospace;
-}
-.brand-hint { font-size: 11px; color: var(--muted); }
-
 .app {
-  flex: 1;
-  min-height: 0;
   display: grid;
   grid-template-columns: 280px 1fr;
+  height: 100vh;
 }
 
 /* ========== Sidebar ========== */
@@ -285,6 +256,7 @@ body {
   --wails-drop-target: drop;
 }
 .composer.wails-drop-target-active { background: var(--primary-soft); }
+.composer.wails-drop-target-active .drop-hint { display: flex; }
 .composer-toolbar {
   display: flex; gap: 6px; margin-bottom: 8px;
 }
@@ -313,42 +285,6 @@ body {
 }
 .send-btn:hover { background: #0e9b6f; }
 .send-btn:disabled { background: var(--border-strong); cursor: not-allowed; }
-
-/* Drop hint: subtle text overlay on the composer while
- * a file is being dragged over it. */
-.drop-hint {
-  display: none;
-  position: absolute;
-  inset: 0;
-  align-items: center;
-  justify-content: center;
-  font-size: 13px;
-  font-weight: 500;
-  color: var(--primary);
-  pointer-events: none;
-  background: var(--primary-soft);
-}
-.composer.wails-drop-target-active .drop-hint { display: flex; }
-
-/* Pending file card: shown between messages and
- * composer when a file is staged but not yet sent. */
-.pending-file { display: none; padding: 8px 22px 0; background: var(--surface); }
-.pending-file.show { display: block; }
-.pending-card {
-  display: flex;
-  align-items: center;
-  gap: 10px;
-  padding: 10px 14px;
-  background: var(--bg);
-  border: 1px solid var(--border);
-  border-radius: 10px;
-}
-.pending-card .file-icon { font-size: 18px; }
-.pending-info { flex: 1; min-width: 0; }
-.pending-name { font-size: 13.5px; font-weight: 500; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-.pending-meta { font-size: 11px; color: var(--muted); margin-top: 1px; }
-.pending-cancel { font-size: 14px; color: var(--text-2); padding: 4px 8px; cursor: pointer; border-radius: 4px; }
-.pending-cancel:hover { color: var(--warn); background: var(--warn-soft); }
 
 /* ========== Empty state ========== */
 .empty {

@@ -63,14 +63,6 @@ interface UIState {
   // from their hostname (avoids spamming SetAlias on
   // every peer:event when nothing changed).
   autoAliased: Set<string>;
-  // pendingFile: a file the user staged via 📎 picker or
-  // drag-and-drop, not yet sent. When set, the composer
-  // shows a file card and submit routes to SendFile /
-  // SendFileContent instead of SendText.
-  //   - path: real on-disk path (drag-drop via Wails)
-  //   - content: bytes from FileReader (📎 picker, since
-  //     the browser File API hides the real path)
-  pendingFile: { name: string; size: number; path?: string; content?: Uint8Array } | null;
   // unreadCount: peer hex ID -> number of incoming
   // messages not yet seen. Reset to 0 in selectPeer.
   unreadCount: Map<string, number>;
@@ -85,7 +77,6 @@ const state: UIState = {
   aliases: new Map(),
   nearBottom: true,
   autoAliased: new Set(),
-  pendingFile: null,
   unreadCount: new Map(),
 };
 
@@ -106,13 +97,6 @@ function fmtTime(ts: any): string {
   const d = ts ? new Date(ts) : new Date();
   if (isNaN(d.getTime())) return '';
   return d.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
-}
-
-function fmtSize(n: number): string {
-  if (n < 1024) return `${n} B`;
-  if (n < 1024 * 1024) return `${(n / 1024).toFixed(1)} KB`;
-  if (n < 1024 * 1024 * 1024) return `${(n / 1024 / 1024).toFixed(1)} MiB`;
-  return `${(n / 1024 / 1024 / 1024).toFixed(2)} GiB`;
 }
 
 // avatarChar picks the first character for the avatar
@@ -208,14 +192,6 @@ function toast(msg: string) {
 // ----- DOM injection (one-shot at startup) -----
 function mount() {
   document.querySelector('#app')!.innerHTML = `
-    <div class="app-header">
-      <div class="brand">
-        <span class="brand-mark"></span>
-        <span class="brand-name">innerlink</span>
-        <span class="brand-tag">v0.1</span>
-      </div>
-      <div class="brand-hint">国密 P2P · 纯客户端 · 局域网</div>
-    </div>
     <div class="app">
       <aside class="sidebar">
         <div class="me">
@@ -268,7 +244,6 @@ function mount() {
             </div>
           </div>
         </div>
-        <div class="pending-file" id="pending-file"></div>
         <form class="composer" id="composer">
           <div class="composer-toolbar">
             <button type="button" class="icon-btn" id="btn-attach" title="发文件" disabled>
@@ -282,7 +257,6 @@ function mount() {
               <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4"><path d="m22 2-7 20-4-9-9-4Z"/><path d="M22 2 11 13"/></svg>
             </button>
           </div>
-          <div class="drop-hint" id="drop-hint">松开以附加文件</div>
           <input type="file" id="file-input" style="display:none" />
         </form>
       </section>
@@ -306,7 +280,13 @@ function renderMe() {
   name.textContent = self.Name || self.Hostname || shortId(self.PeerID);
   const ip = self.Addrs[0]?.split(':')[0] || '—';
   host.textContent = `本机 · ${ip} · ${shortId(self.PeerID)}`;
-  status.textContent = self.Online ? '在线 · UDP 发现已开启' : '启动中…';
+  // Mockup shows "在线 · UDP 发现已开启" once we're up.
+  // self.Online is too strict (waits for the first peer
+  // announcement to round-trip), so fall back to "have
+  // any bound address" -> "在线" (which is what
+  // listening-on-UDP/TCP actually means).
+  const listening = (self.Addrs?.length ?? 0) > 0;
+  status.textContent = (self.Online || listening) ? '在线 · UDP 发现已开启' : '启动中…';
 }
 
 function renderPeerList() {
@@ -487,33 +467,6 @@ function renderMessage(m: node.Message, peerId: string): string {
   `;
 }
 
-function renderPendingFile() {
-  const host = document.getElementById('pending-file')!;
-  if (!state.pendingFile) {
-    host.innerHTML = '';
-    host.classList.remove('show');
-    return;
-  }
-  const f = state.pendingFile;
-  host.classList.add('show');
-  host.innerHTML = `
-    <div class="pending-card">
-      <div class="file-icon">
-        <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><path d="M14 2v6h6"/></svg>
-      </div>
-      <div class="pending-info">
-        <div class="pending-name">${escapeHtml(f.name)}</div>
-        <div class="pending-meta">${f.size > 0 ? fmtSize(f.size) : '文件'} · 准备发送</div>
-      </div>
-      <span class="pending-cancel" id="pending-cancel" title="取消">✕</span>
-    </div>
-  `;
-  document.getElementById('pending-cancel')!.addEventListener('click', () => {
-    state.pendingFile = null;
-    renderPendingFile();
-  });
-}
-
 // ----- actions -----
 async function selectPeer(peerId: string) {
   state.selectedId = peerId;
@@ -529,7 +482,6 @@ async function selectPeer(peerId: string) {
   renderPeerList();
   renderChatHeader();
   renderMessages();
-  renderPendingFile();
   const input = document.getElementById('composer-input') as HTMLTextAreaElement;
   input.focus();
 }
@@ -632,26 +584,32 @@ function promptMore() {
 }
 
 // ----- file transfer helpers -----
-function setPendingFile(f: UIState['pendingFile']) {
-  state.pendingFile = f;
-  renderPendingFile();
+//
+// Files are sent on selection (📎 picker) or drop, not
+// staged into a pending card. The core publishes a
+// "file:" chat message on completion, so the receiver
+// sees the file bubble in the conversation and the sender
+// sees their own outgoing file bubble — no need for an
+// intermediate "ready to send" UI step.
+//
+// sendPickerFile reads the file's bytes via FileReader
+// and hands them to SendFileContent. We can't reuse
+// SendFile (which takes a path) because the browser File
+// API hides the real on-disk path on modern engines.
+async function sendPickerFile(file: File) {
+  if (!state.selectedId) return;
+  const buf = new Uint8Array(await file.arrayBuffer());
+  const r = await SendFileContent(state.selectedId, file.name, Array.from(buf));
+  if (r) toast(`发文件失败: ${r}`);
 }
 
 // ----- event wiring -----
 function wireEvents() {
-  // Composer submit: file mode first, then text mode.
+  // Composer submit: text only. File transfer is wired
+  // to 📎 click and drag-drop (auto-send on selection).
   document.getElementById('composer')!.addEventListener('submit', async (ev) => {
     ev.preventDefault();
     if (!state.selectedId) return;
-    if (state.pendingFile) {
-      const f = state.pendingFile;
-      setPendingFile(null);
-      const r = f.path
-        ? await SendFile(state.selectedId, f.path)
-        : await SendFileContent(state.selectedId, f.name, Array.from(f.content!));
-      if (r) toast(`发文件失败: ${r}`);
-      return;
-    }
     const input = document.getElementById('composer-input') as HTMLTextAreaElement;
     const text = input.value.trim();
     if (!text) return;
@@ -689,11 +647,11 @@ function wireEvents() {
   document.getElementById('btn-scan')!.addEventListener('click', () => promptScan());
 
   // 📎 picker: open a hidden <input type=file>, read its
-  // bytes via FileReader, then stage as state.pendingFile.
-  // We can't reuse SendFile (which takes a path) because
-  // the browser File API hides the real on-disk path on
-  // modern engines; the picker route goes through
-  // SendFileContent.
+  // bytes via FileReader, then call SendFileContent
+  // immediately. We can't reuse SendFile (which takes a
+  // path) because the browser File API hides the real
+  // on-disk path on modern engines; the picker route
+  // always goes through SendFileContent.
   const fileInput = document.getElementById('file-input') as HTMLInputElement;
   document.getElementById('btn-attach')!.addEventListener('click', () => {
     if (!state.selectedId) return;
@@ -703,9 +661,7 @@ function wireEvents() {
   fileInput.addEventListener('change', async () => {
     const f = fileInput.files?.[0];
     if (!f) return;
-    if (!state.selectedId) return;
-    const buf = new Uint8Array(await f.arrayBuffer());
-    setPendingFile({ name: f.name, size: buf.length, content: buf });
+    await sendPickerFile(f);
   });
 
   // Track scroll position so renderMessages can decide
@@ -750,6 +706,11 @@ async function bootstrap() {
   // .composer). Wails adds a wails-drop-target-active
   // class while a file is being dragged over the drop
   // target so we can highlight it.
+  //
+  // On drop we kick off SendFile right away. Wails gives
+  // us a real on-disk path here (unlike the picker, which
+  // only exposes File objects), so we can stream the
+  // file directly without re-reading bytes in JS.
   OnFileDrop((_x, _y, paths) => {
     if (!state.selectedId) {
       toast('先选一个 peer');
@@ -757,13 +718,8 @@ async function bootstrap() {
     }
     if (!paths || paths.length === 0) return;
     const p = paths[0];
-    const name = p.split(/[\\/]/).pop() || p;
-    // Wails gives us a real OS path. We don't have the
-    // byte size in TS without an extra fetch, but the Go
-    // side SendFile will stat the file. Stage with
-    // size=0; the card shows the name and the user hits
-    // send.
-    setPendingFile({ name, size: 0, path: p });
+    const r = SendFile(state.selectedId, p);
+    r.then(err => { if (err) toast(`发文件失败: ${err}`); });
   }, true);
 }
 
