@@ -40,7 +40,6 @@ import (
 	"path/filepath"
 	"runtime"
 	"strings"
-	"syscall"
 	"time"
 
 	wruntime "github.com/wailsapp/wails/v2/pkg/runtime"
@@ -364,7 +363,7 @@ func openWithOS(path string) error {
 		// the registered handler and stays out of the way.
 		// HideWindow avoids a brief console popup.
 		cmd := exec.Command("rundll32", "url.dll,FileProtocolHandler", path)
-		cmd.SysProcAttr = &syscall.SysProcAttr{HideWindow: true}
+		setSysProcAttr(cmd)
 		if err := cmd.Start(); err != nil {
 			return err
 		}
@@ -443,7 +442,7 @@ func revealInExplorer(path string) error {
 	// Explorer window opened but the file selection
 	// silently failed.
 	cmd := exec.Command("explorer.exe", "/select,", path)
-	cmd.SysProcAttr = &syscall.SysProcAttr{HideWindow: true}
+	setSysProcAttr(cmd)
 	return cmd.Start()
 }
 

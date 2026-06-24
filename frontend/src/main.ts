@@ -800,15 +800,27 @@ function wireEvents() {
     const dataPath = bubble.getAttribute('data-file-path') || '';
     void openFileMessage(name, dataPath);
   });
-  document.addEventListener('contextmenu', (ev) => {
+  // Right-click handling. We bind BOTH contextmenu AND
+  // mousedown(button=2). Some WebView2 versions on the
+  // receiver's Windows host were observed to swallow
+  // contextmenu entirely when the message was just
+  // rendered (no observable reaction). mousedown always
+  // fires, so we use it as a fallback that calls the
+  // same handler.
+  const onFileRightClick = (ev: MouseEvent) => {
     const t = ev.target as HTMLElement;
     if (!t) return;
     const bubble = t.closest('.file-bubble') as HTMLElement | null;
     if (!bubble) return;
     ev.preventDefault();
+    ev.stopPropagation();
     const name = bubble.getAttribute('data-file-name') || '';
     const dataPath = bubble.getAttribute('data-file-path') || '';
     showFileContextMenu(ev.clientX, ev.clientY, name, dataPath);
+  };
+  document.addEventListener('contextmenu', onFileRightClick as EventListener);
+  document.addEventListener('mousedown', (ev) => {
+    if (ev.button === 2) onFileRightClick(ev);
   });
   // Click outside the menu to close it.
   document.addEventListener('click', (ev) => {
