@@ -271,6 +271,45 @@ body {
 .bubble.file-bubble:hover { filter: brightness(0.97); }
 .msg.self .bubble.file-bubble:hover { filter: brightness(1.06); }
 
+/* Picker-route file progress bar (2026-06-25+). The
+ * bubble stays in state.fileBubbles the whole time;
+ * file:event runtime events update the fill width
+ * directly via updateFileBubble() in main.ts. Width is
+ * an inline style on .file-bar-fill. The bar itself is
+ * the track. */
+.file-bar {
+  position: relative;
+  height: 4px;
+  border-radius: 2px;
+  background: rgba(0, 0, 0, 0.10);
+  margin-top: 6px;
+  overflow: hidden;
+}
+.msg.self .file-bar { background: rgba(255, 255, 255, 0.22); }
+.file-bar-fill {
+  position: absolute;
+  inset: 0 auto 0 0;
+  width: 0%;
+  background: var(--primary);
+  border-radius: 2px;
+  transition: width 120ms linear;
+}
+/* Done / failed variants override the fill colour so a
+ * glance at the bar tells you the state without reading
+ * the status text. */
+.file-bar-done .file-bar-fill { background: #16a34a; }
+.file-bar-failed .file-bar-fill { background: #dc2626; }
+/* Status row below the bar. Same colour as the bar fill
+ * when done / failed so the eye links them. */
+.file-status { font-size: 11px; margin-top: 4px; font-family: 'JetBrains Mono', monospace; }
+.file-status-pending { color: var(--muted); }
+.file-status-done { color: #16a34a; }
+.file-status-failed { color: #dc2626; }
+.msg.self .file-status { color: rgba(255, 255, 255, 0.85); }
+.msg.self .file-status-pending { color: rgba(255, 255, 255, 0.55); }
+.msg.self .file-status-done { color: #bbf7d0; }
+.msg.self .file-status-failed { color: #fecaca; }
+
 /* Right-click context menu for file bubbles. */
 .ctx-menu {
   position: fixed;

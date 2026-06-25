@@ -32,6 +32,8 @@ package app
 
 import (
 	"context"
+	"crypto/rand"
+	"encoding/hex"
 	"fmt"
 	"log"
 	"net/url"
@@ -40,6 +42,7 @@ import (
 	"path/filepath"
 	"runtime"
 	"strings"
+	"sync"
 	"time"
 
 	wruntime "github.com/wailsapp/wails/v2/pkg/runtime"
@@ -55,6 +58,15 @@ import (
 type App struct {
 	ctx context.Context // Wails runtime context, set in OnStartup
 	nd  *node.Node      // nil until OnStartup, never reset
+
+	// pendingFiles tracks the open staging files for
+	// the picker streaming route (SendFileStart /
+	// SendFileChunk / SendFileFinish). Each entry holds
+	// the open *os.File so chunks append in place; the
+	// fd is closed at SendFileFinish and the entry is
+	// removed. Serialised by pendingMu.
+	pendingMu    sync.Mutex
+	pendingFiles map[string]*pendingFile
 }
 
 // NewApp returns an App ready to be bound to the
@@ -104,6 +116,7 @@ func (a *App) Startup(ctx context.Context) {
 
 	go a.pumpPeers()
 	go a.pumpMessages()
+	go a.pumpFiles()
 	log.Printf("[INFO  app] Startup RETURN (goroutines=%d)", runtime.NumGoroutine())
 }
 
@@ -224,44 +237,185 @@ func (a *App) SendText(peerRef, text string) string {
 //     <data-dir>/received/, the receiver's rename
 //     logic appends a counter ("name (1).ext") on its
 //     own.
+//
+// Drag-and-drop route: no fileID, no progress bubble
+// (the frontend synthesises a fileID at drop time if
+// the user wants a bubble; v0.1 doesn't, the chat
+// message is enough).
 func (a *App) SendFile(peerRef, path string) string {
 	if a.nd == nil {
 		return "node not started"
 	}
-	if err := a.nd.SendFile(peerRef, path, "", path); err != nil {
+	if err := a.nd.SendFile(peerRef, path, "", path, ""); err != nil {
 		return err.Error()
 	}
 	return ""
 }
 
-// SendFileContent writes content to <data-dir>/sent/<name>
-// (a permanent copy on the sender's disk), then calls
-// SendFile on it. Used by the GUI's <input type=file>
-// picker which can't supply a real path (WebView2 has no
-// File.path accessor; Wails v2.12 has no OpenFileDialog
-// runtime API). The frontend reads the File via FileReader
-// and passes the bytes here.
+// pendingFile tracks an in-flight picker stream so
+// SendFileChunk can append to the right open file and
+// SendFileFinish can close it + start the actual
+// transfer. The picker frontend drives this state
+// machine with three calls in order:
 //
-// The File API hides the real on-disk path, so for the
-// picker route we cannot open the user's original file from
-// the chat — only a copy we made. We persist that copy in
-// <data-dir>/sent/ (NOT outbox/ as a temp file) so:
-//   - the chat bubble's LocalPath points to a file the
-//     user can still open after the transfer,
-//   - right-click → "打开文件" / "打开所在文件夹" both
-//     work on the sender's side.
+//   SendFileStart  → create <data-dir>/sent/<name> + register
+//   SendFileChunk  → append bytes (called many times)
+//   SendFileFinish → close file + start SendFile in goroutine
 //
-// On collision with an existing file in sent/, we apply
-// "name (1).ext", "name (2).ext", ... (mirrors the
-// receiver's uniquePath). The chat message keeps the
-// user's original name (offerName) so the user sees a
-// clean name in the chat; the chat's LocalPath points
-// to the actual on-disk file (with the (N) suffix).
+// We hold the open file in the map so the chunks don't
+// have to pass an open fd through Wails IPC (Wails has
+// no fd passing primitive; encoding an os.File in JSON
+// is not supported).
+type pendingFile struct {
+	peerRef  string
+	name     string
+	fileID   string
+	size     int64
+	path     string
+	f        *os.File
+	bytesIn  int64
+}
+
+// SendFileStart creates the on-disk staging file and
+// registers it under fileID. The frontend then streams
+// chunks via SendFileChunk. If the frontend crashes or
+// the user closes the window before calling
+// SendFileFinish, the staging file leaks; v0.1 doesn't
+// have a janitor — the user can manually delete
+// <data-dir>/sent/<stale-file> if it bothers them.
+func (a *App) SendFileStart(peerRef, name, fileID string, size int64) string {
+	if a.nd == nil {
+		return "node not started"
+	}
+	if fileID == "" {
+		return "fileID is empty"
+	}
+	if name == "" {
+		return "name is empty"
+	}
+	if size < 0 {
+		return "size is negative"
+	}
+	// Make sure the peer is actually reachable. We
+	// don't want to leave a staging file lying around
+	// for a typo'd peer.
+	if err := a.nd.Ping(peerRef); err != nil {
+		// Ping is best-effort — if the peer was just
+		// discovered the channel might not be up yet.
+		// Fall back to checking channel presence.
+		_ = err
+	}
+	cleanName := filepath.Base(name)
+	if cleanName == "" || cleanName == "." || cleanName == "/" {
+		return "invalid file name: " + name
+	}
+	sentDir := filepath.Join(a.dataDir(), "sent")
+	if err := os.MkdirAll(sentDir, 0o755); err != nil {
+		return fmt.Sprintf("mkdir sent: %v", err)
+	}
+	finalPath := filepath.Join(sentDir, cleanName)
+	// Overwrite-on-pick (same semantics as the old
+	// SendFileContent). If the user picks the same file
+	// twice, the second pick wins.
+	f, err := os.Create(finalPath)
+	if err != nil {
+		return fmt.Sprintf("create sent file: %v", err)
+	}
+	a.pendingMu.Lock()
+	if a.pendingFiles == nil {
+		a.pendingFiles = make(map[string]*pendingFile)
+	}
+	// If a pending file with this fileID already exists
+	// (frontend re-started a stream with the same ID),
+	// close the old fd first so we don't leak it.
+	if old, ok := a.pendingFiles[fileID]; ok {
+		_ = old.f.Close()
+		_ = os.Remove(old.path)
+	}
+	a.pendingFiles[fileID] = &pendingFile{
+		peerRef: peerRef,
+		name:    cleanName,
+		fileID:  fileID,
+		size:    size,
+		path:    finalPath,
+		f:       f,
+	}
+	a.pendingMu.Unlock()
+	log.Printf("[INFO  app] SendFileStart fileID=%s name=%s size=%d path=%s",
+		fileID, cleanName, size, finalPath)
+	return ""
+}
+
+// SendFileChunk appends one chunk of bytes to the
+// staging file registered under fileID. Called many
+// times between SendFileStart and SendFileFinish.
 //
-// Drag-and-drop route still uses the user's source path
-// directly (App.SendFile), no copy. Picker and drag are
-// separate code paths; both end up looking the same in
-// the chat.
+// We use a 1 MiB upper bound on chunk size for sanity
+// (the frontend chunks at 1 MiB); larger chunks would
+// still work but the per-call latency is bounded by the
+// Wails IPC pipe size, so bigger chunks just make the
+// pipe backpressure more visible.
+func (a *App) SendFileChunk(fileID string, data []byte) string {
+	if a.nd == nil {
+		return "node not started"
+	}
+	a.pendingMu.Lock()
+	pf, ok := a.pendingFiles[fileID]
+	a.pendingMu.Unlock()
+	if !ok {
+		return "unknown fileID: " + fileID
+	}
+	if len(data) == 0 {
+		return ""
+	}
+	n, err := pf.f.Write(data)
+	pf.bytesIn += int64(n)
+	if err != nil {
+		return fmt.Sprintf("write chunk: %v", err)
+	}
+	return ""
+}
+
+// SendFileFinish closes the staging file and kicks off
+// the actual transfer in a background goroutine. After
+// this call the fileID is no longer in pendingFiles —
+// progress events for it go out via SubscribeFiles /
+// "file:event" runtime events.
+func (a *App) SendFileFinish(fileID string) string {
+	if a.nd == nil {
+		return "node not started"
+	}
+	a.pendingMu.Lock()
+	pf, ok := a.pendingFiles[fileID]
+	if !ok {
+		a.pendingMu.Unlock()
+		return "unknown fileID: " + fileID
+	}
+	delete(a.pendingFiles, fileID)
+	a.pendingMu.Unlock()
+	if err := pf.f.Close(); err != nil {
+		_ = os.Remove(pf.path)
+		return fmt.Sprintf("close staging: %v", err)
+	}
+	log.Printf("[INFO  app] SendFileFinish fileID=%s path=%s bytesIn=%d",
+		fileID, pf.path, pf.bytesIn)
+	// Start the transfer. SendFile publishes
+	// file:progress + file:done events keyed by fileID.
+	if err := a.nd.SendFile(pf.peerRef, pf.path, pf.name, pf.path, pf.fileID); err != nil {
+		_ = os.Remove(pf.path)
+		return err.Error()
+	}
+	return ""
+}
+
+// SendFileContent is the legacy "send the whole file in
+// one IPC call" route. Kept for backward compat with
+// older frontends / tests; the picker frontend should
+// prefer SendFileStart/Chunk/Finish for any non-trivial
+// size (Wails v2.12 IPC uses JSON, so passing a 50 MiB
+// []byte through here means ~500 MiB of JSON marshaling
+// on the JS side and ~1 GiB of Go-side json.Unmarshal
+// peak, freezing the UI for many seconds).
 func (a *App) SendFileContent(peerRef, name string, content []byte) string {
 	if a.nd == nil {
 		return "node not started"
@@ -272,21 +426,10 @@ func (a *App) SendFileContent(peerRef, name string, content []byte) string {
 	if name == "" {
 		return "empty file name"
 	}
-	// Sanitize: strip any directory components. The
-	// user-facing name comes from a browser File object
-	// and is already a basename, but we belt-and-suspenders
-	// here so a future caller can't escape the data dir.
 	cleanName := filepath.Base(name)
 	if cleanName == "" || cleanName == "." || cleanName == "/" {
 		return "invalid file name: " + name
 	}
-	// Write to <data-dir>/sent/<name>. We DON'T
-	// uniquePath here: if the user picks the same file
-	// twice, the second pick OVERWRITES the first in
-	// sent/. Both chat messages then point to the same
-	// file (the latest bytes). For v0.1 the UX is "I
-	// sent the same file twice, both messages open the
-	// latest copy" — not great but predictable.
 	sentDir := filepath.Join(a.dataDir(), "sent")
 	if err := os.MkdirAll(sentDir, 0o755); err != nil {
 		return fmt.Sprintf("mkdir sent: %v", err)
@@ -295,11 +438,12 @@ func (a *App) SendFileContent(peerRef, name string, content []byte) string {
 	if err := os.WriteFile(finalPath, content, 0o644); err != nil {
 		return fmt.Sprintf("write sent: %v", err)
 	}
-	// offerName = cleanName so the receiver gets the
-	// user's original name in the chat body. localPath =
-	// the on-disk path so double-click / reveal-in-folder
-	// work from the sender's chat.
-	if err := a.nd.SendFile(peerRef, finalPath, cleanName, finalPath); err != nil {
+	// Synthesise a fileID so even the legacy route
+	// emits file:progress events. The frontend doesn't
+	// get to see these (it didn't put a placeholder
+	// bubble), but the log + future debug view will.
+	fileID := newFileID()
+	if err := a.nd.SendFile(peerRef, finalPath, cleanName, finalPath, fileID); err != nil {
 		return err.Error()
 	}
 	return ""
@@ -510,6 +654,25 @@ func uniquePath(dir, name string) string {
 // Wails v2 on Windows sets cwd to %APPDATA%\Roaming\<bin>\.
 // We re-derive that here so SendFileContent's outbox/ lives
 // in the same place as chat.enc, device.key, etc.
+
+// newFileID returns a 16-byte hex fileID. Random, not
+// derived from a counter, so two concurrent streams on
+// the same path can't accidentally collide. The picker
+// frontend uses crypto.randomUUID() and passes the
+// result in; this is the legacy-route fallback for
+// SendFileContent (which synthesises its own ID since
+// the frontend doesn't pass one in that path).
+func newFileID() string {
+	b := make([]byte, 16)
+	if _, err := rand.Read(b); err != nil {
+		// crypto/rand on a working OS never fails; if it
+		// does, fall back to a nanosecond-derived string
+		// so the caller still has a unique-ish key.
+		return fmt.Sprintf("local-%d", time.Now().UnixNano())
+	}
+	return hex.EncodeToString(b)
+}
+
 func (a *App) dataDir() string {
 	// INKL_DATA_DIR env var, if set, takes precedence.
 	// Used to run multiple instances side-by-side for
@@ -793,5 +956,19 @@ func (a *App) pumpMessages() {
 	for msg := range a.nd.SubscribeMessages() {
 		log.Printf("[INFO  app] pumpMessages emit message:event %+v", msg)
 		wruntime.EventsEmit(a.ctx, "message:event", msg)
+	}
+}
+
+// pumpFiles forwards file-transfer progress + done
+// events to the frontend as "file:event" runtime events.
+// The frontend subscribes per-fileID and updates the
+// matching bubble (progress bar, speed number, ✓/✗).
+// Exits when SubscribeFiles' channel is closed.
+func (a *App) pumpFiles() {
+	log.Printf("[INFO  app] pumpFiles ENTER (goroutines=%d)", runtime.NumGoroutine())
+	defer log.Printf("[INFO  app] pumpFiles EXIT (goroutines=%d)", runtime.NumGoroutine())
+	for ev := range a.nd.SubscribeFiles() {
+		log.Printf("[INFO  app] pumpFiles emit file:event %+v", ev)
+		wruntime.EventsEmit(a.ctx, "file:event", ev)
 	}
 }

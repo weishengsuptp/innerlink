@@ -186,9 +186,9 @@ func (c *Conn) Recv(ctx context.Context) (Frame, error) {
 		if isHeartbeat(fr) {
 			continue
 		}
-		if debugFrameTrace {
-			log.Printf("[transport-trace] non-heartbeat frame body_len=%d remote=%s", len(fr.Body), c.remote)
-		}
+	if debugFrameTrace {
+		log.Printf("transport: non-heartbeat frame body_len=%d remote=%s", len(fr.Body), c.remote)
+	}
 		return fr, nil
 	}
 }

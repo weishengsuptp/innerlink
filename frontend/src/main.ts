@@ -33,7 +33,9 @@
 //     button. Drag-and-drop is scoped to the composer
 //     (Wails OnFileDrop with useDropTarget=true).
 //   - file transfer: drop -> SendFile (real path);
-//     📎 picker -> FileReader -> SendFileContent (bytes).
+//     📎 picker -> SendFileStart/Chunk/Finish (1 MiB
+//     chunks streamed over IPC, live progress via
+//     "file:event" runtime events).
 //   - unread badge: bumps on incoming messages to a
 //     non-selected peer, clears on selection.
 
@@ -52,7 +54,10 @@ import {
   Scan,
   SelfPeerID,
   SendFile,
+  SendFileChunk,
   SendFileContent,
+  SendFileFinish,
+  SendFileStart,
   SendText,
   SetMyAlias,
 } from '../wailsjs/go/app/App';
@@ -81,6 +86,26 @@ interface UIState {
   // unreadCount: peer hex ID -> number of incoming
   // messages not yet seen. Reset to 0 in selectPeer.
   unreadCount: Map<string, number>;
+  // fileBubbles: fileID -> file-bubble state. Picker
+  // route creates a placeholder bubble the moment the
+  // user picks a file (so the UI shows progress even
+  // before the Wails IPC round-trip completes), then
+  // file:event runtime events update the bar / speed /
+  // done state in place. Drag-and-drop bubbles go
+  // through the regular chat-message path (no
+  // fileBubbles entry, no live progress). 2026-06-25+.
+  fileBubbles: Map<string, FileBubbleState>;
+}
+
+interface FileBubbleState {
+  fileID: string;
+  name: string;
+  size: number;        // bytes total
+  sent: number;        // bytes sent (upload to core + core→peer)
+  bps: number;         // bytes per second (last 100 ms window)
+  status: 'pending' | 'sending' | 'done' | 'failed';
+  err: string;
+  peerId: string;      // hex peer ID
 }
 
 const state: UIState = {
@@ -91,6 +116,7 @@ const state: UIState = {
   history: new Map(),
   nearBottom: true,
   unreadCount: new Map(),
+  fileBubbles: new Map(),
 };
 
 // ----- small helpers -----
@@ -472,11 +498,97 @@ function renderMessages() {
     }
     parts.push(renderMessage(m, state.selectedId));
   }
+  // Picker-route file bubbles live OUTSIDE state.history
+  // (they're managed by state.fileBubbles + live
+  // file:event updates), so we re-append them here so
+  // a navigation back to this peer doesn't lose them.
+  if (state.fileBubbles.size > 0) {
+    const fp = state.selectedId;
+    for (const fb of state.fileBubbles.values()) {
+      if (fb.peerId === fp) {
+        parts.push(renderFileBubble(fb));
+      }
+    }
+  }
   // First-load system hint about E2E encryption.
   parts.push(`<div class="msg system"><div class="bubble">—— 端到端加密，每条消息独立会话密钥 ——</div></div>`);
   el.innerHTML = parts.join('');
   if (wasNearBottom) el.scrollTop = el.scrollHeight;
   state.nearBottom = isNearBottom(el);
+}
+
+// renderFileBubble builds the HTML for one picker-route
+// file bubble. The bubble is part of the .msg.self
+// stream (outgoing) and includes:
+//   - file icon + name + size
+//   - progress bar (color-filled from 0 to sent/size)
+//   - live speed number ("X.X MB/s") once we have at
+//     least one progress event
+//   - status row that flips from "排队中…" to a
+//     progress % to "已发送" / "失败: <err>"
+//
+// Identified by data-file-id so the file:event handler
+// can find it without re-rendering the whole list.
+function renderFileBubble(fb: FileBubbleState): string {
+  const pct = fb.size > 0 ? Math.min(100, Math.floor(fb.sent * 100 / fb.size)) : 0;
+  const sizeStr = humanSize(fb.size);
+  let statusHtml: string;
+  let barClass: string;
+  if (fb.status === 'failed') {
+    statusHtml = `<span class="file-status file-status-failed">失败: ${escapeHtml(fb.err || '未知错误')}</span>`;
+    barClass = 'file-bar-failed';
+  } else if (fb.status === 'done') {
+    statusHtml = `<span class="file-status file-status-done">已发送 · ${sizeStr}</span>`;
+    barClass = 'file-bar-done';
+  } else if (fb.sent > 0) {
+    const bpsStr = humanSize(fb.bps) + '/s';
+    statusHtml = `<span class="file-status">${pct}% · ${bpsStr} · ${sizeStr}</span>`;
+    barClass = '';
+  } else {
+    statusHtml = `<span class="file-status file-status-pending">排队中…</span>`;
+    barClass = '';
+  }
+  return `
+    <div class="msg self" data-file-id="${escapeHtml(fb.fileID)}">
+      <div class="av">我</div>
+      <div>
+        <div class="bubble file-bubble" title="右键更多">
+          <div class="file-msg">
+            <div class="file-icon">
+              <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><path d="M14 2v6h6"/></svg>
+            </div>
+            <div class="file-info">
+              <div class="file-name">${escapeHtml(fb.name)}</div>
+              <div class="file-bar ${barClass}">
+                <div class="file-bar-fill" style="width: ${pct}%"></div>
+              </div>
+              <div class="file-meta">${statusHtml}</div>
+            </div>
+          </div>
+        </div>
+        <div class="ts">…</div>
+      </div>
+    </div>
+  `;
+}
+
+// humanSize returns a human-readable file size string
+// (B / KiB / MiB / GiB) for the progress / bubble
+// labels. Binary units, no decimals above 99.9 to keep
+// the bubble width stable.
+function humanSize(n: number): string {
+  if (!n || n < 0) return '0 B';
+  if (n < 1024) return `${n} B`;
+  if (n < 1024 * 1024) return `${(n / 1024).toFixed(n < 10240 ? 1 : 0)} KiB`;
+  if (n < 1024 * 1024 * 1024) return `${(n / 1024 / 1024).toFixed(n < 10 * 1024 * 1024 ? 1 : 0)} MiB`;
+  return `${(n / 1024 / 1024 / 1024).toFixed(2)} GiB`;
+}
+
+// findFileBubbleEl looks up the DOM node for a file
+// bubble by its data-file-id. Returns null if the user
+// has navigated away or the bubble was cleared.
+function findFileBubbleEl(fileID: string): HTMLElement | null {
+  return document.querySelector(`[data-file-id="${CSS.escape(fileID)}"]`);
 }
 
 function renderMessage(m: node.Message, peerId: string): string {
@@ -636,15 +748,132 @@ function promptMore() {
 // sees their own outgoing file bubble — no need for an
 // intermediate "ready to send" UI step.
 //
-// sendPickerFile reads the file's bytes via FileReader
-// and hands them to SendFileContent. We can't reuse
-// SendFile (which takes a path) because the browser File
-// API hides the real on-disk path on modern engines.
+// sendPickerFile streams the picked file to core in
+// 1 MiB chunks so the UI never freezes (the previous
+// "Array.from the whole Uint8Array and IPC it as one
+// JSON call" path hit ~1 GiB of JSON marshaling peak
+// for a 50 MiB file on Windows — see the user's
+// 2026-06-25 bug report). The new flow:
+//
+//   1. Add a placeholder bubble the moment the file is
+//      picked, so the UI shows progress before any IPC
+//      round-trip completes.
+//   2. SendFileStart → core creates the staging file and
+//      registers it under fileID.
+//   3. Read the file in 1 MiB slices via Blob.arrayBuffer
+//      (no full-file memory copy) and SendFileChunk each.
+//   4. SendFileFinish → core closes the file and starts
+//      the actual transfer; progress bubbles on our side
+//      via the "file:event" runtime event.
 async function sendPickerFile(file: File) {
   if (!state.selectedId) return;
-  const buf = new Uint8Array(await file.arrayBuffer());
-  const r = await SendFileContent(state.selectedId, file.name, Array.from(buf));
-  if (r) toast(`发文件失败: ${r}`);
+  const peerId = state.selectedId;
+  const fileID = (crypto.randomUUID
+    ? crypto.randomUUID()
+    : `picker-${Date.now()}-${Math.random().toString(36).slice(2)}`);
+
+  // 1. Placeholder bubble — UI reacts IMMEDIATELY.
+  state.fileBubbles.set(fileID, {
+    fileID, name: file.name, size: file.size,
+    sent: 0, bps: 0,
+    status: 'pending', err: '',
+    peerId,
+  });
+  appendFileBubble(fileID);
+  // Scroll the bubble into view.
+  const el = document.getElementById('messages');
+  if (el) el.scrollTop = el.scrollHeight;
+
+  // 2. Start the core-side staging file.
+  const startErr = await SendFileStart(peerId, file.name, fileID, file.size);
+  if (startErr) {
+    markFileBubbleDone(fileID, false, startErr);
+    toast(`发文件失败: ${startErr}`);
+    return;
+  }
+  state.fileBubbles.get(fileID)!.status = 'sending';
+
+  // 3. Stream 1 MiB chunks. File.slice() doesn't read
+  // the whole file into memory at once — each slice is
+  // a fresh Blob backed by a memory-mapped view.
+  const CHUNK = 1024 * 1024;
+  let offset = 0;
+  try {
+    while (offset < file.size) {
+      const end = Math.min(offset + CHUNK, file.size);
+      const blob = file.slice(offset, end);
+      const buf = new Uint8Array(await blob.arrayBuffer());
+      const r = await SendFileChunk(fileID, buf);
+      if (r) throw new Error(r);
+      offset = end;
+    }
+    // 4. Close staging + kick the real transfer.
+    const finishErr = await SendFileFinish(fileID);
+    if (finishErr) throw new Error(finishErr);
+  } catch (e: any) {
+    markFileBubbleDone(fileID, false, e?.message || String(e));
+    toast(`发文件失败: ${e?.message || e}`);
+  }
+}
+
+// appendFileBubble inserts a single file bubble at the
+// END of the messages container (after the system
+// hint) so the user sees it appear immediately. We
+// don't go through renderMessages because that would
+// re-render the whole conversation and lose the
+// bubble's data-file-id reference (which the file:event
+// handler uses to update progress in place).
+function appendFileBubble(fileID: string) {
+  const el = document.getElementById('messages');
+  if (!el) return;
+  const fb = state.fileBubbles.get(fileID);
+  if (!fb) return;
+  el.insertAdjacentHTML('beforeend', renderFileBubble(fb));
+}
+
+// updateFileBubble refreshes the progress bar / speed
+// number on an existing bubble in place. Cheaper than
+// re-rendering the whole message list.
+function updateFileBubble(fileID: string, sent: number, bps: number) {
+  const fb = state.fileBubbles.get(fileID);
+  if (!fb) return;
+  fb.sent = sent;
+  fb.bps = bps;
+  fb.status = 'sending';
+  const root = findFileBubbleEl(fileID);
+  if (!root) return;
+  const pct = fb.size > 0 ? Math.min(100, Math.floor(sent * 100 / fb.size)) : 0;
+  const fill = root.querySelector('.file-bar-fill') as HTMLElement | null;
+  if (fill) fill.style.width = pct + '%';
+  const status = root.querySelector('.file-status');
+  if (status) status.textContent = `${pct}% · ${humanSize(bps)}/s · ${humanSize(fb.size)}`;
+}
+
+// markFileBubbleDone flips the bubble into its final
+// state. ok=true → green bar + "已发送"; ok=false → red
+// bar + the error message.
+function markFileBubbleDone(fileID: string, ok: boolean, errMsg: string) {
+  const fb = state.fileBubbles.get(fileID);
+  if (!fb) return;
+  fb.status = ok ? 'done' : 'failed';
+  fb.err = errMsg;
+  if (ok) fb.sent = fb.size; // bar at 100%
+  const root = findFileBubbleEl(fileID);
+  if (!root) return;
+  const fill = root.querySelector('.file-bar-fill') as HTMLElement | null;
+  if (fill) fill.style.width = ok ? '100%' : '0%';
+  const bar = root.querySelector('.file-bar');
+  if (bar) bar.classList.add(ok ? 'file-bar-done' : 'file-bar-failed');
+  const status = root.querySelector('.file-status');
+  if (status) {
+    if (ok) {
+      status.textContent = `已发送 · ${humanSize(fb.size)}`;
+      status.classList.add('file-status-done');
+    } else {
+      status.textContent = `失败: ${errMsg || '未知错误'}`;
+      status.classList.add('file-status-failed');
+    }
+  }
 }
 
 // resolveFilePath returns the on-disk path for a file
@@ -915,6 +1144,20 @@ function wireEvents() {
       const n = (state.unreadCount.get(m.PeerID) || 0) + 1;
       state.unreadCount.set(m.PeerID, n);
       renderPeerList();
+    }
+  });
+  // File-transfer events (progress + done) keyed by
+  // fileID. Picker-route bubbles listen on these to draw
+  // the progress bar in place; drag-and-drop bubbles
+  // ignore them (their fileID is "" so the lookup is a
+  // no-op).
+  EventsOn('file:event', (ev: any) => {
+    if (!ev || !ev.fileID) return;
+    if (ev.type === 'progress') {
+      updateFileBubble(ev.fileID, ev.sent, ev.bytesPerSec);
+    } else if (ev.type === 'done') {
+      markFileBubbleDone(ev.fileID, !!ev.ok, ev.err || '');
+      if (!ev.ok) toast(`发文件失败: ${ev.err || '未知错误'}`);
     }
   });
 }
