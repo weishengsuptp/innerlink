@@ -627,7 +627,7 @@ func (n *Node) wrapChannel(conn *transport.Conn, sess *handshake.Session) {
 						FirstSeen: e.FirstSeen,
 					})
 				}
-				added, err := n.rosterStore.MergeFromGossip(remote)
+				res, err := n.rosterStore.MergeFromGossip(remote)
 				if err != nil {
 					log.Printf("[ERROR] roster merge: %v", err)
 					break
@@ -635,15 +635,15 @@ func (n *Node) wrapChannel(conn *transport.Conn, sess *handshake.Session) {
 				if err := n.rosterStore.Save(); err != nil {
 					log.Printf("[ERROR] roster save: %v", err)
 				}
-				if len(added) > 0 {
+				if len(res.Added) > 0 {
 					log.Printf("[ROSTER] sync from %s: %d new entries: %s",
-						peerHexStr, len(added), strings.Join(added, ", "))
+						peerHexStr, len(res.Added), strings.Join(res.Added, ", "))
 					n.broadcastRosterToAll(sess.RemotePeerID)
 					if n.autoScan != nil {
 						n.broadcastScanHistoryToAll(sess.RemotePeerID)
 					}
 					if n.autoScan != nil {
-						for _, peerID := range added {
+						for _, peerID := range res.Added {
 							entry, err := n.rosterStore.Get(peerID)
 							if err == nil {
 								n.autoScan.EnqueueIfNew(entry.Addrs)
@@ -651,12 +651,34 @@ func (n *Node) wrapChannel(conn *transport.Conn, sess *handshake.Session) {
 						}
 					}
 				} else {
-					// Look for any alias updates in this gossip
-					// (MergeFromGossip updates aliases on existing
-					// entries even when no new entries arrive). We
-					// don't have a "what changed" return value from
-					// MergeFromGossip today, so just note the sync.
 					log.Printf("[ROSTER] sync from %s: 0 new (already known; alias may have updated)", peerHexStr)
+				}
+				// Emit a local peer:event whenever the roster
+				// changed in any visible way — new entries,
+				// alias updates, or dedup resets. The frontend
+				// listens for this and re-fetches ListPeers, so
+				// a remote alias change becomes visible in B's
+				// UI without waiting for B to do anything itself
+				// (the user's reported bug: "A changed their
+				// alias but B's list didn't update until B also
+				// changed theirs" was exactly this signal being
+				// missing).
+				if len(res.Added)+len(res.AliasChanged)+len(res.Reset) > 0 {
+					for _, pid := range res.Added {
+						n.publishPeerEvent(PeerEvent{Type: PeerUpdated, PeerID: pid})
+					}
+					for _, pid := range res.AliasChanged {
+						n.publishPeerEvent(PeerEvent{Type: PeerUpdated, PeerID: pid})
+					}
+					for _, pid := range res.Reset {
+						n.publishPeerEvent(PeerEvent{Type: PeerUpdated, PeerID: pid})
+					}
+					if len(res.AliasChanged) > 0 {
+						log.Printf("[ROSTER] alias updated for %s", strings.Join(res.AliasChanged, ", "))
+					}
+					if len(res.Reset) > 0 {
+						log.Printf("[ROSTER] marked %s reset (ghost dedup)", strings.Join(res.Reset, ", "))
+					}
 				}
 			case protocol.TypeScanHistory:
 				var sh protocol.ScanHistory

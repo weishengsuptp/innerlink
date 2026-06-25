@@ -144,6 +144,14 @@ at(6000, async () => {
   console.log(`  B last peers: count=${r.count} ${JSON.stringify(r.peers)}`);
   assert(r.count === 1, 'B sees exactly 1 peer');
   assert(r.peers.some(p => p.name === '老板'), 'B sees alias "老板" for A');
+  // Verify the peer:event signal fired (the bug fix
+  // for "A changed alias but B's list didn't update").
+  // The CLI doesn't drain peerEventCh (no frontend), but
+  // the alias-update log line is emitted by the same code
+  // path so we can assert it appears.
+  const bLog = fs.readFileSync(path.join(ROOT, 'b.log'), 'utf8');
+  assert(/alias updated for/.test(bLog),
+    'B logs alias update (UI would refresh via peer:event)');
 }, 'A: myalias 老板 + assert');
 
 // S3: A changes alias to "新名"
