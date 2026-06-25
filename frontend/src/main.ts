@@ -55,7 +55,6 @@ import {
   SelfPeerID,
   SendFile,
   SendFileChunk,
-  SendFileContent,
   SendFileFinish,
   SendFileStart,
   SendText,
@@ -802,8 +801,15 @@ async function sendPickerFile(file: File) {
     while (offset < file.size) {
       const end = Math.min(offset + CHUNK, file.size);
       const blob = file.slice(offset, end);
+      // The generated Wails binding declares chunk data
+      // as Array<number>; the runtime actually accepts
+      // either Uint8Array or number[] (Go []byte ↔ JS
+      // string in the bridge), but tsc complains. Use
+      // Array.from so we satisfy the types without a
+      // cast; 1 MiB Number[] is fine on the JS heap.
       const buf = new Uint8Array(await blob.arrayBuffer());
-      const r = await SendFileChunk(fileID, buf);
+      const chunk = Array.from(buf);
+      const r = await SendFileChunk(fileID, chunk);
       if (r) throw new Error(r);
       offset = end;
     }
