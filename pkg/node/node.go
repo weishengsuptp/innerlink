@@ -174,6 +174,17 @@ func New(opts Options) (*Node, error) {
 	if _, err := rosterStore.Add(selfEntry); err != nil {
 		return nil, fmt.Errorf("roster: add self: %w", err)
 	}
+	// Tell the roster which entry is "us" so the dedup
+	// scan can recognise a (hostname, IP) collision
+	// with self as the device-key-reset case: the
+	// incoming gossip entry is then the OLD self
+	// identity, not a real new peer, and gets marked
+	// Reset instead of hiding our own entry.
+	// Without this, a user who deletes their data
+	// folder and re-launches briefly sees their own
+	// previous alias in their own peer list until
+	// gossip converges.
+	rosterStore.SetSelf(id.PeerIDHex())
 	if selfEntry.Alias != "" {
 		log.Printf("[INFO ] self alias:      %q", selfEntry.Alias)
 	} else {

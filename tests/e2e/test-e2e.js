@@ -247,6 +247,58 @@ at(26000, async () => {
     `B does NOT see A-old peerID ${oldID} (ghost dedup worked)`);
 }, 'regen A device.key + assert no ghost');
 
+// S8 (2026-06-25+): after the data-folder-reset in
+// S7, A's OWN roster must not show its own previous
+// alias as a peer. The bug pre-fix was: the dedup scan
+// in MergeFromGossip marked the LOCAL SELF (added at
+// startup, before gossip arrived) as Reset, and added
+// the incoming OLD self identity as active, so the user
+// saw their own previous alias in their own peer list
+// until further gossip rounds "naturally" cleared it
+// (which they never quite did, since Reset is sticky).
+// Post-fix: when the dedup collision is with self
+// (peerID matches SetSelf), the INCOMING entry is
+// marked Reset and the self stays active.
+//
+// We can't reliably cross-reference the OLD vs NEW
+// peerID for A because the test's spawnInst() wipes
+// a.log on every respawn — only the LAST startup's log
+// survives. Instead, we observe the user-visible
+// symptom directly: the `peers` REPL command filters
+// out IsSelf, so any ghost entry from the old self
+// would show up as a second entry. Pre-fix: A's
+// `peers` returned 2 entries (B + A-old, where A-old
+// had whatever alias B last saw, e.g. "新我" or
+// "新名"). Post-fix: A's `peers` returns exactly 1
+// entry (B), never the old self.
+at(30000, async () => {
+  console.log('\n=== S8: A own roster clean after data-folder reset ===');
+  send('A', 'peers');
+  await sleep(500);
+  const aOut = lastPeersOutput('A');
+  console.log(`  A last peers: count=${aOut.count} ${JSON.stringify(aOut.peers)}`);
+
+  // The big check: count must be 1. Pre-fix it was 2
+  // (B + A-old with the previous alias).
+  assert(aOut.count === 1,
+    `A's own roster has exactly 1 peer (B), not 2 (B + ghost) — got count=${aOut.count}`);
+  // The 1 peer must be B. We can identify A-old's ghost
+  // by the alias — whichever alias B last saw for A
+  // before S7 wiped. The S7 test pre-wrote alias.txt =
+  // "新我", so any ghost in A's list would also be "新我"
+  // (B had A's prior view of the alias from S3-S4, but
+  // S7 re-asserts "新我" via the freshly written alias.txt
+  // and the S7 respawn's RosterSync).
+  const hasNewMe = aOut.peers.some(p => p.name === '新我');
+  assert(!hasNewMe,
+    'A does NOT see its own new alias "新我" in its own list (would be the ghost signature)');
+  // And the pre-S7 alias that B last saw for A was "新名" (S3).
+  // If the ghost showed up under that older name, we'd see it too.
+  const hasXinMing = aOut.peers.some(p => p.name === '新名');
+  assert(!hasXinMing,
+    'A does NOT see the pre-reset alias "新名" in its own list either');
+}, 'A own-roster clean after reset');
+
 at(32000, async () => {
   console.log('\n=== FINAL ===');
   if (failures > 0) {

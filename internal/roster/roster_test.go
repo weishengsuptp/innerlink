@@ -390,6 +390,166 @@ func TestStore_DedupIsOneShot(t *testing.T) {
 	}
 }
 
+// TestStore_DedupMarksIncomingOnSelfCollision (2026-06-25+):
+// when an incoming gossip entry collides on (hostname, IP)
+// with the LOCAL SELF (the entry whose peerID was
+// registered via SetSelf), the INCOMING entry is the old
+// self identity (a stale "you were this peerID last time"
+// view held by some peer after a device.key reset).
+// Dedup must mark the INCOMING entry Reset, not the local
+// self — otherwise the self becomes hidden and the old
+// alias takes its place in the UI.
+//
+// Scenario: user deletes their data folder (roster
+// starts empty) and re-launches with a new device.key.
+// Startup adds the new self (newPID). When the app
+// connects to a peer who still holds the OLD self
+// entry, the gossip brings in oldPID with same
+// (hostname, IP) but different peerID. The bug pre-fix
+// was: dedup marked newPID (self) as Reset and added
+// oldPID as active, so the user briefly saw their own
+// previous alias in their own list. Post-fix: oldPID
+// is the one marked Reset, newPID stays active.
+func TestStore_DedupMarksIncomingOnSelfCollision(t *testing.T) {
+	tmp := filepath.Join(t.TempDir(), "roster.json")
+	s, _ := Open(tmp)
+	const newPID = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+	const oldPID = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+	const hostname = "DESKTOP-PBJ7K9M"
+	const addr = "192.168.40.129:4748"
+
+	// Local self added at startup (new device.key after
+	// data-folder reset → empty roster → no collision).
+	if _, err := s.Add(Entry{
+		PeerID:   newPID,
+		Hostname: hostname,
+		Addrs:    []string{addr},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	// Register the self peerID so the dedup scan can
+	// recognise future collisions with it.
+	s.SetSelf(newPID)
+
+	// Gossip arrives carrying the OLD self identity
+	// (the user was "大牛" before the reset).
+	res, err := s.MergeFromGossip([]Entry{{
+		PeerID:   oldPID,
+		Hostname: hostname,
+		Alias:    "大牛",
+		Addrs:    []string{addr},
+	}})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Self must still be active and visible.
+	self, _ := s.Get(newPID)
+	if self.Reset {
+		t.Errorf("local self %s was wrongly marked Reset by dedup — that hides the user's own entry", newPID)
+	}
+	// The old self identity must be the one marked Reset.
+	old, _ := s.Get(oldPID)
+	if !old.Reset {
+		t.Errorf("old self identity %s not marked Reset (it's the stale entry from a peer's view of the previous install)", oldPID)
+	}
+	if old.Alias != "大牛" {
+		t.Errorf("old entry Alias = %q, want 大牛 (preserved from gossip)", old.Alias)
+	}
+
+	// res.Added must NOT include the incoming ghost —
+	// the caller (node.go) uses Added to schedule
+	// presence probes and broadcast the new entry;
+	// neither makes sense for a self-collision ghost.
+	for _, pid := range res.Added {
+		if pid == oldPID {
+			t.Errorf("res.Added includes ghost %s — caller would push it to other peers", oldPID)
+		}
+	}
+
+	// ListActive must surface the self and hide the ghost.
+	active := s.ListActive()
+	foundSelf, foundGhost := false, false
+	for _, e := range active {
+		switch e.PeerID {
+		case newPID:
+			foundSelf = true
+		case oldPID:
+			foundGhost = true
+		}
+	}
+	if !foundSelf {
+		t.Errorf("ListActive missing local self %s", newPID)
+	}
+	if foundGhost {
+		t.Errorf("ListActive still includes ghost oldPID %s", oldPID)
+	}
+}
+
+// TestStore_DedupSelfCollisionSticky (2026-06-25+):
+// the dedup-induced Reset on the incoming self-collision
+// entry is sticky: subsequent gossip bringing the same
+// old entry back, or an explicit Add touching it, must
+// not "un-reset" it. Same one-shot rule as the existing
+// "防止状态反复" guarantee.
+func TestStore_DedupSelfCollisionSticky(t *testing.T) {
+	tmp := filepath.Join(t.TempDir(), "roster.json")
+	s, _ := Open(tmp)
+	const newPID = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+	const oldPID = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+	s.Add(Entry{PeerID: newPID, Hostname: "h", Addrs: []string{"1.2.3.4:4748"}})
+	s.SetSelf(newPID)
+	s.MergeFromGossip([]Entry{{PeerID: oldPID, Hostname: "h", Addrs: []string{"1.2.3.4:4748"}}})
+
+	old, _ := s.Get(oldPID)
+	if !old.Reset {
+		t.Fatal("old not reset after first dedup")
+	}
+
+	// Second gossip round with the same old entry —
+	// must stay Reset, not flip back to active.
+	s.MergeFromGossip([]Entry{{PeerID: oldPID, Hostname: "h", Addrs: []string{"1.2.3.4:4748"}}})
+	old, _ = s.Get(oldPID)
+	if !old.Reset {
+		t.Errorf("ghost reset state lost after re-gossip")
+	}
+
+	// Add re-touching the old entry — also must stay Reset.
+	s.Add(Entry{PeerID: oldPID, Hostname: "h-updated", Addrs: []string{"1.2.3.4:4748"}})
+	old, _ = s.Get(oldPID)
+	if !old.Reset {
+		t.Errorf("ghost Reset cleared by re-Add")
+	}
+}
+
+// TestStore_DedupWithoutSetSelf: when SetSelf was never
+// called, dedup falls back to the pre-fix "older wins"
+// behaviour (mark the existing entry Reset). This is the
+// legacy test path — keep it working so callers that
+// don't opt in to self-awareness aren't affected.
+func TestStore_DedupWithoutSetSelf(t *testing.T) {
+	tmp := filepath.Join(t.TempDir(), "roster.json")
+	s, _ := Open(tmp)
+	const oldA = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+	const newB = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+	s.Add(Entry{PeerID: oldA, Hostname: "vm-1", Addrs: []string{"1.2.3.4:4748"}})
+	// NOTE: no SetSelf call.
+
+	res, err := s.MergeFromGossip([]Entry{{PeerID: newB, Hostname: "vm-1", Addrs: []string{"1.2.3.4:4748"}}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	a, _ := s.Get(oldA)
+	if !a.Reset {
+		t.Errorf("without SetSelf, old entry %s not marked Reset (legacy dedup behaviour)", oldA)
+	}
+	for _, pid := range res.Added {
+		if pid != newB {
+			t.Errorf("res.Added = %v, want only [%s]", res.Added, newB)
+		}
+	}
+}
+
 // TestStore_MarkReset exercises the explicit API as
 // well as the idempotency contract: marking twice is
 // a no-op, marking a missing peerID is an error.
