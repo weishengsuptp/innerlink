@@ -129,8 +129,27 @@ type fileFormat struct {
 type Store struct {
 	path string
 
-	mu      sync.RWMutex // protects m
+	mu      sync.RWMutex // protects m AND selfPeerID
 	m       map[string]Entry
+	// selfPeerID is the peerID of the local self entry
+	// (the entry added by New() at process start). The
+	// dedup scan uses it to disambiguate the "device.key
+	// reset" scenario: when an incoming entry collides on
+	// (hostname, IP) with the LOCAL SELF, the incoming
+	// entry is the old self identity (a stale entry left
+	// in some peer's roster from a previous install) and
+	// must be marked Reset — NOT the self. Without this
+	// signal, dedup naively marks whichever entry
+	// arrived first, which happens to be the self
+	// (added at startup before gossip arrives) and
+	// produces the bug: a user who deletes their data
+	// folder and re-launches briefly sees their own
+	// previous alias in their own peer list.
+	//
+	// Set via SetSelf once after the self entry is
+	// added. Not persisted — the caller knows its own
+	// peerID and re-sets it on every process start.
+	selfPeerID string
 
 	saveMu sync.Mutex // serializes Save()
 	dirty  bool       // m has changes not yet on disk
@@ -177,6 +196,23 @@ func Open(path string) (*Store, error) {
 	return s, nil
 }
 
+// SetSelf records the peerID of the local self entry,
+// so the dedup scan can recognise "collision with self"
+// and mark the INCOMING (old) entry as Reset instead of
+// the local self. The caller is expected to call this
+// once during Node construction, after Add(selfEntry).
+//
+// Idempotent. The most recent call wins. Passing ""
+// disables self-awareness (back to the pre-fix
+// behaviour: dedup blindly marks whichever entry
+// arrived first). The production code path always
+// sets a real peerID.
+func (s *Store) SetSelf(peerID string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.selfPeerID = peerID
+}
+
 // Add inserts or updates an entry. Empty peerID is an
 // error (caller bug). If the entry already exists, the
 // hostname, alias, and addrs are refreshed, first_seen
@@ -194,6 +230,15 @@ func Open(path string) (*Store, error) {
 // latter was the source of the bug where a regenerated
 // device.key left the old self-entry visible as a peer
 // in the user's own UI.
+//
+// Self-collision rule (2026-06-25+): if the collision
+// is with the entry whose peerID matches SetSelf, the
+// incoming entry is the old self identity (stale
+// "device.key was reset" view held by some peer), so
+// the INCOMING entry is the one marked Reset. The self
+// stays active. This is the fix for "user deleted data
+// folder, re-launched, sees their own previous alias
+// in their own list until gossip dedup catches up".
 //
 // Returns true if the entry is new (didn't exist
 // before). Callers use this to decide whether to push
@@ -225,6 +270,11 @@ func (s *Store) Add(e Entry) (added bool, err error) {
 	// new peerID first. The scan only marks ghosts
 	// reset; it never overwrites or deletes them, so
 	// double-scanning is harmless.
+	//
+	// Self-collision: if SetSelf was called and the
+	// collision matches the self peerID, the INCOMING
+	// entry is the old self identity — mark e as Reset
+	// (sticky) instead of hiding the self.
 	if len(e.Addrs) > 0 && e.Hostname != "" {
 		for existingPID, ghost := range s.m {
 			if existingPID == e.PeerID {
@@ -237,6 +287,19 @@ func (s *Store) Add(e Entry) (added bool, err error) {
 				continue
 			}
 			if !addrsOverlap(ghost.Addrs, e.Addrs) {
+				continue
+			}
+			if existingPID == s.selfPeerID {
+				// Self-collision: incoming is the old
+				// identity. Don't touch self.
+				e.Reset = true
+				// Don't break — keep scanning. Other
+				// collisions (e.g. a stale entry from
+				// yet another peer who also saw the
+				// old self) should also reset e, not
+				// the existing ghost. With Reset=true
+				// the guard `if ghost.Reset { continue }`
+				// already skips already-reset ghosts.
 				continue
 			}
 			ghost.Reset = true
@@ -391,6 +454,18 @@ func (s *Store) MarkReset(peerID string) error {
 // Reset=true once. The new entry is then added
 // normally. The reset marker is sticky.
 //
+// Self-collision (2026-06-25+): if the existing entry
+// is the LOCAL SELF (peerID matches SetSelf), the
+// incoming entry is the old self identity — typically
+// a peer's stale "you were this peerID last time we
+// talked" view after a device.key reset. Mark the
+// INCOMING entry as Reset (sticky) and skip adding it
+// to res.Added (it isn't a real new peer). This is the
+// fix for the "after device.key reset I see my own
+// previous alias in my own list" bug — without it, the
+// dedup scan would mark the local self (added at
+// startup, before gossip arrives) as the ghost.
+//
 // Returns the list of peerIDs that were newly added —
 // the caller uses this to decide whether to schedule
 // a dial to those peers (presence probe). Reset
@@ -447,7 +522,11 @@ func (s *Store) MergeFromGossip(remote []Entry) (MergeResult, error) {
 		// New entry. Dedup scan: any existing entry
 		// with a matching (IP, hostname) but DIFFERENT
 		// peerID is a "ghost of the previous install"
-		// — mark it reset.
+		// — but the rule flips if the collision is with
+		// the LOCAL SELF (SetSelf): the incoming entry
+		// is then the old self identity, NOT a real new
+		// peer, and is itself marked Reset.
+		incomingGhost := false
 		if len(e.Addrs) > 0 && e.Hostname != "" {
 			for existingPID, ghost := range s.m {
 				if existingPID == e.PeerID {
@@ -462,6 +541,13 @@ func (s *Store) MergeFromGossip(remote []Entry) (MergeResult, error) {
 				if !addrsOverlap(ghost.Addrs, e.Addrs) {
 					continue
 				}
+				if existingPID == s.selfPeerID {
+					// Self-collision: incoming is the
+					// old self identity. Don't touch
+					// self; mark incoming.
+					incomingGhost = true
+					continue
+				}
 				ghost.Reset = true
 				s.m[existingPID] = ghost
 				s.dirty = true
@@ -474,9 +560,14 @@ func (s *Store) MergeFromGossip(remote []Entry) (MergeResult, error) {
 		if e.LastSeen.IsZero() {
 			e.LastSeen = time.Now().UTC()
 		}
+		if incomingGhost {
+			e.Reset = true
+		}
 		s.m[e.PeerID] = e
 		s.dirty = true
-		res.Added = append(res.Added, e.PeerID)
+		if !incomingGhost {
+			res.Added = append(res.Added, e.PeerID)
+		}
 	}
 	sort.Strings(res.Added)
 	sort.Strings(res.AliasChanged)
