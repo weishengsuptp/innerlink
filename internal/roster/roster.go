@@ -395,7 +395,26 @@ func (s *Store) MarkReset(peerID string) error {
 // the caller uses this to decide whether to schedule
 // a dial to those peers (presence probe). Reset
 // victims are NOT included.
-func (s *Store) MergeFromGossip(remote []Entry) (newlyAdded []string, err error) {
+// MergeResult tells the caller exactly what changed
+// during a MergeFromGossip, so the upper layer can
+// emit the right UI event without having to diff
+// the roster before / after.
+//
+// added          - peerIDs that were newly inserted
+// aliasChanged   - peerIDs whose Alias field changed
+//                  (may overlap with added; for an
+//                  existing entry, "changed" means
+//                  the gossip alias was different)
+// reset          - peerIDs that were just marked
+//                  Reset=true by the dedup scan
+type MergeResult struct {
+	Added        []string
+	AliasChanged []string
+	Reset        []string
+}
+
+func (s *Store) MergeFromGossip(remote []Entry) (MergeResult, error) {
+	res := MergeResult{}
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	for _, e := range remote {
@@ -421,6 +440,7 @@ func (s *Store) MergeFromGossip(remote []Entry) (newlyAdded []string, err error)
 				existing.Alias = e.Alias
 				s.m[e.PeerID] = existing
 				s.dirty = true
+				res.AliasChanged = append(res.AliasChanged, e.PeerID)
 			}
 			continue
 		}
@@ -445,6 +465,7 @@ func (s *Store) MergeFromGossip(remote []Entry) (newlyAdded []string, err error)
 				ghost.Reset = true
 				s.m[existingPID] = ghost
 				s.dirty = true
+				res.Reset = append(res.Reset, existingPID)
 			}
 		}
 		if e.FirstSeen.IsZero() {
@@ -455,10 +476,12 @@ func (s *Store) MergeFromGossip(remote []Entry) (newlyAdded []string, err error)
 		}
 		s.m[e.PeerID] = e
 		s.dirty = true
-		newlyAdded = append(newlyAdded, e.PeerID)
+		res.Added = append(res.Added, e.PeerID)
 	}
-	sort.Strings(newlyAdded)
-	return newlyAdded, nil
+	sort.Strings(res.Added)
+	sort.Strings(res.AliasChanged)
+	sort.Strings(res.Reset)
+	return res, nil
 }
 
 // addrsOverlap returns true if two addr lists share

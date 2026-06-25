@@ -78,10 +78,23 @@ type PeerInfo struct {
 type PeerEventType string
 
 const (
-	PeerAdded   PeerEventType = "added"   // discovery saw this peer for the first time
+PeerAdded   PeerEventType = "added"   // discovery saw this peer for the first time
 	PeerRemoved PeerEventType = "removed" // discovery timed out this peer
 	PeerOnline  PeerEventType = "online"  // channel became ready
 	PeerOffline PeerEventType = "offline" // channel closed
+	// PeerUpdated fires when the local roster changes
+	// for a reason that ISN'T a presence transition —
+	// e.g. a remote peer broadcast a new alias, or a
+	// dedup reset marked a peer. The frontend listens
+	// for this and calls refreshAll() to re-render the
+	// peer list with the new data. Without this signal,
+	// alias updates land in the data layer but the UI
+	// stays stale until something else (presence,
+	// self-action) triggers a refresh — which produces
+	// the user-visible bug "A changed their alias but
+	// B's list didn't update until B also changed
+	// theirs".
+	PeerUpdated PeerEventType = "updated"
 )
 
 // PeerEvent is one transition. SubscribePeers() delivers

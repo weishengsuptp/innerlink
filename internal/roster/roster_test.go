@@ -133,12 +133,12 @@ func TestStore_MergeFromGossip(t *testing.T) {
 		{PeerID: "11111111111111112222222222222222", Hostname: "z", Addrs: []string{"192.168.40.3:4748"}},
 		{PeerID: "garbage", Hostname: "should-be-skipped"}, // malformed
 	}
-	newly, err := s.MergeFromGossip(remote)
+	res, err := s.MergeFromGossip(remote)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(newly) != 2 {
-		t.Errorf("newly added = %v, want 2 entries (y, z)", newly)
+	if len(res.Added) != 2 {
+		t.Errorf("newly added = %v, want 2 entries (y, z)", res.Added)
 	}
 	// X should NOT be refreshed by gossip — local direct
 	// observation wins. This is the v0.5 design choice
@@ -277,12 +277,12 @@ func TestStore_DedupResetOnMerge(t *testing.T) {
 		Hostname: "vm-1",
 		Addrs:    []string{"192.168.40.5:4748"},
 	}}
-	newly, err := s.MergeFromGossip(remote)
+	res, err := s.MergeFromGossip(remote)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(newly) != 1 || newly[0] != newID {
-		t.Errorf("newly added = %v, want [%s]", newly, newID)
+	if len(res.Added) != 1 || res.Added[0] != newID {
+		t.Errorf("newly added = %v, want [%s]", res.Added, newID)
 	}
 
 	// Old ghost should be reset.
