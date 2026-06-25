@@ -95,6 +95,8 @@ D:\innerlink\
 - CI 三平台跑：`ubuntu-22.04` / `windows-latest` / `macos-14`（**不要** `macos-latest`，新 dyld 严格 LC_UUID，Wails 2.12 CLI 起不来；也不要 `ubuntu-latest`，新 noble 24.04 没 webkit2gtk-4.0）。
 - Wails CLI 装 `v2.12.0`（跟 `go.mod` 一致），不升 nightly。
 - Release workflow：手动 tag + force push；不自动 release（公网公钥 push 用 inline token 临时方案，不入仓）。
+- **`frontend/dist/.gitkeep` 必须入库**：`main.go:36` 有 `//go:embed all:frontend/dist`，fresh clone 目录空会编译失败；Go `all:` 前缀会包含 `.` 开头的文件，所以 `.gitkeep` 能满足 embed。`wails build -clean` 会清空 `frontend/dist/` 包括已跟踪的 `.gitkeep`，所以 build 后 commit 前要 `git checkout HEAD -- frontend/dist/.gitkeep` 恢复，或者用单独的 chore commit 兜底。
+- **本地 pre-push 必跑 `wails build -clean -nopackage`**（不带 `-s`），`-s`/`-nopackage` 单独用会跳过 `tsc && vite build`，TS 类型错会漏到 CI（参考 879c55c 的 `Uint8Array`/`SendFileContent` 类型错）。
 
 ## 调试
 
