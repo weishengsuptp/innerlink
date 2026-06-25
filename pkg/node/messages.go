@@ -47,6 +47,78 @@ func (n *Node) SubscribeMessages() <-chan Message {
 	return n.messageCh
 }
 
+// publishFileEvent drops a file-transfer event into
+// the SubscribeFiles() channel with drop-oldest
+// backpressure (mirrors publishPeerEvent's pattern).
+// Used by SendFile to fan progress + done notifications
+// out to the GUI's "file:event" listener.
+func (n *Node) publishFileEvent(ev FileEvent) {
+	if n.fileEventCh == nil {
+		return
+	}
+	select {
+	case n.fileEventCh <- ev:
+	default:
+		select {
+		case <-n.fileEventCh:
+		default:
+		}
+		select {
+		case n.fileEventCh <- ev:
+		default:
+		}
+	}
+}
+
+// FileEventType enumerates the file-transfer progress
+// events the GUI subscribes to. The frontend listens on
+// "file:event" Wails runtime events; the per-file
+// updates carry fileID so a single channel can carry
+// many concurrent transfers without the GUI having to
+// match by name or timestamp.
+type FileEventType string
+
+const (
+	FileEventProgress FileEventType = "progress" // sent/total updated; draw bar + speed
+	FileEventDone     FileEventType = "done"     // ok + err; draw ✓ or ✗
+)
+
+// FileEvent is the payload of the "file:event" runtime
+// event. fileID identifies the bubble on the GUI side
+// (the picker frontend generates a UUID when the user
+// picks a file and passes it to SendFileStart; the drag-
+// and-drop route also synthesises one if missing).
+//
+// Sent/Total are bytes moved / bytes total. For the
+// "done" event they are equal; for a failed transfer
+// Err is non-empty.
+//
+// 2026-06-25+: progress is now Wails-runtime-driven
+// instead of [FILE] log lines only. The old log lines
+// are still emitted (they're useful for log dumps
+// during triage), but the GUI updates the bubble from
+// this event so progress is visible without tabbing
+// to the terminal.
+type FileEvent struct {
+	Type      FileEventType `json:"type"`
+	FileID    string        `json:"fileID"`
+	Sent      int64         `json:"sent"`
+	Total     int64         `json:"total"`
+	BytesPerSec int64       `json:"bytesPerSec"`
+	OK        bool          `json:"ok"`
+	Err       string        `json:"err,omitempty"`
+}
+
+// SubscribeFiles returns a channel of file-transfer
+// progress events. Buffered to 32; under sustained
+// progress (e.g. 1 MiB chunks at 30 Hz) drops oldest
+// rather than blocking the sender goroutine.
+//
+// The channel is closed when Close() is called.
+func (n *Node) SubscribeFiles() <-chan FileEvent {
+	return n.fileEventCh
+}
+
 // SendText sends a chat message to a peer, identified
 // by either an alias name or a 32-char hex PeerID.
 // Returns an error if no active channel exists for the
@@ -124,8 +196,18 @@ func (n *Node) SendText(peerRef, text string) error {
 //     on-disk path; the user knows where they picked
 //     the file from and can find it themselves).
 //
-// Progress is logged to the configured log sink.
-func (n *Node) SendFile(peerRef, path, offerName, localPath string) error {
+// fileID is the bubble ID on the GUI side. The
+// frontend generates a UUID when the user picks a file
+// and passes it through SendFileStart → SendFileFinish
+// → this call. Drag-and-drop synthesises one if the
+// caller passes "" so progress events still reach
+// the right bubble.
+//
+// Progress is logged to the configured log sink and
+// also published to SubscribeFiles() as FileEvent
+// values, so the GUI can update its bubble in real
+// time without polling logs.
+func (n *Node) SendFile(peerRef, path, offerName, localPath, fileID string) error {
 	if n.ctx == nil {
 		return errors.New("node: not started")
 	}
@@ -144,6 +226,14 @@ func (n *Node) SendFile(peerRef, path, offerName, localPath string) error {
 	if st == nil {
 		return errors.New("no active channel for peer " + peerHexStr)
 	}
+	// Sliding-window speed estimate (last 1 s of
+	// progress samples) so the GUI can show "X.X MB/s"
+	// without doing its own EWMA. We accumulate bytes
+	// since the last speed-flush tick and emit the
+	// rate on each flush.
+	var lastFlush time.Time
+	var lastSent int64
+	var windowBytes int64
 	progress := func(sent, total int64) {
 		pct := int64(0)
 		if total > 0 {
@@ -151,17 +241,61 @@ func (n *Node) SendFile(peerRef, path, offerName, localPath string) error {
 		}
 		log.Printf("[FILE] sending %s to %s  %d/%d bytes (%d%%)",
 			path, peerHexStr, sent, total, pct)
+		// Emit at most ~10 Hz to avoid flooding the
+		// event channel on a fast transfer.
+		now := time.Now()
+		if lastFlush.IsZero() {
+			lastFlush = now
+			lastSent = sent
+		}
+		windowBytes += sent - lastSent
+		lastSent = sent
+		if now.Sub(lastFlush) < 100*time.Millisecond {
+			return
+		}
+		bps := int64(float64(windowBytes) / now.Sub(lastFlush).Seconds())
+		n.publishFileEvent(FileEvent{
+			Type:        FileEventProgress,
+			FileID:      fileID,
+			Sent:        sent,
+			Total:       total,
+			BytesPerSec: bps,
+		})
+		lastFlush = now
+		windowBytes = 0
 	}
-	log.Printf("[FILE] start send peer=%s path=%s offerName=%s localPath=%q",
-		peerHexStr, path, offerName, localPath)
+	log.Printf("[FILE] start send peer=%s path=%s fileID=%s offerName=%s localPath=%q",
+		peerHexStr, path, fileID, offerName, localPath)
 	n.wg.Add(1)
 	go func() {
 		defer n.wg.Done()
 		if err := filetransfer.Send(context.Background(), st.ch, path, offerName, progress, st.rcv.WaitForReply); err != nil {
 			log.Printf("[ERROR] sendfile: %v", err)
+			// Tell the GUI: bubble turns red, show err.
+			n.publishFileEvent(FileEvent{
+				Type:   FileEventDone,
+				FileID: fileID,
+				OK:     false,
+				Err:    err.Error(),
+			})
 			return
 		}
 		log.Printf("[FILE] done peer=%s path=%s", peerHexStr, path)
+		// Final 100% tick so the GUI's progress bar
+		// reaches the end before the done event.
+		if info, ferr := os.Stat(path); ferr == nil {
+			n.publishFileEvent(FileEvent{
+				Type:   FileEventProgress,
+				FileID: fileID,
+				Sent:   info.Size(),
+				Total:  info.Size(),
+			})
+		}
+		n.publishFileEvent(FileEvent{
+			Type:   FileEventDone,
+			FileID: fileID,
+			OK:     true,
+		})
 		// GUI chat panel: announce the sent file so the
 		// chat UI can render a file card. Body uses
 		// "file://<basename>" prefix (frontend parses).

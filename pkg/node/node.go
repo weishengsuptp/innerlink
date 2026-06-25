@@ -66,10 +66,14 @@ type Node struct {
 	// messageCh receives every inbound + outbound chat
 	// message as the dispatcher pump processes them.
 	// peerEventCh receives peer add/remove/online/offline
-	// transitions. Both are buffered to absorb short bursts
-	// from gossip storms.
+	// transitions. fileEventCh receives file-transfer
+	// progress / done notifications keyed by fileID so
+	// the GUI can update its bubble in real time.
+	// All three are buffered to absorb short bursts
+	// from gossip storms / network floods.
 	messageCh   chan Message
 	peerEventCh chan PeerEvent
+	fileEventCh chan FileEvent
 
 	// In-memory chat history cache. Source of truth is
 	// the encrypted chat.enc on disk; this slice is just
@@ -157,6 +161,7 @@ func New(opts Options) (*Node, error) {
 		channels:    newChannelRegistry(),
 		messageCh:   make(chan Message, 64),
 		peerEventCh: make(chan PeerEvent, 64),
+		fileEventCh: make(chan FileEvent, 32),
 	}
 
 	// Self entry in the roster: always include ourselves
@@ -371,6 +376,7 @@ func (n *Node) Close() error {
 	_ = logx.Close()
 	close(n.messageCh)
 	close(n.peerEventCh)
+	close(n.fileEventCh)
 	return nil
 }
 

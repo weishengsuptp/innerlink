@@ -14,6 +14,9 @@ coverage.html
 
 # e2e build output (innerlink.exe + .stale* test artifacts)
 tests/e2e/bin/
+tests/e2e/node_modules/
+tests/e2e/package.json
+tests/e2e/package-lock.json
 
 # Frontend (Wails)
 frontend/node_modules/
