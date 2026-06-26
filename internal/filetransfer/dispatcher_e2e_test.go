@@ -33,8 +33,7 @@ func TestSendFile_WithSharedChannelPump(t *testing.T) {
 	// reachable in 50 MB-equivalent conditions. 3 MiB
 	// = 12 chunks at 256 KiB.
 	const size = 3 * 1024 * 1024
-	srcPath, wantHash := makeDeterministicFile(t, size)
-	defer os.Remove(srcPath)
+	srcFile, srcSize, wantHash := makeDeterministicFile(t, size)
 
 	chA, chB := channelPairE2E(t)
 	defer chA.Close()
@@ -88,11 +87,11 @@ func TestSendFile_WithSharedChannelPump(t *testing.T) {
 	// the Accept reply route to a registry that no
 	// chA-side dispatcher is writing to, and the
 	// sender would deadlock on wait accept.
-	if err := ft.Send(ctx, chA, srcPath, "", nil, senderRcv.WaitForReply); err != nil {
+	if err := ft.Send(ctx, chA, srcFile, srcSize, "e2e-src.bin", nil, senderRcv.WaitForReply); err != nil {
 		t.Fatalf("Send: %v", err)
 	}
 
-	gotPath := filepath.Join(saveDir, filepath.Base(srcPath))
+	gotPath := filepath.Join(saveDir, "e2e-src.bin")
 	gotHash, err := hashFileE2E(gotPath)
 	if err != nil {
 		t.Fatalf("read received: %v", err)
@@ -102,7 +101,7 @@ func TestSendFile_WithSharedChannelPump(t *testing.T) {
 	}
 }
 
-func makeDeterministicFile(t *testing.T, size int) (string, string) {
+func makeDeterministicFile(t *testing.T, size int) (*os.File, int64, string) {
 	t.Helper()
 	dir := t.TempDir()
 	path := filepath.Join(dir, "e2e-src.bin")
@@ -110,7 +109,7 @@ func makeDeterministicFile(t *testing.T, size int) (string, string) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer f.Close()
+	t.Cleanup(func() { f.Close() })
 	h := sha256.New()
 	buf := make([]byte, 64*1024)
 	written := 0
@@ -128,7 +127,10 @@ func makeDeterministicFile(t *testing.T, size int) (string, string) {
 		h.Write(buf[:n])
 		written += n
 	}
-	return path, hex.EncodeToString(h.Sum(nil))
+	if _, err := f.Seek(0, io.SeekStart); err != nil {
+		t.Fatal(err)
+	}
+	return f, int64(size), hex.EncodeToString(h.Sum(nil))
 }
 
 func hashFileE2E(path string) (string, error) {

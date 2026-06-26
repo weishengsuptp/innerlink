@@ -12,6 +12,7 @@ import (
 	"fmt"
 	"log"
 	"os"
+	"path/filepath"
 	"sort"
 	"strings"
 
@@ -86,9 +87,29 @@ func cmdSendFile(nd *node.Node, parts []string) {
 		log.Println("[ERROR] sendfile: peer ref is empty")
 		return
 	}
-	if err := nd.SendFile(parts[1], parts[2], "", parts[2], "", false); err != nil {
+	path := parts[2]
+	f, err := os.Open(path)
+	if err != nil {
+		log.Printf("[ERROR] open: %v", err)
+		return
+	}
+	stat, err := f.Stat()
+	if err != nil {
+		_ = f.Close()
+		log.Printf("[ERROR] stat: %v", err)
+		return
+	}
+	if !stat.Mode().IsRegular() {
+		_ = f.Close()
+		log.Printf("[ERROR] not a regular file: %s", path)
+		return
+	}
+	name := filepath.Base(path)
+	if err := nd.SendFile(parts[1], name, stat.Size(), f, path, "", false); err != nil {
+		_ = f.Close()
 		log.Printf("[ERROR] %v", err)
 	}
+	// f is owned by Node.SendFile's goroutine now.
 }
 
 func cmdPing(nd *node.Node, parts []string) {

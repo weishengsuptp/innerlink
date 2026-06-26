@@ -55,8 +55,8 @@ import {
   SelfPeerID,
   SendFile,
   SendFileChunk,
-  SendFileFinish,
-  SendFileStart,
+  SendFileClose,
+  SendFileOpen,
   SendText,
   SetMyAlias,
 } from '../wailsjs/go/app/App';
@@ -100,9 +100,8 @@ interface FileBubbleState {
   fileID: string;
   name: string;
   size: number;        // bytes total
-  sent: number;        // bytes sent (upload to core + core→peer)
-  bps: number;         // bytes per second (last 100 ms window)
-  status: 'pending' | 'sending' | 'done' | 'failed';
+  sent: number;        // bytes sent (single-phase now)
+  bps: number;         // bytes per second (sliding window)
   err: string;
   peerId: string;      // hex peer ID
 }
@@ -533,25 +532,37 @@ function renderFileBubble(fb: FileBubbleState): string {
   const sizeStr = humanSize(fb.size);
   let statusHtml: string;
   let barClass: string;
-  if (fb.status === 'failed') {
+  // Single-phase status text. The picker route now
+  // streams bytes from the user's disk → IPC →
+  // io.Pipe → filetransfer.Send → network in ONE
+  // pass; the picker no longer stages to a local
+  // file. So there's only one progress stream and
+  // the bar fills 0→100 exactly once.
+  if (fb.err) {
     statusHtml = `<span class="file-status file-status-failed">失败: ${escapeHtml(fb.err || '未知错误')}</span>`;
     barClass = 'file-bar-failed';
-  } else if (fb.status === 'done') {
+  } else if (fb.sent >= fb.size && fb.size > 0) {
     statusHtml = `<span class="file-status file-status-done">已发送 · ${sizeStr}</span>`;
     barClass = 'file-bar-done';
   } else if (fb.sent > 0) {
-    const bpsStr = humanSize(fb.bps) + '/s';
-    statusHtml = `<span class="file-status">${pct}% · ${bpsStr} · ${sizeStr}</span>`;
+    const bpsStr = fb.bps > 0 ? humanSize(fb.bps) + '/s' : '';
+    statusHtml = `<span class="file-status">发送中 · ${pct}%${bpsStr ? ' · ' + bpsStr : ''}</span>`;
     barClass = '';
   } else {
     statusHtml = `<span class="file-status file-status-pending">排队中…</span>`;
     barClass = '';
   }
+  // No data-file-path here: the picker File API
+  // hides the user's on-disk path, and the bubble
+  // is owned by core's file:event stream. Right-click
+  // on the picker bubble reports "no local path; use
+  // drag-and-drop" (existing behaviour in
+  // revealFileMessage).
   return `
     <div class="msg self" data-file-id="${escapeHtml(fb.fileID)}">
       <div class="av">我</div>
       <div>
-        <div class="bubble file-bubble" title="右键更多">
+        <div class="bubble file-bubble" data-file-name="${escapeHtml(fb.name)}" data-file-path="" title="右键更多">
           <div class="file-msg">
             <div class="file-icon">
               <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><path d="M14 2v6h6"/></svg>
@@ -764,44 +775,62 @@ function promptMore() {
 //   4. SendFileFinish → core closes the file and starts
 //      the actual transfer; progress bubbles on our side
 //      via the "file:event" runtime event.
+// sendPickerFile streams a picked file to core via an
+// in-memory pipe that filetransfer.Send reads from. The
+// frontend's only job is to push 1 MiB chunks through
+// the pipe and close the writer when done; core owns
+// everything else (encryption, network, progress).
+//
+// 2026-06-26 rewrite: the previous design staged the
+// file to <data-dir>/sent/ before the transfer, which
+// meant the user's file was read TWICE (once by JS,
+// once by Go) and the progress bar went 0→100 twice.
+// The pipe-based version makes ONE pass: bytes flow
+// JS → IPC → io.Pipe → SM4-GCM → network.
+//
+// Three calls in order:
+//   SendFileOpen(peer, name, size)  →  pfID  (core
+//     creates an in-memory slot; we use pfID as the
+//     fileID for both the bubble key and the
+//     file:event correlation)
+//   SendFileChunk(pfID, bytes)     →  write 1 MiB at a time
+//   SendFileClose(pfID)            →  close writer (EOF);
+//     core then runs Node.SendFile → filetransfer.Send,
+//     which drains the pipe reader end and ships chunks
+//     to the peer.
 async function sendPickerFile(file: File) {
   if (!state.selectedId) return;
   const peerId = state.selectedId;
-  const fileID = (crypto.randomUUID
-    ? crypto.randomUUID()
-    : `picker-${Date.now()}-${Math.random().toString(36).slice(2)}`);
 
-  // 1. Placeholder bubble — UI reacts IMMEDIATELY.
-  state.fileBubbles.set(fileID, {
-    fileID, name: file.name, size: file.size,
+  // 1. Open the core-side slot FIRST so we know the
+  // canonical pfID core will use for file:event
+  // correlation. Wails v2.12 only exposes the first
+  // return value of a bound Go method, so SendFileOpen
+  // returns "" on failure and the non-empty pfID on
+  // success.
+  const pfID = await SendFileOpen(peerId, file.name, file.size);
+  if (!pfID) {
+    toast(`发文件失败: 无法打开传输通道`);
+    return;
+  }
+
+  // 2. Placeholder bubble — UI reacts IMMEDIATELY.
+  state.fileBubbles.set(pfID, {
+    fileID: pfID, name: file.name, size: file.size,
     sent: 0, bps: 0,
-    status: 'pending', err: '',
+    err: '',
     peerId,
   });
-  appendFileBubble(fileID);
+  appendFileBubble(pfID);
   // Scroll the bubble into view.
   const el = document.getElementById('messages');
   if (el) el.scrollTop = el.scrollHeight;
-
-  // 2. Start the core-side staging file.
-  const startErr = await SendFileStart(peerId, file.name, fileID, file.size);
-  if (startErr) {
-    markFileBubbleDone(fileID, false, startErr);
-    toast(`发文件失败: ${startErr}`);
-    return;
-  }
-  state.fileBubbles.get(fileID)!.status = 'sending';
 
   // 3. Stream 1 MiB chunks. File.slice() doesn't read
   // the whole file into memory at once — each slice is
   // a fresh Blob backed by a memory-mapped view.
   const CHUNK = 1024 * 1024;
   let offset = 0;
-  // Throttle picker-phase progress updates so we don't
-  // re-render the DOM 401 times for a 401 MiB file.
-  // (Node.SendFile has its own 100 ms throttle for the
-  // post-Finish transfer phase; this covers the gap.)
-  let lastLocalTick = 0;
   try {
     while (offset < file.size) {
       const end = Math.min(offset + CHUNK, file.size);
@@ -814,24 +843,17 @@ async function sendPickerFile(file: File) {
       // cast; 1 MiB Number[] is fine on the JS heap.
       const buf = new Uint8Array(await blob.arrayBuffer());
       const chunk = Array.from(buf);
-      const r = await SendFileChunk(fileID, chunk);
+      const r = await SendFileChunk(pfID, chunk);
       if (r) throw new Error(r);
       offset = end;
-      // Local progress for the picker-streaming phase.
-      // bps is approximate here — Node.SendFile's
-      // sliding-window bps will take over once the
-      // actual transfer starts (file:event 'progress').
-      const now = performance.now();
-      if (now - lastLocalTick > 80) {
-        lastLocalTick = now;
-        updateFileBubble(fileID, offset, 0);
-      }
     }
-    // 4. Close staging + kick the real transfer.
-    const finishErr = await SendFileFinish(fileID);
-    if (finishErr) throw new Error(finishErr);
+    // 3. Close the pipe writer; core starts the actual
+    // transfer immediately (drains the pipe reader end
+    // inside filetransfer.Send).
+    const closeErr = await SendFileClose(pfID);
+    if (closeErr) throw new Error(closeErr);
   } catch (e: any) {
-    markFileBubbleDone(fileID, false, e?.message || String(e));
+    markFileBubbleDone(pfID, false, e?.message || String(e));
     toast(`发文件失败: ${e?.message || e}`);
   }
 }
@@ -853,20 +875,24 @@ function appendFileBubble(fileID: string) {
 
 // updateFileBubble refreshes the progress bar / speed
 // number on an existing bubble in place. Cheaper than
-// re-rendering the whole message list.
+// re-rendering the whole message list. Single-phase
+// now: sent = total bytes sent across the whole
+// pipeline (picker → IPC → pipe → encrypt → network).
 function updateFileBubble(fileID: string, sent: number, bps: number) {
   const fb = state.fileBubbles.get(fileID);
   if (!fb) return;
   fb.sent = sent;
   fb.bps = bps;
-  fb.status = 'sending';
   const root = findFileBubbleEl(fileID);
   if (!root) return;
   const pct = fb.size > 0 ? Math.min(100, Math.floor(sent * 100 / fb.size)) : 0;
   const fill = root.querySelector('.file-bar-fill') as HTMLElement | null;
   if (fill) fill.style.width = pct + '%';
   const status = root.querySelector('.file-status');
-  if (status) status.textContent = `${pct}% · ${humanSize(bps)}/s · ${humanSize(fb.size)}`;
+  if (status) {
+    const bpsStr = bps > 0 ? humanSize(bps) + '/s' : '';
+    status.textContent = `发送中 · ${pct}%${bpsStr ? ' · ' + bpsStr : ''}`;
+  }
 }
 
 // markFileBubbleDone flips the bubble into its final
@@ -875,8 +901,7 @@ function updateFileBubble(fileID: string, sent: number, bps: number) {
 function markFileBubbleDone(fileID: string, ok: boolean, errMsg: string) {
   const fb = state.fileBubbles.get(fileID);
   if (!fb) return;
-  fb.status = ok ? 'done' : 'failed';
-  fb.err = errMsg;
+  fb.err = ok ? '' : errMsg;
   if (ok) fb.sent = fb.size; // bar at 100%
   const root = findFileBubbleEl(fileID);
   if (!root) return;
@@ -1174,6 +1199,10 @@ function wireEvents() {
   EventsOn('file:event', (ev: any) => {
     if (!ev || !ev.fileID) return;
     if (ev.type === 'progress') {
+      // Single-phase: file:event 'progress' IS the only
+      // progress stream the frontend reads. Bytes flow
+      // JS → IPC → pipe → encrypt → wire; this event
+      // carries the running total.
       updateFileBubble(ev.fileID, ev.sent, ev.bytesPerSec);
     } else if (ev.type === 'done') {
       markFileBubbleDone(ev.fileID, !!ev.ok, ev.err || '');

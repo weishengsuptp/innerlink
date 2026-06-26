@@ -35,6 +35,7 @@ import (
 	"crypto/rand"
 	"encoding/hex"
 	"fmt"
+	"io"
 	"log"
 	"net/url"
 	"os"
@@ -238,140 +239,147 @@ func (a *App) SendText(peerRef, text string) string {
 //     logic appends a counter ("name (1).ext") on its
 //     own.
 //
-// Drag-and-drop route: no fileID, no progress bubble
-// (the frontend synthesises a fileID at drop time if
-// the user wants a bubble; v0.1 doesn't, the chat
-// message is enough).
+// Drag-and-drop + CLI route: the caller already has a
+// path. core opens the file itself and runs the
+// transfer; the frontend never sees the bytes.
 func (a *App) SendFile(peerRef, path string) string {
 	if a.nd == nil {
 		return "node not started"
 	}
+	f, err := os.Open(path)
+	if err != nil {
+		return fmt.Sprintf("open: %v", err)
+	}
+	stat, err := f.Stat()
+	if err != nil {
+		_ = f.Close()
+		return fmt.Sprintf("stat: %v", err)
+	}
+	if !stat.Mode().IsRegular() {
+		_ = f.Close()
+		return "not a regular file: " + path
+	}
+	name := filepath.Base(path)
 	// skipChatLog=false: drag-and-drop has no live
 	// placeholder bubble, so the chat message IS the
-	// UI artefact for the sent file.
-	if err := a.nd.SendFile(peerRef, path, "", path, "", false); err != nil {
+	// UI artefact for the sent file. localPath=path so
+	// the sender's right-click "open folder" reveals
+	// the user's actual folder.
+	if err := a.nd.SendFile(peerRef, name, stat.Size(), f, path, "", false); err != nil {
+		_ = f.Close()
 		return err.Error()
 	}
+	// f is owned by Node.SendFile's goroutine now; it'll
+	// close after the transfer completes. Don't double-close.
 	return ""
 }
 
-// pendingFile tracks an in-flight picker stream so
-// SendFileChunk can append to the right open file and
-// SendFileFinish can close it + start the actual
-// transfer. The picker frontend drives this state
-// machine with three calls in order:
+// pendingFile tracks an in-flight picker stream. The
+// picker frontend drives this state machine with three
+// calls in order:
 //
-//   SendFileStart  → create <data-dir>/sent/<name> + register
-//   SendFileChunk  → append bytes (called many times)
-//   SendFileFinish → close file + start SendFile in goroutine
+//   SendFileOpen   → core creates an io.Pipe + slot, returns pfID
+//   SendFileChunk  → write one chunk to the pipe writer (called N times)
+//   SendFileClose  → close the pipe writer; core reads from the
+//                    pipe reader end via filetransfer.Send
 //
-// We hold the open file in the map so the chunks don't
-// have to pass an open fd through Wails IPC (Wails has
-// no fd passing primitive; encoding an os.File in JSON
-// is not supported).
+// We don't touch disk on this path. The bytes go:
+//   user's file  →  Blob.slice in JS  →  IPC  →  pw  →  pr  →
+//   filetransfer chunk stream  →  network.
+// Same byte makes ONE trip from disk to network. The
+// previous staging-file version made TWO disk reads.
 type pendingFile struct {
-	peerRef  string
-	name     string
-	fileID   string
-	size     int64
-	path     string
-	f        *os.File
-	bytesIn  int64
+	peerRef string
+	name    string
+	fileID  string
+	size    int64
+	bytesIn int64
+	pr      *io.PipeReader
+	pw      *io.PipeWriter
 }
 
-// SendFileStart creates the on-disk staging file and
-// registers it under fileID. The frontend then streams
-// chunks via SendFileChunk. If the frontend crashes or
-// the user closes the window before calling
-// SendFileFinish, the staging file leaks; v0.1 doesn't
-// have a janitor — the user can manually delete
-// <data-dir>/sent/<stale-file> if it bothers them.
-func (a *App) SendFileStart(peerRef, name, fileID string, size int64) string {
+// SendFileOpen allocates an in-memory pipe for the picker
+// route and returns a slotID. The frontend then feeds
+// bytes via SendFileChunk(pfID, bytes) and signals EOF
+// via SendFileClose(pfID). The transfer starts
+// automatically on Close.
+//
+// Wails v2.12 exposes only the FIRST return value of a
+// bound Go method to TypeScript, so we collapse (pfID,
+// err) into a single string: pfID on success, "" on
+// error (with the err message logged to the app log and
+// the in-memory pump below). The frontend checks for
+// empty string.
+//
+// pfID is also the fileID used in file:event progress so
+// the frontend's bubble key matches the events core emits.
+func (a *App) SendFileOpen(peerRef, name string, size int64) string {
 	if a.nd == nil {
-		return "node not started"
+		return ""
 	}
-	if fileID == "" {
-		return "fileID is empty"
+	if peerRef == "" {
+		return ""
 	}
 	if name == "" {
-		return "name is empty"
+		return ""
 	}
 	if size < 0 {
-		return "size is negative"
-	}
-	// Make sure the peer is actually reachable. We
-	// don't want to leave a staging file lying around
-	// for a typo'd peer.
-	if err := a.nd.Ping(peerRef); err != nil {
-		// Ping is best-effort — if the peer was just
-		// discovered the channel might not be up yet.
-		// Fall back to checking channel presence.
-		_ = err
+		return ""
 	}
 	cleanName := filepath.Base(name)
 	if cleanName == "" || cleanName == "." || cleanName == "/" {
-		return "invalid file name: " + name
+		return ""
 	}
-	sentDir := filepath.Join(a.dataDir(), "sent")
-	if err := os.MkdirAll(sentDir, 0o755); err != nil {
-		return fmt.Sprintf("mkdir sent: %v", err)
-	}
-	finalPath := filepath.Join(sentDir, cleanName)
-	// Overwrite-on-pick (same semantics as the old
-	// SendFileContent). If the user picks the same file
-	// twice, the second pick wins.
-	f, err := os.Create(finalPath)
-	if err != nil {
-		return fmt.Sprintf("create sent file: %v", err)
-	}
+	pr, pw := io.Pipe()
+	pfID := newFileID()
 	a.pendingMu.Lock()
 	if a.pendingFiles == nil {
 		a.pendingFiles = make(map[string]*pendingFile)
 	}
-	// If a pending file with this fileID already exists
-	// (frontend re-started a stream with the same ID),
-	// close the old fd first so we don't leak it.
-	if old, ok := a.pendingFiles[fileID]; ok {
-		_ = old.f.Close()
-		_ = os.Remove(old.path)
+	// If a slot with this pfID already exists (frontend
+	// re-started a stream with the same ID), close the old
+	// pipe first so the old sender goroutine sees EOF and
+	// exits cleanly.
+	if old, ok := a.pendingFiles[pfID]; ok {
+		_ = old.pw.Close()
+		_ = old.pr.Close()
 	}
-	a.pendingFiles[fileID] = &pendingFile{
+	a.pendingFiles[pfID] = &pendingFile{
 		peerRef: peerRef,
 		name:    cleanName,
-		fileID:  fileID,
+		fileID:  pfID,
 		size:    size,
-		path:    finalPath,
-		f:       f,
+		pr:      pr,
+		pw:      pw,
 	}
 	a.pendingMu.Unlock()
-	log.Printf("[INFO  app] SendFileStart fileID=%s name=%s size=%d path=%s",
-		fileID, cleanName, size, finalPath)
-	return ""
+	log.Printf("[INFO  app] SendFileOpen pfID=%s peer=%s name=%s size=%d",
+		pfID, peerRef, cleanName, size)
+	return pfID
 }
 
-// SendFileChunk appends one chunk of bytes to the
-// staging file registered under fileID. Called many
-// times between SendFileStart and SendFileFinish.
+// SendFileChunk writes one chunk of bytes into the pipe
+// for the slot identified by pfID. Called many times
+// between SendFileOpen and SendFileClose.
 //
-// We use a 1 MiB upper bound on chunk size for sanity
-// (the frontend chunks at 1 MiB); larger chunks would
-// still work but the per-call latency is bounded by the
-// Wails IPC pipe size, so bigger chunks just make the
-// pipe backpressure more visible.
-func (a *App) SendFileChunk(fileID string, data []byte) string {
+// We accept any chunk size the frontend wants to send —
+// filetransfer.Send reads ChunkSize (1 MiB) bytes at a
+// time, so larger chunks just mean more pipe backpressure
+// visibility. The frontend uses 1 MiB chunks to match.
+func (a *App) SendFileChunk(pfID string, data []byte) string {
 	if a.nd == nil {
 		return "node not started"
-	}
-	a.pendingMu.Lock()
-	pf, ok := a.pendingFiles[fileID]
-	a.pendingMu.Unlock()
-	if !ok {
-		return "unknown fileID: " + fileID
 	}
 	if len(data) == 0 {
 		return ""
 	}
-	n, err := pf.f.Write(data)
+	a.pendingMu.Lock()
+	pf, ok := a.pendingFiles[pfID]
+	a.pendingMu.Unlock()
+	if !ok {
+		return "unknown pfID: " + pfID
+	}
+	n, err := pf.pw.Write(data)
 	pf.bytesIn += int64(n)
 	if err != nil {
 		return fmt.Sprintf("write chunk: %v", err)
@@ -379,87 +387,45 @@ func (a *App) SendFileChunk(fileID string, data []byte) string {
 	return ""
 }
 
-// SendFileFinish closes the staging file and kicks off
-// the actual transfer in a background goroutine. After
-// this call the fileID is no longer in pendingFiles —
-// progress events for it go out via SubscribeFiles /
-// "file:event" runtime events.
-func (a *App) SendFileFinish(fileID string) string {
+// SendFileClose closes the pipe writer for pfID,
+// signalling EOF to filetransfer.Send (which is reading
+// from the pipe reader end). Then it kicks off the
+// actual transfer in a background goroutine and removes
+// the slot from pendingFiles.
+//
+// progress events for the file go out via SubscribeFiles
+// / "file:event" runtime events.
+func (a *App) SendFileClose(pfID string) string {
 	if a.nd == nil {
 		return "node not started"
 	}
 	a.pendingMu.Lock()
-	pf, ok := a.pendingFiles[fileID]
+	pf, ok := a.pendingFiles[pfID]
 	if !ok {
 		a.pendingMu.Unlock()
-		return "unknown fileID: " + fileID
+		return "unknown pfID: " + pfID
 	}
-	delete(a.pendingFiles, fileID)
+	delete(a.pendingFiles, pfID)
 	a.pendingMu.Unlock()
-	if err := pf.f.Close(); err != nil {
-		_ = os.Remove(pf.path)
-		return fmt.Sprintf("close staging: %v", err)
+	// Close the writer; filetransfer.Send will see EOF on
+	// its next ReadFull and finish.
+	if err := pf.pw.Close(); err != nil {
+		_ = pf.pr.Close()
+		return fmt.Sprintf("close pipe: %v", err)
 	}
-	log.Printf("[INFO  app] SendFileFinish fileID=%s path=%s bytesIn=%d",
-		fileID, pf.path, pf.bytesIn)
-	// Start the transfer. SendFile publishes
-	// file:progress + file:done events keyed by fileID.
-	//
-	// skipChatLog=true: the picker frontend already
-	// inserted a placeholder bubble via state.fileBubbles
-	// and renders progress there. Publishing a chat
-	// message here too would create a SECOND bubble for
-	// the same file. The staging copy at pf.path is
-	// removed by Node.SendFile once the transfer
-	// completes (we own that lifecycle now).
-	if err := a.nd.SendFile(pf.peerRef, pf.path, pf.name, "", pf.fileID, true); err != nil {
-		_ = os.Remove(pf.path)
+	log.Printf("[INFO  app] SendFileClose pfID=%s bytesIn=%d size=%d",
+		pfID, pf.bytesIn, pf.size)
+	// Start the transfer. SendFile reads from pf.pr until
+	// EOF, encrypts each chunk, ships to peer. localPath=""
+	// because the picker File API hides the real path —
+	// right-click "open folder" reports "no local path;
+	// drag-and-drop to send" on the picker bubble (see
+	// openFileMessage / revealFileMessage).
+	if err := a.nd.SendFile(pf.peerRef, pf.name, pf.size, pf.pr, "", pfID, true); err != nil {
+		_ = pf.pr.Close()
 		return err.Error()
 	}
-	return ""
-}
-
-// SendFileContent is the legacy "send the whole file in
-// one IPC call" route. Kept for backward compat with
-// older frontends / tests; the picker frontend should
-// prefer SendFileStart/Chunk/Finish for any non-trivial
-// size (Wails v2.12 IPC uses JSON, so passing a 50 MiB
-// []byte through here means ~500 MiB of JSON marshaling
-// on the JS side and ~1 GiB of Go-side json.Unmarshal
-// peak, freezing the UI for many seconds).
-func (a *App) SendFileContent(peerRef, name string, content []byte) string {
-	if a.nd == nil {
-		return "node not started"
-	}
-	if len(content) == 0 {
-		return "empty file content"
-	}
-	if name == "" {
-		return "empty file name"
-	}
-	cleanName := filepath.Base(name)
-	if cleanName == "" || cleanName == "." || cleanName == "/" {
-		return "invalid file name: " + name
-	}
-	sentDir := filepath.Join(a.dataDir(), "sent")
-	if err := os.MkdirAll(sentDir, 0o755); err != nil {
-		return fmt.Sprintf("mkdir sent: %v", err)
-	}
-	finalPath := filepath.Join(sentDir, cleanName)
-	if err := os.WriteFile(finalPath, content, 0o644); err != nil {
-		return fmt.Sprintf("write sent: %v", err)
-	}
-	// Synthesise a fileID so even the legacy route
-	// emits file:progress events. The frontend doesn't
-	// get to see these (it didn't put a placeholder
-	// bubble), but the log + future debug view will.
-	fileID := newFileID()
-	// skipChatLog=false: legacy one-shot route; the
-	// chat message is the only UI artefact for this
-	// send (no live placeholder bubble).
-	if err := a.nd.SendFile(peerRef, finalPath, cleanName, finalPath, fileID, false); err != nil {
-		return err.Error()
-	}
+	// pr is now owned by Node.SendFile's goroutine.
 	return ""
 }
 
@@ -666,16 +632,14 @@ func uniquePath(dir, name string) string {
 // but we keep it simple: respect the cwd override the node
 // was created with, or default to <launch-cwd>/.innerlink/.
 // Wails v2 on Windows sets cwd to %APPDATA%\Roaming\<bin>\.
-// We re-derive that here so SendFileContent's outbox/ lives
-// in the same place as chat.enc, device.key, etc.
+// We re-derive that here so anything that writes under
+// the data dir lives next to chat.enc / device.key.
 
 // newFileID returns a 16-byte hex fileID. Random, not
 // derived from a counter, so two concurrent streams on
-// the same path can't accidentally collide. The picker
-// frontend uses crypto.randomUUID() and passes the
-// result in; this is the legacy-route fallback for
-// SendFileContent (which synthesises its own ID since
-// the frontend doesn't pass one in that path).
+// the same path can't accidentally collide. Used as the
+// pfID for SendFileOpen (picker route) so the frontend
+// doesn't have to invent one.
 func newFileID() string {
 	b := make([]byte, 16)
 	if _, err := rand.Read(b); err != nil {

@@ -5,7 +5,6 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
-	"os"
 	"path/filepath"
 	"time"
 
@@ -71,65 +70,70 @@ type ProgressFn func(sent, total int64)
 // canonical implementation.
 type WaitForReplyFunc func(ctx context.Context, wantType protocol.MsgType, fileID string) (protocol.Envelope, error)
 
-// Send streams the file at path to the peer reachable through
-// the given protocol.Channel. It blocks until the receiver
-// acknowledges Done, the transfer is aborted, or ctx fires.
+// Send streams src (a fixed-size byte stream of length size
+// bytes) to ch under offerName.
 //
-// On success, the file's SHA-256 has been verified by the
-// receiver. Send returns nil only after that ack.
+// On success, the receiver has acknowledged Done. Send
+// returns nil only after that ack.
+//
+// src is the byte source — for drag-and-drop this is an
+// *os.File opened by the caller, for the picker route this
+// is the read end of an io.Pipe whose write end the
+// frontend feeds bytes into. Send does NOT close src; the
+// caller owns it.
+//
+// size is the total number of bytes src will produce. It
+// MUST match the actual byte count (Send will short-read
+// EOF correctly but Offer.Size is set from size up front).
+//
+// offerName is the name the receiver will see on its
+// bubble. Empty is rejected.
+//
+// progress is invoked roughly every 10 Hz as bytes go
+// out, with (sent, total). Pass nil to disable.
 //
 // waitForReply is required when ch is shared with another
 // goroutine that calls ch.Recv. Pass nil only if Send is the
 // sole reader of ch.Recv (e.g. in a file-only loopback test
 // where the cmd dispatcher pattern is not in use).
-func Send(ctx context.Context, ch *protocol.Channel, path, offerName string, progress ProgressFn, waitForReply WaitForReplyFunc) error {
+//
+// Note (v0.1): full-file SHA-256 in the Offer is omitted
+// (set to ""). The receiver verifies per-chunk SHA-256
+// during transmission; the channel itself is SM4-GCM
+// authenticated so an attacker can't tamper with chunks.
+// End-to-end tamper detection on the whole file is a v0.2
+// concern. Dropping the upfront hash means Send no longer
+// pre-reads the source for hashing — for the picker route
+// this is what removes the "JS reads file → IPC → staging
+// → Go reads staging → encrypt → send" double-pass that
+// users reported as confusing.
+func Send(ctx context.Context, ch *protocol.Channel, src io.Reader, size int64, offerName string, progress ProgressFn, waitForReply WaitForReplyFunc) error {
 	if waitForReply == nil {
 		waitForReply = defaultWaitForReply(ch)
 	}
-	f, err := os.Open(path)
-	if err != nil {
-		return fmt.Errorf("filetransfer: open: %w", err)
+	if size < 0 {
+		return fmt.Errorf("filetransfer: negative size")
 	}
-	defer f.Close()
-
-	stat, err := f.Stat()
-	if err != nil {
-		return fmt.Errorf("filetransfer: stat: %w", err)
-	}
-	if !stat.Mode().IsRegular() {
-		return fmt.Errorf("filetransfer: not a regular file: %s", path)
+	if src == nil {
+		return fmt.Errorf("filetransfer: nil source reader")
 	}
 
 	// Resolve the offer name. The caller (the GUI's picker
 	// route, the CLI's `send` command) decides what the
-	// receiver should see. If the caller passed an empty
-	// name we fall back to the on-disk basename. We then
-	// sanitize: strip any directory components so a buggy
-	// caller can't let the receiver escape the save dir.
+	// receiver should see. We sanitize: strip any directory
+	// components so a buggy caller can't let the receiver
+	// escape the save dir.
 	name := filepath.Base(offerName)
 	if name == "" || name == "." || name == "/" {
-		name = stat.Name()
-	}
-	if name == "" {
 		return fmt.Errorf("filetransfer: empty offer name")
 	}
 
-	// Hash the whole file up front so the Offer carries the
-	// full-file checksum. For multi-GB files this means the
-	// sender reads the file once for hashing, then a second
-	// time for sending. v0.1 keeps it simple: a v0.2 streaming
-	// variant could cache the chunk hashes from this pass.
-	fullHash, err := HashFileSHA256(path)
-	if err != nil {
-		return fmt.Errorf("filetransfer: hash: %w", err)
-	}
-
-	totalChunks := uint32((stat.Size() + int64(ChunkSize) - 1) / int64(ChunkSize))
+	totalChunks := uint32((size + int64(ChunkSize) - 1) / int64(ChunkSize))
 	offer := FileOffer{
 		FileID:      NewFileID(),
 		Name:        name,
-		Size:        stat.Size(),
-		SHA256:      fullHash,
+		Size:        size,
+		SHA256:      "", // see doc comment for rationale
 		TotalChunks: totalChunks,
 		ChunkSize:   int32(ChunkSize),
 	}
@@ -156,26 +160,40 @@ func Send(ctx context.Context, ch *protocol.Channel, path, offerName string, pro
 
 	// 3) Stream chunks. The progress callback is throttled to
 	//    ~10 Hz to avoid log spam.
+	//
+	//    Skip-chunk (resume) support requires a seekable
+	//    source — only drag-and-drop paths are seekable, so
+	//    the picker route (io.Pipe) always sends every
+	//    chunk. We attempt Seek only if the underlying
+	//    reader satisfies io.Seeker.
 	buf := make([]byte, ChunkSize)
 	var sent int64
 	lastReport := time.Now()
+	var seeker io.Seeker
+	if s, ok := src.(io.Seeker); ok {
+		seeker = s
+	}
 	for idx := uint32(0); idx < totalChunks; idx++ {
 		if err := ctx.Err(); err != nil {
 			sendAbort(ctx, ch, offer.FileID, ctx.Err().Error())
 			return err
 		}
 		if skip[idx] {
-			// Resuming: this chunk is already on the other side.
-			n, _ := f.Seek(int64(idx)*int64(ChunkSize), io.SeekStart)
+			// Resuming: this chunk is already on the other
+			// side. Only possible for seekable sources.
+			if seeker == nil {
+				return fmt.Errorf("filetransfer: cannot resume non-seekable source")
+			}
+			n, _ := seeker.Seek(int64(idx)*int64(ChunkSize), io.SeekStart)
 			sent = n
 			if progress != nil && time.Since(lastReport) > 100*time.Millisecond {
-				progress(sent, stat.Size())
+				progress(sent, size)
 				lastReport = time.Now()
 			}
 			continue
 		}
 
-		n, rerr := io.ReadFull(f, buf)
+		n, rerr := io.ReadFull(src, buf)
 		if rerr != nil && rerr != io.ErrUnexpectedEOF && rerr != io.EOF {
 			return fmt.Errorf("filetransfer: read chunk %d: %w", idx, rerr)
 		}
@@ -192,12 +210,12 @@ func Send(ctx context.Context, ch *protocol.Channel, path, offerName string, pro
 		}
 		sent += int64(n)
 		if progress != nil && time.Since(lastReport) > 100*time.Millisecond {
-			progress(sent, stat.Size())
+			progress(sent, size)
 			lastReport = time.Now()
 		}
 	}
 	if progress != nil {
-		progress(stat.Size(), stat.Size())
+		progress(size, size)
 	}
 
 	// 4) Wait for Done.
