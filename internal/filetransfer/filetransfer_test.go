@@ -83,8 +83,10 @@ func channelPair(t *testing.T) (*protocol.Channel, *protocol.Channel) {
 }
 
 // makeFile builds a temp file of size bytes filled with random
-// data and returns the path and its expected SHA-256 hex.
-func makeFile(t *testing.T, size int) (string, string) {
+// data and returns the open *os.File (positioned at start,
+// caller must Close), the size in bytes, and its expected
+// SHA-256 hex.
+func makeFile(t *testing.T, size int) (*os.File, int64, string) {
 	t.Helper()
 	dir := t.TempDir()
 	path := filepath.Join(dir, "src.bin")
@@ -110,8 +112,11 @@ func makeFile(t *testing.T, size int) (string, string) {
 		h.Write(buf[:n])
 		written += n
 	}
-	f.Close()
-	return path, hex.EncodeToString(h.Sum(nil))
+	if _, err := f.Seek(0, io.SeekStart); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { f.Close() })
+	return f, int64(size), hex.EncodeToString(h.Sum(nil))
 }
 
 func TestSendSmallFile(t *testing.T) {
@@ -120,7 +125,7 @@ func TestSendSmallFile(t *testing.T) {
 	defer chB.Close()
 
 	// 64 KiB 鈥?well under one chunk.
-	srcPath, srcHash := makeFile(t, 64*1024)
+	srcFile, srcSize, srcHash := makeFile(t, 64*1024)
 
 	// Receiver runs in background.
 	recvDir := t.TempDir()
@@ -139,7 +144,7 @@ func TestSendSmallFile(t *testing.T) {
 	// Send.
 	var progressCalls int
 	var lastSent int64
-	if err := ft.Send(context.Background(), chA, srcPath, "", func(sent, total int64) {
+	if err := ft.Send(context.Background(), chA, srcFile, srcSize, "src.bin", func(sent, total int64) {
 		progressCalls++
 		lastSent = sent
 	}, nil); err != nil {
@@ -188,7 +193,7 @@ func TestSendMultiChunk(t *testing.T) {
 	defer chB.Close()
 
 	// 3 MiB = exactly 3 chunks.
-	srcPath, srcHash := makeFile(t, 3*ft.ChunkSize)
+	srcFile, srcSize, srcHash := makeFile(t, 3*ft.ChunkSize)
 
 	recvDir := t.TempDir()
 	rcv, err := ft.NewReceiver(chB, recvDir, nil, "peerA")
@@ -202,7 +207,7 @@ func TestSendMultiChunk(t *testing.T) {
 		t.Logf("[recv] Loop returned: %v", err)
 	}()
 
-	if err := ft.Send(context.Background(), chA, srcPath, "", nil, nil); err != nil {
+	if err := ft.Send(context.Background(), chA, srcFile, srcSize, "src.bin", nil, nil); err != nil {
 		t.Fatalf("Send: %v", err)
 	}
 
@@ -241,7 +246,7 @@ func TestReceiverRejectsOffer(t *testing.T) {
 	defer chB.Close()
 
 	// Pre-build a file so the Send is fast.
-	srcPath, _ := makeFile(t, 1024)
+	srcFile, srcSize, _ := makeFile(t, 1024)
 
 	recvDir := t.TempDir()
 	rcv, err := ft.NewReceiver(chB, recvDir, func(o ft.FileOffer, _ string) error {
@@ -254,7 +259,7 @@ func TestReceiverRejectsOffer(t *testing.T) {
 	defer rcancel()
 	go func() { _ = rcv.Loop(rctx) }()
 
-	err = ft.Send(context.Background(), chA, srcPath, "", nil, nil)
+	err = ft.Send(context.Background(), chA, srcFile, srcSize, "src.bin", nil, nil)
 	if err == nil {
 		t.Fatal("Send should have failed when receiver rejected offer")
 	}
@@ -277,7 +282,7 @@ func TestSendUnalignedLastChunk(t *testing.T) {
 	defer chB.Close()
 
 	size := ft.ChunkSize + 17
-	srcPath, srcHash := makeFile(t, size)
+	srcFile, srcSize, srcHash := makeFile(t, size)
 
 	recvDir := t.TempDir()
 	rcv, err := ft.NewReceiver(chB, recvDir, nil, "peerA")
@@ -288,7 +293,7 @@ func TestSendUnalignedLastChunk(t *testing.T) {
 	defer rcancel()
 	go func() { _ = rcv.Loop(rctx) }()
 
-	if err := ft.Send(context.Background(), chA, srcPath, "", nil, nil); err != nil {
+	if err := ft.Send(context.Background(), chA, srcFile, srcSize, "src.bin", nil, nil); err != nil {
 		t.Fatalf("Send: %v", err)
 	}
 

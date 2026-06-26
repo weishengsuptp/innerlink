@@ -4,8 +4,8 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"log"
-	"os"
 	"strings"
 	"time"
 
@@ -219,7 +219,36 @@ func (n *Node) SendText(peerRef, text string) error {
 // also published to SubscribeFiles() as FileEvent
 // values, so the GUI can update its bubble in real
 // time without polling logs.
-func (n *Node) SendFile(peerRef, path, offerName, localPath, fileID string, skipChatLog bool) error {
+// SendFile ships the byte stream from src to peerRef under
+// offerName. The src argument is an io.Reader the caller
+// owns (typically *os.File for drag-and-drop, the read end
+// of an io.Pipe for the picker route). SendFile does NOT
+// close src — when the caller is done with it, the caller
+// closes it.
+//
+// size is the total byte count of src. It is sent in the
+// FileOffer so the receiver knows the file length up front.
+//
+// localPath is what the GUI should hand to the
+// double-click / right-click "open" handler on the
+// sender's chat bubble:
+//   - drag-and-drop route: the source file path on the
+//     user's disk (so opening reveals the user's own
+//     folder, not a temp copy).
+//   - picker route: "" (the File API hides the real
+//     on-disk path; the user knows where they picked the
+//     file from and can find it themselves).
+//
+// fileID is the bubble ID on the GUI side. The frontend
+// generates a UUID when the user picks a file and passes
+// it through SendFileStart → SendFileFinish → this call;
+// drag-and-drop synthesises one if the caller passes "" so
+// progress events still reach the right bubble.
+//
+// skipChatLog controls whether to publish a chat message
+// + persist a chat.enc record for this send. See the
+// SendFileStart doc comment for the picker-route rationale.
+func (n *Node) SendFile(peerRef, name string, size int64, src io.Reader, localPath, fileID string, skipChatLog bool) error {
 	if n.ctx == nil {
 		return errors.New("node: not started")
 	}
@@ -252,7 +281,7 @@ func (n *Node) SendFile(peerRef, path, offerName, localPath, fileID string, skip
 			pct = sent * 100 / total
 		}
 		log.Printf("[FILE] sending %s to %s  %d/%d bytes (%d%%)",
-			path, peerHexStr, sent, total, pct)
+			name, peerHexStr, sent, total, pct)
 		// Emit at most ~10 Hz to avoid flooding the
 		// event channel on a fast transfer.
 		now := time.Now()
@@ -276,12 +305,12 @@ func (n *Node) SendFile(peerRef, path, offerName, localPath, fileID string, skip
 		lastFlush = now
 		windowBytes = 0
 	}
-	log.Printf("[FILE] start send peer=%s path=%s fileID=%s offerName=%s localPath=%q",
-		peerHexStr, path, fileID, offerName, localPath)
+	log.Printf("[FILE] start send peer=%s name=%s size=%d fileID=%s localPath=%q",
+		peerHexStr, name, size, fileID, localPath)
 	n.wg.Add(1)
 	go func() {
 		defer n.wg.Done()
-		if err := filetransfer.Send(context.Background(), st.ch, path, offerName, progress, st.rcv.WaitForReply); err != nil {
+		if err := filetransfer.Send(context.Background(), st.ch, src, size, name, progress, st.rcv.WaitForReply); err != nil {
 			log.Printf("[ERROR] sendfile: %v", err)
 			// Tell the GUI: bubble turns red, show err.
 			n.publishFileEvent(FileEvent{
@@ -292,17 +321,15 @@ func (n *Node) SendFile(peerRef, path, offerName, localPath, fileID string, skip
 			})
 			return
 		}
-		log.Printf("[FILE] done peer=%s path=%s", peerHexStr, path)
+		log.Printf("[FILE] done peer=%s name=%s", peerHexStr, name)
 		// Final 100% tick so the GUI's progress bar
 		// reaches the end before the done event.
-		if info, ferr := os.Stat(path); ferr == nil {
-			n.publishFileEvent(FileEvent{
-				Type:   FileEventProgress,
-				FileID: fileID,
-				Sent:   info.Size(),
-				Total:  info.Size(),
-			})
-		}
+		n.publishFileEvent(FileEvent{
+			Type:   FileEventProgress,
+			FileID: fileID,
+			Sent:   size,
+			Total:  size,
+		})
 		n.publishFileEvent(FileEvent{
 			Type:   FileEventDone,
 			FileID: fileID,
@@ -314,26 +341,15 @@ func (n *Node) SendFile(peerRef, path, offerName, localPath, fileID string, skip
 		// The basename rather than full path because
 		// the receiver already has its own copy and we
 		// don't want to leak the sender's local layout.
-		base := path
+		base := name
 		if i := strings.LastIndexAny(base, "/\\"); i >= 0 {
 			base = base[i+1:]
 		}
-		// Size: stat the file we just sent. Logged as
-		// human-readable in the file: message body so the
-		// GUI can show "2.4 MiB · SM4-GCM 加密" without a
-		// second fs call.
-		sizeStr := ""
-		if info, err := os.Stat(path); err == nil {
-			sizeStr = humanSize(info.Size())
-		}
+		sizeStr := humanSize(size)
 		body := "file://" + base
 		if sizeStr != "" {
 			body += "|" + sizeStr
 		}
-		// Use the LocalPath the caller gave us, not the
-		// on-disk path of the temp/source file. For the
-		// picker route the caller passes "" because the
-		// temp file is going to be deleted.
 		outLocalPath := localPath
 		if !skipChatLog {
 			n.publishMessage(Message{
@@ -356,16 +372,21 @@ func (n *Node) SendFile(peerRef, path, offerName, localPath, fileID string, skip
 				LocalPath: outLocalPath,
 			})
 		} else {
-			// Picker route. The staging file at <path>
-			// has served its purpose; clean it up so we
-			// don't accumulate <data-dir>/sent/ entries
-			// forever. The frontend holds the live bubble,
-			// the receiver has its own copy on the other
-			// side, and the sender has the original file
-			// in the place they picked it from.
-			if err := os.Remove(path); err != nil && !os.IsNotExist(err) {
-				log.Printf("[WARN  ] picker staging cleanup failed: %v", err)
-			}
+			// Picker route. We deliberately KEEP the
+			// staging copy at <path> (it's at
+			// <data-dir>/sent/<basename>) so the
+			// sender's bubble has a real LocalPath for
+			// right-click "open folder" / "double-click
+			// open". The picker frontend holds the live
+			// bubble; we don't publish a chat message
+			// (skipChatLog=true). The receiver already
+			// has its own copy on the other side, and
+			// the sender's original file is where they
+			// picked it from — the staging copy here is
+			// only used as a "where to reveal in folder"
+			// target. v0.1 doesn't auto-clean old sent/
+			// entries; the user can sweep the dir
+			// manually if it grows.
 		}
 	}()
 	return nil

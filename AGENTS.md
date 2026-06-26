@@ -98,6 +98,16 @@ D:\innerlink\
 - **`frontend/dist/.gitkeep` 必须入库**：`main.go:36` 有 `//go:embed all:frontend/dist`，fresh clone 目录空会编译失败；Go `all:` 前缀会包含 `.` 开头的文件，所以 `.gitkeep` 能满足 embed。`wails build -clean` 会清空 `frontend/dist/` 包括已跟踪的 `.gitkeep`，所以 build 后 commit 前要 `git checkout HEAD -- frontend/dist/.gitkeep` 恢复，或者用单独的 chore commit 兜底。
 - **本地 pre-push 必跑 `wails build -clean -nopackage`**（不带 `-s`），`-s`/`-nopackage` 单独用会跳过 `tsc && vite build`，TS 类型错会漏到 CI（参考 879c55c 的 `Uint8Array`/`SendFileContent` 类型错）。
 
+## Architecture
+
+- **前端就是视觉呈现，文件传输逻辑放 core**。Wails v2 浏览器 `File` API 故意隐藏磁盘路径（沙箱安全），但 Go 拿不到路径不等于必须由前端来"分发字节"。正确做法：
+  - 把 `filetransfer.Send` 签名从 `path string` 改成 `src io.Reader, size int64`。
+  - Picker 路径前端调 `SendFileOpen/Chunk/Close`，core 端用 `io.Pipe` 收字节：JS Blob.slice → IPC → pipe.Writer → pipe.Reader → filetransfer chunk 加密 → 网络。
+  - Drag-and-drop 路径 core 自己 `os.Open(path)`，传 `*os.File` 当 reader。
+  - 同一份字节只走一次磁盘读（避免之前 staging file 方案的"JS 读一次 + Go 再读一次"的 2x I/O）。
+  - 不要让前端拼装"phase 1 上传 → phase 2 发送"的多阶段进度；用户会觉得"文件被搬了两次"。核心就发一个进度事件，单阶段 0→100。
+  - 老版本的两阶段（staging file）设计是绕过 `filetransfer.Send` 必须接 path 的妥协，**重构接口 > 在前端补粘合逻辑**。
+
 ## 调试
 
 - **CLI REPL** 是最快验证协议层的工具：`go build -o innerlink-cli.exe ./cmd/innerlink`，跑 `innerlink-cli.exe`。

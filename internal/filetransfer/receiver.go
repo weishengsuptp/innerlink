@@ -404,7 +404,14 @@ func (r *Receiver) finalize(ctx context.Context, pf *partFile) error {
 			return fmt.Errorf("missing chunk %d", i)
 		}
 	}
-	if pf.hashWhole.SumHex() != pf.offer.SHA256 {
+	// v0.1: per-chunk SHA-256 was checked on arrival; full-
+	// file SHA-256 in the Offer is now empty (see sender.go
+	// doc comment for the picker-route rationale). Skip the
+	// whole-file compare when the sender didn't supply one.
+	// Per-chunk hashes + SM4-GCM channel MAC cover in-flight
+	// tamper detection. End-to-end whole-file integrity is
+	// a v0.2 concern.
+	if pf.offer.SHA256 != "" && pf.hashWhole.SumHex() != pf.offer.SHA256 {
 		return errors.New("full-file sha256 mismatch")
 	}
 	finalPath := uniquePath(r.saveDir, pf.offer.Name)
