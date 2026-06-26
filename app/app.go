@@ -246,7 +246,10 @@ func (a *App) SendFile(peerRef, path string) string {
 	if a.nd == nil {
 		return "node not started"
 	}
-	if err := a.nd.SendFile(peerRef, path, "", path, ""); err != nil {
+	// skipChatLog=false: drag-and-drop has no live
+	// placeholder bubble, so the chat message IS the
+	// UI artefact for the sent file.
+	if err := a.nd.SendFile(peerRef, path, "", path, "", false); err != nil {
 		return err.Error()
 	}
 	return ""
@@ -401,7 +404,15 @@ func (a *App) SendFileFinish(fileID string) string {
 		fileID, pf.path, pf.bytesIn)
 	// Start the transfer. SendFile publishes
 	// file:progress + file:done events keyed by fileID.
-	if err := a.nd.SendFile(pf.peerRef, pf.path, pf.name, pf.path, pf.fileID); err != nil {
+	//
+	// skipChatLog=true: the picker frontend already
+	// inserted a placeholder bubble via state.fileBubbles
+	// and renders progress there. Publishing a chat
+	// message here too would create a SECOND bubble for
+	// the same file. The staging copy at pf.path is
+	// removed by Node.SendFile once the transfer
+	// completes (we own that lifecycle now).
+	if err := a.nd.SendFile(pf.peerRef, pf.path, pf.name, "", pf.fileID, true); err != nil {
 		_ = os.Remove(pf.path)
 		return err.Error()
 	}
@@ -443,7 +454,10 @@ func (a *App) SendFileContent(peerRef, name string, content []byte) string {
 	// get to see these (it didn't put a placeholder
 	// bubble), but the log + future debug view will.
 	fileID := newFileID()
-	if err := a.nd.SendFile(peerRef, finalPath, cleanName, finalPath, fileID); err != nil {
+	// skipChatLog=false: legacy one-shot route; the
+	// chat message is the only UI artefact for this
+	// send (no live placeholder bubble).
+	if err := a.nd.SendFile(peerRef, finalPath, cleanName, finalPath, fileID, false); err != nil {
 		return err.Error()
 	}
 	return ""

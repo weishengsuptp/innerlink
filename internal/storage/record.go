@@ -46,6 +46,24 @@ import (
 //     on-the-wire message (8 bytes hex). We store it so
 //     a future v0.3 reader can dedupe re-delivered
 //     envelopes. v0.1's reader does not check it.
+//
+//   - LocalPath is set for "file://" messages and points
+//     at the actual file on the local filesystem
+//     (drag-and-drop: the file the user dropped;
+//     picker-route: the staging copy in <data-dir>/sending/
+//     renamed to its original basename after transfer;
+//     inbound: the saved copy in <data-dir>/received/).
+//     Empty for plain text messages. The frontend reads it
+//     to wire up "right-click → reveal in folder" and
+//     "double-click → open with default app". Without
+//     persisting this, peer-switch / app-restart wipes the
+//     path and the user gets the "此文件来自文件选择器"
+//     toast even though the file is right there.
+//
+//     `omitempty` keeps the on-disk shape unchanged for
+//     plain text records (the majority), and an old reader
+//     that doesn't know this field still works because
+//     json.Unmarshal silently leaves it at zero value.
 type Record struct {
 	Version   int       `json:"v"`
 	Timestamp time.Time `json:"ts"`
@@ -54,6 +72,7 @@ type Record struct {
 	Direction string    `json:"dir"`      // "in" or "out"
 	Body      string    `json:"body"`     // chat text
 	MsgID     string    `json:"msgID"`    // 16-char hex, envelope MsgID
+	LocalPath string    `json:"localPath,omitempty"`
 }
 
 // CurrentVersion is the on-disk record version produced by

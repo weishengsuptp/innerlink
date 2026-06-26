@@ -565,13 +565,32 @@ func (n *Node) wrapChannel(conn *transport.Conn, sess *handshake.Session) {
 		if sizeStr != "" {
 			body += "|" + sizeStr
 		}
+		now := time.Now().UTC()
 		n.publishMessage(Message{
 			PeerID:    peerHexStr,
 			Body:      body,
-			Timestamp: time.Now().UTC(),
+			Timestamp: now,
 			Direction: DirIn,
 			LocalPath: finalPath,
 		})
+		// Persist so the GUI can re-render the file
+		// card after peer-switch / app-restart.
+		// Without this, History() reload shows the
+		// received files but their LocalPath is empty
+		// and right-click → "open folder" fails.
+		rec := &storage.Record{
+			Timestamp: now,
+			From:      peerHexStr,
+			To:        n.id.PeerIDHex(),
+			Direction: "in",
+			Body:      body,
+			MsgID:     "",
+			LocalPath: finalPath,
+		}
+		if err := n.chatStore.Append(rec); err != nil {
+			log.Printf("[ERROR] chat log append (file): %v", err)
+		}
+		n.appendHistory(rec)
 	})
 	if !n.channels.set(sess.RemotePeerID, &channelState{ch: ch, rcv: rcv, peerID: append([]byte(nil), sess.RemotePeerID...)}) {
 		log.Printf("[INFO ] channel superseded peer=%s (keeping existing)", peerHexStr)
