@@ -193,8 +193,8 @@ func (n *Node) SendText(peerRef, text string) error {
 //     user's disk (so opening reveals the user's own
 //     folder, not a temp copy).
 //   - picker route: "" (the File API hides the real
-//     on-disk path; the user knows where they picked
-//     the file from and can find it themselves).
+//     on-disk path; the user knows where they picked the
+//     file from and can find it themselves).
 //
 // fileID is the bubble ID on the GUI side. The
 // frontend generates a UUID when the user picks a file
@@ -203,11 +203,23 @@ func (n *Node) SendText(peerRef, text string) error {
 // caller passes "" so progress events still reach
 // the right bubble.
 //
+// skipChatLog controls whether to publish a chat
+// message + persist a chat.enc record for this send.
+//   - drag-and-drop route (app.App.SendFile → this):
+//     false. The chat message is the only UI artefact
+//     for the file (no live placeholder bubble), so it
+//     must exist.
+//   - picker route (app.App.SendFileFinish → this):
+//     true. The frontend already created a live progress
+//     bubble via state.fileBubbles; publishing a chat
+//     message here would create a SECOND bubble for
+//     the same file, which looks like a duplicate.
+//
 // Progress is logged to the configured log sink and
 // also published to SubscribeFiles() as FileEvent
 // values, so the GUI can update its bubble in real
 // time without polling logs.
-func (n *Node) SendFile(peerRef, path, offerName, localPath, fileID string) error {
+func (n *Node) SendFile(peerRef, path, offerName, localPath, fileID string, skipChatLog bool) error {
 	if n.ctx == nil {
 		return errors.New("node: not started")
 	}
@@ -323,24 +335,38 @@ func (n *Node) SendFile(peerRef, path, offerName, localPath, fileID string) erro
 		// picker route the caller passes "" because the
 		// temp file is going to be deleted.
 		outLocalPath := localPath
-		n.publishMessage(Message{
-			PeerID:    peerHexStr,
-			Body:      body,
-			Timestamp: time.Now().UTC(),
-			Direction: DirOut,
-			LocalPath: outLocalPath,
-		})
-		// Also append to the encrypted chat log so the
-		// file event persists across restarts and the GUI
-		// can re-render the file card on relaunch.
-		n.chatStore.Append(&storage.Record{
-			Timestamp: time.Now().UTC(),
-			From:      n.id.PeerIDHex(),
-			To:        peerHexStr,
-			Direction: "out",
-			Body:      body,
-			MsgID:     "",
-		})
+		if !skipChatLog {
+			n.publishMessage(Message{
+				PeerID:    peerHexStr,
+				Body:      body,
+				Timestamp: time.Now().UTC(),
+				Direction: DirOut,
+				LocalPath: outLocalPath,
+			})
+			// Also append to the encrypted chat log so the
+			// file event persists across restarts and the GUI
+			// can re-render the file card on relaunch.
+			n.chatStore.Append(&storage.Record{
+				Timestamp: time.Now().UTC(),
+				From:      n.id.PeerIDHex(),
+				To:        peerHexStr,
+				Direction: "out",
+				Body:      body,
+				MsgID:     "",
+				LocalPath: outLocalPath,
+			})
+		} else {
+			// Picker route. The staging file at <path>
+			// has served its purpose; clean it up so we
+			// don't accumulate <data-dir>/sent/ entries
+			// forever. The frontend holds the live bubble,
+			// the receiver has its own copy on the other
+			// side, and the sender has the original file
+			// in the place they picked it from.
+			if err := os.Remove(path); err != nil && !os.IsNotExist(err) {
+				log.Printf("[WARN  ] picker staging cleanup failed: %v", err)
+			}
+		}
 	}()
 	return nil
 }
@@ -423,6 +449,12 @@ func (n *Node) History(peerRef string) []Message {
 			Body:      r.Body,
 			Timestamp: r.Timestamp,
 			Direction: r.Direction,
+			// LocalPath is persisted in chat.enc since
+			// 2026-06-26; older records omit it (json
+			// default = ""). Pass it through so
+			// peer-switch / app-restart doesn't wipe the
+			// "right-click → reveal in folder" target.
+			LocalPath: r.LocalPath,
 		})
 		if len(out) >= historyLimit {
 			break

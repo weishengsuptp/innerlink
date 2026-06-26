@@ -797,6 +797,11 @@ async function sendPickerFile(file: File) {
   // a fresh Blob backed by a memory-mapped view.
   const CHUNK = 1024 * 1024;
   let offset = 0;
+  // Throttle picker-phase progress updates so we don't
+  // re-render the DOM 401 times for a 401 MiB file.
+  // (Node.SendFile has its own 100 ms throttle for the
+  // post-Finish transfer phase; this covers the gap.)
+  let lastLocalTick = 0;
   try {
     while (offset < file.size) {
       const end = Math.min(offset + CHUNK, file.size);
@@ -812,6 +817,15 @@ async function sendPickerFile(file: File) {
       const r = await SendFileChunk(fileID, chunk);
       if (r) throw new Error(r);
       offset = end;
+      // Local progress for the picker-streaming phase.
+      // bps is approximate here — Node.SendFile's
+      // sliding-window bps will take over once the
+      // actual transfer starts (file:event 'progress').
+      const now = performance.now();
+      if (now - lastLocalTick > 80) {
+        lastLocalTick = now;
+        updateFileBubble(fileID, offset, 0);
+      }
     }
     // 4. Close staging + kick the real transfer.
     const finishErr = await SendFileFinish(fileID);
