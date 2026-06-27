@@ -395,7 +395,17 @@ func (a *App) SendFilePath(peerRef, path string) SendFilePathResult {
 	}
 	name := filepath.Base(path)
 	fileID := newFileID()
-	if err := a.nd.SendFile(peerRef, name, stat.Size(), f, path, fileID, false); err != nil {
+	// skipChatLog=true: the frontend keeps a live
+	// placeholder bubble for this fileID in
+	// state.fileBubbles, updated in place by the
+	// file:event stream. If we also published a chat
+	// message here, the frontend would render a SECOND
+	// bubble for the same file (one live-progress, one
+	// final file://). Node.SendFile now writes the
+	// chat.enc record unconditionally so the bubble
+	// survives app restart either way (file card
+	// re-rendered from history on relaunch).
+	if err := a.nd.SendFile(peerRef, name, stat.Size(), f, path, fileID, true); err != nil {
 		_ = f.Close()
 		return SendFilePathResult{Err: err.Error()}
 	}

@@ -98,11 +98,12 @@ interface UIState {
 interface FileBubbleState {
   fileID: string;
   name: string;
-  size: number;        // bytes total
+  size: number;        // bytes total (populated by first file:event)
   sent: number;        // bytes sent (single-phase now)
   bps: number;         // bytes per second (sliding window)
   err: string;
   peerId: string;      // hex peer ID
+  localPath: string;   // sender's on-disk path (picker has it; drag-and-drop also has it now)
 }
 
 const state: UIState = {
@@ -555,17 +556,17 @@ function renderFileBubble(fb: FileBubbleState): string {
     statusHtml = `<span class="file-status file-status-pending">排队中…</span>`;
     barClass = '';
   }
-  // No data-file-path here: the picker File API
-  // hides the user's on-disk path, and the bubble
-  // is owned by core's file:event stream. Right-click
-  // on the picker bubble reports "no local path; use
-  // drag-and-drop" (existing behaviour in
-  // revealFileMessage).
+  // data-file-path is the user's real on-disk path
+  // (set by the picker via the native dialog, or by
+  // drag-and-drop). Same value either way — both
+  // routes have a real path in v4. Right-click uses
+  // it to reveal in Explorer.
+  const dataPath = fb.localPath || '';
   return `
     <div class="msg self" data-file-id="${escapeHtml(fb.fileID)}">
       <div class="av">我</div>
       <div>
-        <div class="bubble file-bubble" data-file-name="${escapeHtml(fb.name)}" data-file-path="" title="右键更多">
+        <div class="bubble file-bubble" data-file-name="${escapeHtml(fb.name)}" data-file-path="${escapeHtml(dataPath)}" title="双击打开 · 右键更多">
           <div class="file-msg">
             <div class="file-icon">
               <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><path d="M14 2v6h6"/></svg>
@@ -813,12 +814,22 @@ function appendFileBubble(fileID: string) {
 // number on an existing bubble in place. Cheaper than
 // re-rendering the whole message list. Single-phase
 // now: sent = total bytes sent across the whole
-// pipeline (picker → IPC → pipe → encrypt → network).
-function updateFileBubble(fileID: string, sent: number, bps: number) {
+// pipeline (Go reads from disk → encrypt → wire).
+//
+// `total` is the file's full size from the Go-side
+// FileEvent (always present in the payload). We latch
+// it into fb.size on the FIRST progress event so the
+// bar percentage works correctly from that point on;
+// otherwise fb.size stays at the placeholder's 0 and
+// every pct computation reads 0% (the bug that left
+// the bar stuck at 0% with speed numbers animating —
+// 2026-06-27).
+function updateFileBubble(fileID: string, sent: number, total: number, bps: number) {
   const fb = state.fileBubbles.get(fileID);
   if (!fb) return;
   fb.sent = sent;
   fb.bps = bps;
+  if (total > 0 && fb.size === 0) fb.size = total;
   const root = findFileBubbleEl(fileID);
   if (!root) return;
   const pct = fb.size > 0 ? Math.min(100, Math.floor(sent * 100 / fb.size)) : 0;
@@ -834,10 +845,18 @@ function updateFileBubble(fileID: string, sent: number, bps: number) {
 // markFileBubbleDone flips the bubble into its final
 // state. ok=true → green bar + "已发送"; ok=false → red
 // bar + the error message.
-function markFileBubbleDone(fileID: string, ok: boolean, errMsg: string) {
+//
+// `total` is the file's full size from the Go-side
+// FileEvent (latched into fb.size if the file finished
+// before the first progress event, e.g. tiny files
+// that complete in <100 ms — those skip the progress
+// stream entirely; without this fallback the bubble
+// would show "已发送 · 0 B" because fb.size was still 0).
+function markFileBubbleDone(fileID: string, ok: boolean, errMsg: string, total: number) {
   const fb = state.fileBubbles.get(fileID);
   if (!fb) return;
   fb.err = ok ? '' : errMsg;
+  if (total > 0 && fb.size === 0) fb.size = total;
   if (ok) fb.sent = fb.size; // bar at 100%
   const root = findFileBubbleEl(fileID);
   if (!root) return;
@@ -1049,6 +1068,11 @@ function wireEvents() {
 
     // 3. Placeholder bubble. Progress comes from
     //    file:event which fires within ~100 ms.
+    //    localPath is set NOW (not on done) so right-
+    //    click on the live bubble already reveals the
+    //    user's folder — the picker has the real path
+    //    in hand the moment OpenFileDialog returns, no
+    //    reason to gate the affordance on completion.
     const name = path.replace(/^.*[\\/]/, '');
     state.fileBubbles.set(fileID, {
       fileID, name,
@@ -1056,6 +1080,7 @@ function wireEvents() {
       sent: 0, bps: 0,
       err: '',
       peerId,
+      localPath: path,
     });
     appendFileBubble(fileID);
     const el = document.getElementById('messages');
@@ -1183,12 +1208,15 @@ function wireEvents() {
     if (!ev || !ev.fileID) return;
     if (ev.type === 'progress') {
       // Single-phase: file:event 'progress' IS the only
-      // progress stream the frontend reads. Bytes flow
-      // JS → IPC → pipe → encrypt → wire; this event
-      // carries the running total.
-      updateFileBubble(ev.fileID, ev.sent, ev.bytesPerSec);
+      // progress stream the frontend reads. ev.total
+      // carries the file size; we latch it on the first
+      // event so the bar percentage works from then on.
+      updateFileBubble(ev.fileID, ev.sent ?? 0, ev.total ?? 0, ev.bytesPerSec ?? 0);
     } else if (ev.type === 'done') {
-      markFileBubbleDone(ev.fileID, !!ev.ok, ev.err || '');
+      // ev.total is 0 for failed transfers (Go doesn't
+      // know the file size if the open failed) — that's
+      // fine, the failure path doesn't read it.
+      markFileBubbleDone(ev.fileID, !!ev.ok, ev.err || '', ev.total ?? 0);
       if (!ev.ok) toast(`发文件失败: ${ev.err || '未知错误'}`);
     }
   });

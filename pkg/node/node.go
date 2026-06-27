@@ -161,7 +161,14 @@ func New(opts Options) (*Node, error) {
 		channels:    newChannelRegistry(),
 		messageCh:   make(chan Message, 64),
 		peerEventCh: make(chan PeerEvent, 64),
-		fileEventCh: make(chan FileEvent, 32),
+		// 256 = ~12.8s of progress events per transfer at
+		// the ~10 Hz flush cadence; comfortable margin for
+		// 3 concurrent transfers without dropping events
+		// when the Wails event-emit pump is briefly slow.
+		// Was 32 (1.6s) which caused "排队中…" to stick on
+		// parallel sends because the GUI's 'done' event
+		// was dropped on overflow (2026-06-27).
+		fileEventCh: make(chan FileEvent, 256),
 	}
 
 	// Self entry in the roster: always include ourselves
