@@ -48,15 +48,14 @@ import {
   History,
   ListPeers,
   OpenPath,
+  PickFile,
   Ping,
   ReceivedFilePath,
   RevealInFolder,
   Scan,
   SelfPeerID,
   SendFile,
-  SendFileChunk,
-  SendFileClose,
-  SendFileOpen,
+  SendFilePath,
   SendText,
   SetMyAlias,
 } from '../wailsjs/go/app/App';
@@ -313,7 +312,11 @@ function mount() {
               <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4"><path d="m22 2-7 20-4-9-9-4Z"/><path d="M22 2 11 13"/></svg>
             </button>
           </div>
-          <input type="file" id="file-input" style="display:none" />
+          <!-- The picker route now uses runtime.OpenFileDialog
+                via PickFile() (a native OS dialog that hands
+                the real path to Go). The <input type=file>
+                sandbox-route is gone; bytes never cross the
+                JS/Go boundary on the picker. -->
         </form>
       </section>
     </div>
@@ -751,113 +754,46 @@ function promptMore() {
 
 // ----- file transfer helpers -----
 //
-// Files are sent on selection (📎 picker) or drop, not
-// staged into a pending card. The core publishes a
-// "file://" chat message on completion, so the receiver
-// sees the file bubble in the conversation and the sender
-// sees their own outgoing file bubble — no need for an
-// intermediate "ready to send" UI step.
+// Files are sent on selection (📎 picker via the native
+// OS dialog) or drop, not staged into a pending card.
+// The core publishes a "file://" chat message on
+// completion, so the receiver sees the file bubble in
+// the conversation and the sender sees their own
+// outgoing file bubble — no need for an intermediate
+// "ready to send" UI step.
 //
-// sendPickerFile streams the picked file to core in
-// 1 MiB chunks so the UI never freezes (the previous
-// "Array.from the whole Uint8Array and IPC it as one
-// JSON call" path hit ~1 GiB of JSON marshaling peak
-// for a 50 MiB file on Windows — see the user's
-// 2026-06-25 bug report). The new flow:
+// Picker history (2026-06-25 → 2026-06-27):
 //
-//   1. Add a placeholder bubble the moment the file is
-//      picked, so the UI shows progress before any IPC
-//      round-trip completes.
-//   2. SendFileStart → core creates the staging file and
-//      registers it under fileID.
-//   3. Read the file in 1 MiB slices via Blob.arrayBuffer
-//      (no full-file memory copy) and SendFileChunk each.
-//   4. SendFileFinish → core closes the file and starts
-//      the actual transfer; progress bubbles on our side
-//      via the "file:event" runtime event.
-// sendPickerFile streams a picked file to core via an
-// in-memory pipe that filetransfer.Send reads from. The
-// frontend's only job is to push 1 MiB chunks through
-// the pipe and close the writer when done; core owns
-// everything else (encryption, network, progress).
+//   v1: SendFileContent(peer, name, Array.from(uint8)).
+//       Sent the whole file in one IPC call. 50 MiB
+//       JSON.stringify froze the UI for several seconds.
 //
-// 2026-06-26 rewrite: the previous design staged the
-// file to <data-dir>/sent/ before the transfer, which
-// meant the user's file was read TWICE (once by JS,
-// once by Go) and the progress bar went 0→100 twice.
-// The pipe-based version makes ONE pass: bytes flow
-// JS → IPC → io.Pipe → SM4-GCM → network.
+//   v2: SendFileStart / SendFileChunk / SendFileFinish.
+//       Streamed 1 MiB chunks via IPC into a staging file
+//       under <data-dir>/sent/, then ran Node.SendFile
+//       on the staging copy. User saw TWO progress
+//       runs (staging + transfer) and "排队中…" for
+//       several seconds while chunks went through IPC.
 //
-// Three calls in order:
-//   SendFileOpen(peer, name, size)  →  pfID  (core
-//     creates an in-memory slot; we use pfID as the
-//     fileID for both the bubble key and the
-//     file:event correlation)
-//   SendFileChunk(pfID, bytes)     →  write 1 MiB at a time
-//   SendFileClose(pfID)            →  close writer (EOF);
-//     core then runs Node.SendFile → filetransfer.Send,
-//     which drains the pipe reader end and ships chunks
-//     to the peer.
-async function sendPickerFile(file: File) {
-  if (!state.selectedId) return;
-  const peerId = state.selectedId;
-
-  // 1. Open the core-side slot FIRST so we know the
-  // canonical pfID core will use for file:event
-  // correlation. Wails v2.12 only exposes the first
-  // return value of a bound Go method, so SendFileOpen
-  // returns "" on failure and the non-empty pfID on
-  // success.
-  const pfID = await SendFileOpen(peerId, file.name, file.size);
-  if (!pfID) {
-    toast(`发文件失败: 无法打开传输通道`);
-    return;
-  }
-
-  // 2. Placeholder bubble — UI reacts IMMEDIATELY.
-  state.fileBubbles.set(pfID, {
-    fileID: pfID, name: file.name, size: file.size,
-    sent: 0, bps: 0,
-    err: '',
-    peerId,
-  });
-  appendFileBubble(pfID);
-  // Scroll the bubble into view.
-  const el = document.getElementById('messages');
-  if (el) el.scrollTop = el.scrollHeight;
-
-  // 3. Stream 1 MiB chunks. File.slice() doesn't read
-  // the whole file into memory at once — each slice is
-  // a fresh Blob backed by a memory-mapped view.
-  const CHUNK = 1024 * 1024;
-  let offset = 0;
-  try {
-    while (offset < file.size) {
-      const end = Math.min(offset + CHUNK, file.size);
-      const blob = file.slice(offset, end);
-      // The generated Wails binding declares chunk data
-      // as Array<number>; the runtime actually accepts
-      // either Uint8Array or number[] (Go []byte ↔ JS
-      // string in the bridge), but tsc complains. Use
-      // Array.from so we satisfy the types without a
-      // cast; 1 MiB Number[] is fine on the JS heap.
-      const buf = new Uint8Array(await blob.arrayBuffer());
-      const chunk = Array.from(buf);
-      const r = await SendFileChunk(pfID, chunk);
-      if (r) throw new Error(r);
-      offset = end;
-    }
-    // 3. Close the pipe writer; core starts the actual
-    // transfer immediately (drains the pipe reader end
-    // inside filetransfer.Send).
-    const closeErr = await SendFileClose(pfID);
-    if (closeErr) throw new Error(closeErr);
-  } catch (e: any) {
-    markFileBubbleDone(pfID, false, e?.message || String(e));
-    toast(`发文件失败: ${e?.message || e}`);
-  }
-}
-
+//   v3: SendFileOpen / SendFileChunk / SendFileClose
+//       with io.Pipe. Removed the staging file so
+//       bytes flow JS → IPC → pipe → encrypt → wire
+//       in one pass. But the chunk-writing phase still
+//       gave "排队中…" for ~half a second per MiB.
+//
+//   v4 (current): runtime.OpenFileDialog + SendFilePath.
+//       The native OS file picker hands the real on-disk
+//       path straight to Go. core opens the file
+//       directly with os.Open and hands the *os.File to
+//       Node.SendFile — same code path as drag-and-drop.
+//       No JS byte streaming at all. The placeholder
+//       bubble appears synchronously and file:event
+//       progress starts within ~100 ms. User reaction
+//       drove this: "go can handle files, why is JS
+//       doing the transfer?" — the answer was the
+//       HTML <input type=file> was sandbox-limited;
+//       runtime.OpenFileDialog is not.
+//
 // appendFileBubble inserts a single file bubble at the
 // END of the messages container (after the system
 // hint) so the user sees it appear immediately. We
@@ -1061,22 +997,63 @@ function wireEvents() {
     }
   });
 
-  // 📎 picker: open a hidden <input type=file>, read its
-  // bytes via FileReader, then call SendFileContent
-  // immediately. We can't reuse SendFile (which takes a
-  // path) because the browser File API hides the real
-  // on-disk path on modern engines; the picker route
-  // always goes through SendFileContent.
-  const fileInput = document.getElementById('file-input') as HTMLInputElement;
-  document.getElementById('btn-attach')!.addEventListener('click', () => {
-    if (!state.selectedId) return;
-    fileInput.value = '';
-    fileInput.click();
-  });
-  fileInput.addEventListener('change', async () => {
-    const f = fileInput.files?.[0];
-    if (!f) return;
-    await sendPickerFile(f);
+  // 📎 picker: open the native OS file dialog via
+  // PickFile. core gets the real on-disk path back and
+  // hands it to SendFilePath, which opens the file
+  // and runs the same Node.SendFile path as drag-and-
+  // drop. No bytes cross the JS/Go boundary — core
+  // reads the file straight from disk into the SM4-GCM
+  // send loop.
+//
+// Why not <input type=file> + Wails IPC streaming (the
+// 2026-06-26 first attempt): the browser File API hides
+// the real path on modern engines, so core can't
+// `os.Open` it, can't wire up "right-click → open
+// folder", and has to stream bytes through IPC. That
+// gave users a visible "排队中…" pause while JS pushed
+// chunks into core. The native dialog bypasses the
+// browser sandbox entirely and hands the path straight
+// to Go.
+  document.getElementById('btn-attach')!.addEventListener('click', async () => {
+    if (!state.selectedId) {
+      toast('先选一个 peer');
+      return;
+    }
+    const peerId = state.selectedId;
+
+    // 1. Native OS picker → path.
+    const [path, pickErr] = await PickFile();
+    if (!path) {
+      // 'cancelled' = user dismissed the dialog, silent.
+      // Anything else is a real error.
+      if (pickErr && pickErr !== 'cancelled') {
+        toast('选文件失败: ' + pickErr);
+      }
+      return;
+    }
+
+    // 2. core opens the file + starts the transfer.
+    //    Returns a fileID we use as the bubble key AND
+    //    to match file:event progress.
+    const [fileID, sendErr] = await SendFilePath(peerId, path);
+    if (!fileID) {
+      toast('发文件失败: ' + (sendErr || 'unknown'));
+      return;
+    }
+
+    // 3. Placeholder bubble. Progress comes from
+    //    file:event which fires within ~100 ms.
+    const name = path.replace(/^.*[\\/]/, '');
+    state.fileBubbles.set(fileID, {
+      fileID, name,
+      size: 0, // populated by first file:event 'progress'
+      sent: 0, bps: 0,
+      err: '',
+      peerId,
+    });
+    appendFileBubble(fileID);
+    const el = document.getElementById('messages');
+    if (el) el.scrollTop = el.scrollHeight;
   });
 
   // Track scroll position so renderMessages can decide
