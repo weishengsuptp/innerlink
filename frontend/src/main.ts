@@ -703,6 +703,11 @@ function renderMessage(m: node.Message, peerId: string): string {
   // File message: Body has prefix "file://" (per core
   // pkg/node/messages.go SendFile + OnComplete), with an
   // optional "|size" suffix for the meta line.
+  //
+  // v1.1: data-msg-ts / data-msg-peer / data-msg-dir on
+  // the outer .msg let the history drawer's click
+  // handler scroll to this exact message.
+  const msgAttrs = `data-msg-ts="${escapeHtml(m.Timestamp || '')}" data-msg-peer="${escapeHtml(m.PeerID || '')}" data-msg-dir="${escapeHtml(m.Direction || '')}"`;
   if (m.Body.startsWith('file://')) {
     const rest = m.Body.slice('file://'.length);
     const pipe = rest.indexOf('|');
@@ -714,7 +719,7 @@ function renderMessage(m: node.Message, peerId: string): string {
     // The click handler resolves the actual path.
     const dataPath = m.LocalPath || '';
     return `
-      <div class="msg ${sideClass}">
+      <div class="msg ${sideClass}" ${msgAttrs}>
         <div class="av">${escapeHtml(avChar)}</div>
         <div>
           <div class="bubble file-bubble" data-file-name="${escapeHtml(name)}" data-file-path="${escapeHtml(dataPath)}" title="双击打开 · 右键更多">
@@ -735,7 +740,7 @@ function renderMessage(m: node.Message, peerId: string): string {
   }
 
   return `
-    <div class="msg ${sideClass}">
+    <div class="msg ${sideClass}" ${msgAttrs}>
       <div class="av">${escapeHtml(avChar)}</div>
       <div>
         <div class="bubble">${escapeHtml(m.Body)}</div>
@@ -926,7 +931,10 @@ function renderHistoryList() {
     const bodyText = historyBodyText(r.msg.Body);
     const bodyHtml = highlightQuery(escapeHtml(bodyText), q);
     return `
-      <div class="history-item" data-peer="${escapeHtml(r.peer)}">
+      <div class="history-item"
+           data-peer="${escapeHtml(r.peer)}"
+           data-ts="${escapeHtml(r.msg.Timestamp || '')}"
+           data-dir="${escapeHtml(r.msg.Direction || '')}">
         <div class="history-item-meta">
           <span class="history-item-peer ${isSelf ? 'self' : ''}">${escapeHtml(r.peerName)}</span>
           <span>${fmtTime(r.msg.Timestamp)}</span>
@@ -935,15 +943,36 @@ function renderHistoryList() {
       </div>
     `;
   }).join('');
-  // Click → jump to peer + close drawer.
+  // Click → switch to that peer + close drawer + scroll
+  // to the exact message + brief flash highlight so the
+  // user sees where they landed. The scroll happens AFTER
+  // renderMessages() completes (requestAnimationFrame) so
+  // the target .msg node is in the DOM by the time we
+  // query for it. v1.1 (2026-06-27).
   body.querySelectorAll<HTMLElement>('.history-item').forEach(el => {
     el.addEventListener('click', () => {
       const pid = el.getAttribute('data-peer') || '';
+      const ts = el.getAttribute('data-ts') || '';
+      const dir = el.getAttribute('data-dir') || 'in';
       if (!pid) return;
       if (state.selectedId !== pid) {
         void selectPeer(pid);
       }
       void toggleHistoryDrawer();
+      // The chat panel renders after selectPeer resolves;
+      // wait one frame so the new peer's messages are in
+      // the DOM before we try to find + scroll to the
+      // target. Without this, the first query runs before
+      // renderMessages has finished its innerHTML rewrite.
+      requestAnimationFrame(() => {
+        const sel = `.messages .msg[data-msg-ts="${CSS.escape(ts)}"][data-msg-peer="${CSS.escape(pid)}"][data-msg-dir="${CSS.escape(dir)}"]`;
+        const target = document.querySelector(sel);
+        if (target) {
+          target.scrollIntoView({ behavior: 'smooth', block: 'center' });
+          target.classList.add('msg-flash');
+          window.setTimeout(() => target.classList.remove('msg-flash'), 1600);
+        }
+      });
     });
   });
 }
@@ -1494,6 +1523,25 @@ function wireEvents() {
       if (state.historyDrawerOpen) renderHistoryList();
     });
   }
+  // Outside-click closes the drawer. v1.1 (2026-06-27)
+  // user feedback: clicking the chat area should also
+  // close the drawer, not just the X button or Esc.
+  // Registered LAST so it doesn't preempt the file-bubble
+  // / cancel-button / menu-closer handlers above.
+  document.addEventListener('click', (ev) => {
+    if (!state.historyDrawerOpen) return;
+    const t = ev.target as HTMLElement | null;
+    if (!t) return;
+    // Clicks inside the drawer (header / search / list) —
+    // let them propagate normally.
+    if (t.closest('#history-drawer')) return;
+    // Click on the toggle button (📜) is handled by its
+    // own listener (toggles). Don't fight it here.
+    if (t.closest('#btn-history')) return;
+    // Anything else (chat area, sidebar, peer list, …)
+    // closes the drawer.
+    void toggleHistoryDrawer();
+  });
 
   // Live event streams from Go.
   EventsOn('peer:event', (_ev: any) => {

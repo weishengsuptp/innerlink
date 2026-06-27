@@ -315,32 +315,38 @@ body {
  * (2026-06-27). Floats in the top-right corner of the
  * bubble, only visible while the bubble is in flight
  * (the renderer omits it for done / failed bubbles).
- * Sits on a subtle background so it's visible against
- * the green outgoing-bubble fill. */
+ * Updated 2026-06-27 15:50: v1 — was opacity:0.55 default
+ * (only visible on hover) and 22px. User reported the
+ * button "couldn't be found" — fixed to opacity 1.0 +
+ * 24px + bold white ✕ on a stronger dark badge so it
+ * reads as an obvious affordance at a glance. */
 .file-cancel {
   position: absolute;
-  top: 8px;
-  right: 8px;
-  width: 22px;
-  height: 22px;
+  top: 6px;
+  right: 6px;
+  width: 24px;
+  height: 24px;
   display: inline-flex;
   align-items: center;
   justify-content: center;
-  background: rgba(0, 0, 0, 0.16);
-  color: rgba(255, 255, 255, 0.92);
+  background: rgba(0, 0, 0, 0.55);
+  color: #ffffff;
   border: none;
   border-radius: 50%;
   cursor: pointer;
   padding: 0;
-  opacity: 0.55;
-  transition: opacity 0.15s, background 0.15s;
+  opacity: 1;
+  transition: background 0.15s, transform 0.1s;
 }
 .file-cancel:hover {
-  opacity: 1;
-  background: rgba(220, 38, 38, 0.85);
+  background: #dc2626;
+  transform: scale(1.08);
+}
+.file-cancel:active {
+  transform: scale(0.94);
 }
 .file-cancel.cancelling {
-  opacity: 0.3;
+  opacity: 0.4;
   pointer-events: none;
 }
 
