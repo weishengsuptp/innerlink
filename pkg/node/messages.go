@@ -110,9 +110,12 @@ type FileEvent struct {
 }
 
 // SubscribeFiles returns a channel of file-transfer
-// progress events. Buffered to 32; under sustained
-// progress (e.g. 1 MiB chunks at 30 Hz) drops oldest
-// rather than blocking the sender goroutine.
+// progress events. Buffered to 256 (about 12 s of
+// progress at the 10 Hz flush cadence for one transfer;
+// comfortable for ~3 concurrent transfers without
+// dropping the final 'done' event when the Wails event
+// pump is briefly slow); under sustained progress drops
+// oldest rather than blocking the sender goroutine.
 //
 // The channel is closed when Close() is called.
 func (n *Node) SubscribeFiles() <-chan FileEvent {
@@ -173,52 +176,6 @@ func (n *Node) SendText(peerRef, text string) error {
 	return nil
 }
 
-// SendFile streams a local file to a peer. Runs in a
-// background goroutine (file transfers can take
-// minutes for GiB-sized files); this method returns
-// immediately once the goroutine is launched.
-//
-// offerName is the name the receiver should save and
-// display. If empty, the on-disk basename of path is
-// used. The GUI's picker route passes the user's
-// original filename here (the actual bytes live in a
-// temp file in <data-dir>/outbox/ — which is deleted
-// shortly after the transfer, so we never want to
-// advertise the temp path as the "open me" location).
-//
-// localPath is what the GUI should hand to the
-// double-click / right-click "open" handler on the
-// sender's chat bubble:
-//   - drag-and-drop route: the source file path on the
-//     user's disk (so opening reveals the user's own
-//     folder, not a temp copy).
-//   - picker route: "" (the File API hides the real
-//     on-disk path; the user knows where they picked the
-//     file from and can find it themselves).
-//
-// fileID is the bubble ID on the GUI side. The
-// frontend generates a UUID when the user picks a file
-// and passes it through SendFileStart → SendFileFinish
-// → this call. Drag-and-drop synthesises one if the
-// caller passes "" so progress events still reach
-// the right bubble.
-//
-// skipChatLog controls whether to publish a chat
-// message + persist a chat.enc record for this send.
-//   - drag-and-drop route (app.App.SendFile → this):
-//     false. The chat message is the only UI artefact
-//     for the file (no live placeholder bubble), so it
-//     must exist.
-//   - picker route (app.App.SendFileFinish → this):
-//     true. The frontend already created a live progress
-//     bubble via state.fileBubbles; publishing a chat
-//     message here would create a SECOND bubble for
-//     the same file, which looks like a duplicate.
-//
-// Progress is logged to the configured log sink and
-// also published to SubscribeFiles() as FileEvent
-// values, so the GUI can update its bubble in real
-// time without polling logs.
 // SendFile ships the byte stream from src to peerRef under
 // offerName. The src argument is an io.Reader the caller
 // owns (typically *os.File for drag-and-drop, the read end
@@ -235,19 +192,32 @@ func (n *Node) SendText(peerRef, text string) error {
 //   - drag-and-drop route: the source file path on the
 //     user's disk (so opening reveals the user's own
 //     folder, not a temp copy).
-//   - picker route: "" (the File API hides the real
-//     on-disk path; the user knows where they picked the
-//     file from and can find it themselves).
+//   - picker route: the user's original path (the native
+//     OS dialog hands the real path to Go, no sandbox
+//     hiding). Same value, different origin.
 //
 // fileID is the bubble ID on the GUI side. The frontend
-// generates a UUID when the user picks a file and passes
-// it through SendFileStart → SendFileFinish → this call;
-// drag-and-drop synthesises one if the caller passes "" so
-// progress events still reach the right bubble.
+// generates a UUID when the user picks a file and stores
+// it in state.fileBubbles before the file:event
+// progress stream arrives. Drag-and-drop synthesises one
+// if the caller passes "" so progress events still reach
+// the right bubble.
 //
 // skipChatLog controls whether to publish a chat message
-// + persist a chat.enc record for this send. See the
-// SendFileStart doc comment for the picker-route rationale.
+// to the message channel (SubscribeMessages). The chat.enc
+// record is ALWAYS written regardless of skipChatLog —
+// that's the persistence contract that lets the file card
+// re-render after an app restart.
+//   - drag-and-drop route (app.App.SendFile → this):
+//     false. No live placeholder bubble on the GUI; the
+//     chat message IS the only UI artefact for the file.
+//   - picker route (app.App.SendFilePath → this):
+//     true. The frontend already maintains a live
+//     placeholder bubble in state.fileBubbles (driven by
+//     file:event). Publishing a chat message here too
+//     would render a SECOND bubble for the same file,
+//     which is what happened before skipChatLog became
+//     publish-only (2026-06-27).
 func (n *Node) SendFile(peerRef, name string, size int64, src io.Reader, localPath, fileID string, skipChatLog bool) error {
 	if n.ctx == nil {
 		return errors.New("node: not started")
@@ -350,43 +320,49 @@ func (n *Node) SendFile(peerRef, name string, size int64, src io.Reader, localPa
 		if sizeStr != "" {
 			body += "|" + sizeStr
 		}
-		outLocalPath := localPath
+		// Always append to the encrypted chat log so the
+		// file event persists across restarts and the GUI
+		// can re-render the file card on relaunch. This is
+		// the source of truth — even if the in-process
+		// state.fileBubbles is gone after a restart, the
+		// chat.enc record survives and History() will
+		// surface it as a regular file:// bubble with the
+		// right LocalPath for right-click "open folder".
+		//
+		// skipChatLog gates only the publishMessage call
+		// below. Picker route passes skipChatLog=true so
+		// the frontend's live placeholder bubble (driven
+		// by file:event) is the only chat artefact during
+		// the active session — publishing a chat message
+		// here too would render a SECOND bubble for the
+		// same file (one live-progress, one final),
+		// which is what happened before this split
+		// (2026-06-27).
+		rec := &storage.Record{
+			Timestamp: time.Now().UTC(),
+			From:      n.id.PeerIDHex(),
+			To:        peerHexStr,
+			Direction: "out",
+			Body:      body,
+			MsgID:     "",
+			LocalPath: localPath,
+		}
+		if err := n.chatStore.Append(rec); err != nil {
+			log.Printf("[ERROR] chat log append (file): %v", err)
+		}
+		// Also keep the in-memory history slice in sync so
+		// History() returns the file without a chat.enc
+		// reload (cmd/innerlink reads it on every History()
+		// call).
+		n.appendHistory(rec)
 		if !skipChatLog {
 			n.publishMessage(Message{
 				PeerID:    peerHexStr,
 				Body:      body,
-				Timestamp: time.Now().UTC(),
+				Timestamp: rec.Timestamp,
 				Direction: DirOut,
-				LocalPath: outLocalPath,
+				LocalPath: localPath,
 			})
-			// Also append to the encrypted chat log so the
-			// file event persists across restarts and the GUI
-			// can re-render the file card on relaunch.
-			n.chatStore.Append(&storage.Record{
-				Timestamp: time.Now().UTC(),
-				From:      n.id.PeerIDHex(),
-				To:        peerHexStr,
-				Direction: "out",
-				Body:      body,
-				MsgID:     "",
-				LocalPath: outLocalPath,
-			})
-		} else {
-			// Picker route. We deliberately KEEP the
-			// staging copy at <path> (it's at
-			// <data-dir>/sent/<basename>) so the
-			// sender's bubble has a real LocalPath for
-			// right-click "open folder" / "double-click
-			// open". The picker frontend holds the live
-			// bubble; we don't publish a chat message
-			// (skipChatLog=true). The receiver already
-			// has its own copy on the other side, and
-			// the sender's original file is where they
-			// picked it from — the staging copy here is
-			// only used as a "where to reveal in folder"
-			// target. v0.1 doesn't auto-clean old sent/
-			// entries; the user can sweep the dir
-			// manually if it grows.
 		}
 	}()
 	return nil
