@@ -615,7 +615,7 @@ function renderFileBubble(fb: FileBubbleState): string {
          <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4"><path d="M18 6L6 18"/><path d="M6 6l12 12"/></svg>
        </button>`
     : '';
-  return `
+return `
     <div class="msg self" data-file-id="${escapeHtml(fb.fileID)}">
       <div class="av">我</div>
       <div>
@@ -631,10 +631,9 @@ function renderFileBubble(fb: FileBubbleState): string {
               </div>
               <div class="file-meta">${statusHtml}</div>
             </div>
-            ${cancelBtn}
           </div>
+          ${cancelBtn}
         </div>
-        <div class="ts">…</div>
       </div>
     </div>
   `;
@@ -928,8 +927,37 @@ function renderHistoryList() {
   }
   body.innerHTML = rows.map(r => {
     const isSelf = r.msg.Direction === 'out';
-    const bodyText = historyBodyText(r.msg.Body);
-    const bodyHtml = highlightQuery(escapeHtml(bodyText), q);
+    // File messages keep their essence in the history list
+    // (icon + name + size) just like the chat panel — they
+    // are NOT reduced to "📎 <name>" text. User feedback
+    // 2026-06-27: history file rows must support the same
+    // right-click open / reveal / copy actions as live
+    // bubbles. v1.1.
+    let bodyHtml: string;
+    if ((r.msg.Body || '').startsWith('file://')) {
+      const rest = r.msg.Body.slice('file://'.length);
+      const pipe = rest.indexOf('|');
+      const name = pipe >= 0 ? rest.slice(0, pipe) : rest;
+      const size = pipe >= 0 ? rest.slice(pipe + 1) : '';
+      const filePath = r.msg.LocalPath || '';
+      bodyHtml = `
+        <div class="history-item-file"
+             data-file-name="${escapeHtml(name)}"
+             data-file-path="${escapeHtml(filePath)}"
+             title="双击打开 · 右键更多">
+          <div class="file-icon">
+            <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><path d="M14 2v6h6"/></svg>
+          </div>
+          <div class="file-info">
+            <div class="file-name">${highlightQuery(escapeHtml(name), q)}</div>
+            <div class="file-meta">${size ? escapeHtml(size) + ' · ' : ''}文件</div>
+          </div>
+        </div>
+      `;
+    } else {
+      const bodyText = historyBodyText(r.msg.Body);
+      bodyHtml = `<span class="history-item-text">${highlightQuery(escapeHtml(bodyText), q)}</span>`;
+    }
     return `
       <div class="history-item"
            data-peer="${escapeHtml(r.peer)}"
@@ -943,6 +971,27 @@ function renderHistoryList() {
       </div>
     `;
   }).join('');
+  // File rows: right-click → file context menu (open /
+  // reveal / copy), double-click → open file. v1.1
+  // (2026-06-27). Row click is handled below (scroll-to-
+  // message); file interaction is wired separately so
+  // clicking the file doesn't conflict with row click.
+  body.querySelectorAll<HTMLElement>('.history-item-file').forEach(el => {
+    el.addEventListener('contextmenu', (ev) => {
+      const e = ev as MouseEvent;
+      e.preventDefault();
+      e.stopPropagation();
+      const name = el.getAttribute('data-file-name') || '';
+      const dataPath = el.getAttribute('data-file-path') || '';
+      showFileContextMenu(e.clientX, e.clientY, name, dataPath);
+    });
+    el.addEventListener('dblclick', (ev) => {
+      ev.stopPropagation();
+      const name = el.getAttribute('data-file-name') || '';
+      const dataPath = el.getAttribute('data-file-path') || '';
+      void openFileMessage(name, dataPath);
+    });
+  });
   // Click → switch to that peer + close drawer + scroll
   // to the exact message + brief flash highlight so the
   // user sees where they landed. The scroll happens AFTER
