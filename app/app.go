@@ -299,9 +299,30 @@ func (a *App) SendFile(peerRef, path string) string {
 // native dialog removes the gap entirely — the placeholder
 // bubble appears synchronously with the dialog click and
 // file:event progress starts within ~100 ms.
-func (a *App) PickFile() (string, string) {
+// PickFileResult is the (path, errMsg) tuple for
+// PickFile returned as a single Go struct. Wails v2 only
+// exposes the FIRST return value of a bound Go method
+// to TypeScript, so we can't use two-valued returns. A
+// struct gets cleanly translated to a TypeScript class
+// so the frontend can read both fields without a
+// string-parsing hack.
+type PickFileResult struct {
+	Path string `json:"path"` // "" on cancel/error
+	Err  string `json:"err"`  // "" on success; "cancelled" if user dismissed; else real error
+}
+
+// PickFile opens the native OS file picker via
+// wruntime.OpenFileDialog. Returns (path, "") on success;
+// ("", "cancelled") if the user dismisses the dialog;
+// ("", errMsg) on error.
+//
+// Returns PickFileResult (struct, not tuple) for the
+// same Wails v2 reason as SendFilePathResult: only the
+// first return value is exposed to TypeScript, so we
+// can't return (path, errMsg) cleanly. Struct → TS class.
+func (a *App) PickFile() PickFileResult {
 	if a.ctx == nil {
-		return "", "wails context not initialised"
+		return PickFileResult{Err: "wails context not initialised"}
 	}
 	path, err := wruntime.OpenFileDialog(a.ctx, wruntime.OpenDialogOptions{
 		Title: "选择要发送的文件",
@@ -310,13 +331,25 @@ func (a *App) PickFile() (string, string) {
 		},
 	})
 	if err != nil {
-		return "", err.Error()
+		return PickFileResult{Err: err.Error()}
 	}
 	if path == "" {
 		// User cancelled — frontend treats this as silent.
-		return "", "cancelled"
+		return PickFileResult{Err: "cancelled"}
 	}
-	return path, ""
+	return PickFileResult{Path: path}
+}
+
+// SendFilePathResult is the (fileID, errMsg) tuple for
+// SendFilePath returned as a single Go struct. Wails v2
+// only exposes the FIRST return value of a bound Go
+// method to TypeScript, so we can't use two-valued
+// returns. A struct gets cleanly translated to a
+// TypeScript class so the frontend can read both
+// fields without a string-parsing hack.
+type SendFilePathResult struct {
+	FileID string `json:"fileID"` // "" on failure
+	Err    string `json:"err"`    // "" on success
 }
 
 // SendFilePath opens the file at path and starts streaming
@@ -337,40 +370,40 @@ func (a *App) PickFile() (string, string) {
 //     peer-switch / app-restart.
 //   - localPath=path: the sender's right-click "open
 //     folder" reveals the user's actual folder.
-func (a *App) SendFilePath(peerRef, path string) (string, string) {
+func (a *App) SendFilePath(peerRef, path string) SendFilePathResult {
 	if a.nd == nil {
-		return "", "node not started"
+		return SendFilePathResult{Err: "node not started"}
 	}
 	if peerRef == "" {
-		return "", "peer ref is empty"
+		return SendFilePathResult{Err: "peer ref is empty"}
 	}
 	if path == "" {
-		return "", "path is empty"
+		return SendFilePathResult{Err: "path is empty"}
 	}
 	f, err := os.Open(path)
 	if err != nil {
-		return "", fmt.Sprintf("open: %v", err)
+		return SendFilePathResult{Err: fmt.Sprintf("open: %v", err)}
 	}
 	stat, err := f.Stat()
 	if err != nil {
 		_ = f.Close()
-		return "", fmt.Sprintf("stat: %v", err)
+		return SendFilePathResult{Err: fmt.Sprintf("stat: %v", err)}
 	}
 	if !stat.Mode().IsRegular() {
 		_ = f.Close()
-		return "", "not a regular file: " + path
+		return SendFilePathResult{Err: "not a regular file: " + path}
 	}
 	name := filepath.Base(path)
 	fileID := newFileID()
 	if err := a.nd.SendFile(peerRef, name, stat.Size(), f, path, fileID, false); err != nil {
 		_ = f.Close()
-		return "", err.Error()
+		return SendFilePathResult{Err: err.Error()}
 	}
 	// f is owned by Node.SendFile's goroutine now; it'll
 	// close after the transfer completes. Don't double-close.
 	log.Printf("[INFO  app] SendFilePath peer=%s path=%s size=%d fileID=%s",
 		peerRef, path, stat.Size(), fileID)
-	return fileID, ""
+	return SendFilePathResult{FileID: fileID}
 }
 
 // OpenPath opens a local file or folder with the OS

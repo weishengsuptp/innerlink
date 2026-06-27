@@ -1022,12 +1022,17 @@ function wireEvents() {
     const peerId = state.selectedId;
 
     // 1. Native OS picker → path.
-    const [path, pickErr] = await PickFile();
+    //    Wails v2 only exposes the FIRST return value of a
+    //    bound Go method, so PickFile / SendFilePath both
+    //    return structs (PickFileResult / SendFilePathResult)
+    //    instead of tuples — see app/app.go for the why.
+    const pickRes = await PickFile();
+    const path = pickRes.path;
     if (!path) {
       // 'cancelled' = user dismissed the dialog, silent.
       // Anything else is a real error.
-      if (pickErr && pickErr !== 'cancelled') {
-        toast('选文件失败: ' + pickErr);
+      if (pickRes.err && pickRes.err !== 'cancelled') {
+        toast('选文件失败: ' + pickRes.err);
       }
       return;
     }
@@ -1035,9 +1040,10 @@ function wireEvents() {
     // 2. core opens the file + starts the transfer.
     //    Returns a fileID we use as the bubble key AND
     //    to match file:event progress.
-    const [fileID, sendErr] = await SendFilePath(peerId, path);
+    const sendRes = await SendFilePath(peerId, path);
+    const fileID = sendRes.fileID;
     if (!fileID) {
-      toast('发文件失败: ' + (sendErr || 'unknown'));
+      toast('发文件失败: ' + (sendRes.err || 'unknown'));
       return;
     }
 
