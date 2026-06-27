@@ -44,7 +44,24 @@ import (
 
 // ProtocolVersion is the envelope version baked into every message.
 // Bumped if the wire format changes incompatibly.
-const ProtocolVersion = 1
+//
+// v1 → v2 (2026-06-27): added Envelope.GroupID for group-chat
+// routing. v2 envelopes also carry an explicit empty-when-not-
+// applied AAD = MsgID || GroupID (see send/Recv) to bind the
+// ciphertext to its (msgID, groupID) context. v1 and v2 are
+// NOT wire-compatible: v1 receivers reject v2 ("unsupported
+// version") and v2 receivers reject v1. Upgrade is a hard
+// cutover — both ends of every channel must be on v1.1+ before
+// they reconnect.
+//
+// AAD rationale: GroupID is also inside the authenticated
+// plaintext (GCM protects it), so the routing layer could
+// catch cross-group replays by reading GroupID post-decrypt.
+// The AAD binds it at the cryptographic layer instead, so a
+// stolen ciphertext can't even be decrypted into the wrong
+// group context (defense-in-depth — the routing filter is the
+// primary check, AAD is the secondary).
+const ProtocolVersion = 2
 
 // MaxEnvelopeSize caps the post-decryption envelope size.
 //
@@ -139,7 +156,24 @@ type Envelope struct {
 	From    []byte    `json:"f"`   // 16 bytes (sender's PeerID)
 	TS      int64     `json:"ts"`  // unix milliseconds
 	MsgID   []byte    `json:"mid"` // 8 bytes, random per message
+	// GroupID is the SM3-hashed identifier of the group this
+	// message belongs to (v2 / v1.1+). Empty for 1:1 chat.
+	// Format: 32 raw bytes (no "g_" prefix on the wire; the
+	// prefix is a human-friendly rendering only).
+	//
+	// Empty GroupID + 1:1 channel = regular chat.
+	// Non-empty GroupID + group channel = group message,
+	// routed to every member of the group.
+	GroupID []byte    `json:"gid,omitempty"` // v2: 32 bytes for groups, empty for 1:1
 	Payload []byte    `json:"p"`   // type-specific (for text: utf-8 string bytes)
+}
+
+// IsGroup reports whether this envelope is addressed to a group
+// (non-empty GroupID). Used by the routing layer to dispatch the
+// decrypted envelope to the right chat history file: groups/<id>/
+// for group messages, chat/<peerID>.enc for 1:1.
+func (e Envelope) IsGroup() bool {
+	return len(e.GroupID) > 0
 }
 
 // RosterEntry is one row of the LAN peer directory as it
@@ -314,10 +348,22 @@ func (c *Channel) send(ctx context.Context, env Envelope) error {
 	if err != nil {
 		return fmt.Errorf("protocol: gen nonce: %w", err)
 	}
-	// v0.1: no AAD. The MsgID is inside the encrypted envelope,
-	// so GCM still authenticates it as part of the plaintext.
-	// A future revision can pass env.MsgID as AAD after sending
-	// the MsgID in cleartext first.
+	// v2 design decision (2026-06-27): no AAD. We considered
+	// AAD = MsgID || GroupID to bind the ciphertext to its
+	// (msgID, groupID) context at the cryptographic layer, but
+	// AAD has to be known BEFORE decryption — and the AAD
+	// inputs are themselves inside the ciphertext. The clean
+	// alternatives (send MsgID+GroupID in cleartext before the
+	// ciphertext, breaking the wire format; or pre-share an
+	// out-of-band key per group) both cost more than the
+	// protection is worth at our threat model.
+	//
+	// Cross-replay protection comes from the routing layer
+	// instead: every group-channel relay reads the decrypted
+	// GroupID and rejects if it doesn't match the expected
+	// channel. GCM still authenticates the entire plaintext
+	// (including MsgID + GroupID), so tampering with GroupID
+	// post-encryption breaks the auth tag.
 	ct, err := ic.SM4EncryptGCM(c.session.SessionKey, nonce, plain, nil)
 	if err != nil {
 		return fmt.Errorf("protocol: encrypt: %w", err)

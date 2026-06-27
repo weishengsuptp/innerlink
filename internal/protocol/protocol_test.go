@@ -380,3 +380,95 @@ func TestEnvelopeJSONRoundtrip(t *testing.T) {
 		t.Errorf("roundtrip mismatch: %+v vs %+v", got, env)
 	}
 }
+
+// TestEnvelopeGroupRoundtrip covers v2's GroupID field end-to-end:
+// 1) JSON shape 鈥?empty GroupID omits the field; non-empty keeps it
+// 2) full channel round-trip 鈥?group message survives SM4-GCM
+//    encryption with the same wire format as a 1:1 message
+// 3) IsGroup() helper reflects the field correctly
+//
+// 2026-06-27 (v2 hardening): the GroupID path is the one piece
+// of v2 that doesn't exist in v1, so we want explicit coverage
+// rather than relying on the catch-all TestChannelRoundtrip.
+func TestEnvelopeGroupRoundtrip(t *testing.T) {
+	t.Run("JSON omits empty GroupID", func(t *testing.T) {
+		env := Envelope{Version: ProtocolVersion, Type: TypeText}
+		b, err := jsonMarshal(env)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if bytes.Contains(b, []byte(`"gid"`)) {
+			t.Errorf("empty GroupID should omit gid field; got %s", b)
+		}
+	})
+	t.Run("JSON preserves non-empty GroupID", func(t *testing.T) {
+		gid := bytes.Repeat([]byte{0xCD}, 32) // SM3 output length
+		env := Envelope{Version: ProtocolVersion, Type: TypeText, GroupID: gid}
+		b, err := jsonMarshal(env)
+		if err != nil {
+			t.Fatal(err)
+		}
+		var got Envelope
+		if err := jsonUnmarshal(b, &got); err != nil {
+			t.Fatal(err)
+		}
+		if !bytes.Equal(got.GroupID, gid) {
+			t.Errorf("GroupID roundtrip: got %x, want %x", got.GroupID, gid)
+		}
+		if !got.IsGroup() {
+			t.Error("IsGroup() = false for non-empty GroupID")
+		}
+	})
+	t.Run("IsGroup empty", func(t *testing.T) {
+		env := Envelope{Version: ProtocolVersion, Type: TypeText}
+		if env.IsGroup() {
+			t.Error("IsGroup() = true for empty GroupID")
+		}
+	})
+	t.Run("Channel roundtrip preserves GroupID", func(t *testing.T) {
+		// Two channels over a real TCP loopback (loopbackPair +
+		// runHandshakePair), but the envelope carries a group
+		// ID. Verifies the wire format (nonce||ct) handles
+		// the new field transparently — the encryption layer
+		// doesn't need to know about GroupID because the
+		// field is inside the authenticated plaintext.
+		cA, cB := loopbackPair(t)
+		defer cA.Close()
+		defer cB.Close()
+		sA, sB := runHandshakePair(t, cA, cB)
+		chA, err := NewChannel(cA, sA)
+		if err != nil {
+			t.Fatal(err)
+		}
+		chB, err := NewChannel(cB, sB)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer chA.Close()
+		defer chB.Close()
+		gid := bytes.Repeat([]byte{0xEF}, 32)
+		want := "group message body"
+		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+		defer cancel()
+		if err := chA.Send(ctx, Envelope{
+			Type:    TypeText,
+			GroupID: gid,
+			Payload: []byte(want),
+		}); err != nil {
+			t.Fatal(err)
+		}
+		got, err := chB.Recv(ctx)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !bytes.Equal(got.GroupID, gid) {
+			t.Errorf("GroupID over wire: got %x, want %x", got.GroupID, gid)
+		}
+		if !got.IsGroup() {
+			t.Error("IsGroup() = false after wire roundtrip")
+		}
+		if string(got.Payload) != want {
+			t.Errorf("payload = %q, want %q", got.Payload, want)
+		}
+	})
+}
