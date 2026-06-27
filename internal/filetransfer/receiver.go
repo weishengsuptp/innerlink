@@ -11,8 +11,10 @@ import (
 	"log"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"sync"
+	"syscall"
 	"time"
 
 	"github.com/weishengsuptp/innerlink/internal/protocol"
@@ -324,7 +326,16 @@ func (r *Receiver) handleOffer(ctx context.Context, env protocol.Envelope) {
 		hashWhole: *newHashAccumulator(),
 	}
 	pf.path = filepath.Join(r.saveDir, ".incoming", offer.FileID+".part")
-	f, err := os.Create(pf.path)
+	// os.Create can hit a transient Windows sharing
+	// violation when Defender or the Search indexer
+	// grabs the just-appeared .part file for a real-
+	// time scan. openForWrite retries with exponential
+	// backoff (50 ms → 6.4 s, 8 attempts, ~12.5 s
+	// total) which is plenty for AV scans. Without
+	// this, every transfer whose first chunk lands in
+	// that scan window aborts with a confusing
+	// "process cannot access the file" error.
+	f, err := openForWrite(pf.path, os.O_RDWR|os.O_CREATE|os.O_TRUNC, 0o644)
 	if err != nil {
 		_ = sendJSON(ctx, r.ch, protocol.TypeFileAbort,
 			FileAbort{FileID: offer.FileID, Reason: err.Error()})
@@ -366,7 +377,7 @@ func (r *Receiver) handleChunk(ctx context.Context, env protocol.Envelope) {
 		return
 	}
 	// Write at offset.
-	f, err := os.OpenFile(pf.path, os.O_WRONLY, 0o644)
+	f, err := openForWrite(pf.path, os.O_WRONLY, 0o644)
 	if err != nil {
 		_ = r.sendDone(ctx, pf, false, err.Error())
 		return
@@ -491,4 +502,74 @@ func uniquePath(dir, name string) string {
 	// in any real P2P session; fall back to a nanosecond
 	// stamp so we never silently overwrite.
 	return filepath.Join(dir, fmt.Sprintf("%s-%d%s", stem, time.Now().UnixNano(), ext))
+}
+
+// openForWrite wraps os.OpenFile with a short retry loop
+// for transient Windows sharing violations (ERROR_SHARING_
+// VIOLATION, errno 32). Real-time AV (Windows Defender)
+// and the Search indexer grab newly-created files in
+// <data-dir>/received/.incoming/ with an exclusive handle
+// for a brief real-time scan, and the very next chunk from
+// the sender would otherwise land during that window and
+// fail with "The process cannot access the file because it
+// is being used by another process". A few retries with
+// exponential backoff absorb the scan; the user sees a
+// normal transfer instead of a confusing failure.
+//
+// On non-Windows the helper is a passthrough — there's no
+// equivalent transient lock and most open errors are real.
+//
+// Backoff: 50 ms, 100, 200, 400, 800, 1600, 3200, 6400 —
+// 8 attempts, ~12.5 s ceiling. AV scans rarely hold longer
+// than a couple seconds; 12.5 s is "obvious hang" territory
+// and we'd rather surface the error.
+func openForWrite(path string, flag int, perm os.FileMode) (*os.File, error) {
+	const maxAttempts = 8
+	const baseDelay = 50 * time.Millisecond
+	var lastErr error
+	for attempt := 0; attempt < maxAttempts; attempt++ {
+		f, err := os.OpenFile(path, flag, perm)
+		if err == nil {
+			return f, nil
+		}
+		lastErr = err
+		if !isTransientOpenErr(err) {
+			return nil, err
+		}
+		time.Sleep(baseDelay << attempt)
+	}
+	return nil, lastErr
+}
+
+// isTransientOpenErr returns true for errors that might
+// resolve on a brief retry: Windows sharing violations
+// (AV / indexer scan) and a couple of common POSIX
+// "resource busy" conditions.
+func isTransientOpenErr(err error) bool {
+	if err == nil {
+		return false
+	}
+	// Windows: ERROR_SHARING_VIOLATION = 32.
+	if runtime.GOOS == "windows" {
+		var errno syscall.Errno
+		if errors.As(err, &errno) && errno == 32 {
+			return true
+		}
+	}
+	// POSIX: ETXTBSY (text file busy) and EBUSY.
+	var errno syscall.Errno
+	if errors.As(err, &errno) {
+		// ETXTBSY on Linux = 26, EBUSY = 16. Match by text
+		// since these are uncommon and we want portability.
+		switch errno {
+		case syscall.ETXTBSY, syscall.EBUSY:
+			return true
+		}
+	}
+	// Heuristic fallback for wrapped errors that don't
+	// unwrap to Errno (e.g. fs.FS / afero errors).
+	s := err.Error()
+	return strings.Contains(s, "being used by another process") ||
+		strings.Contains(s, "resource busy") ||
+		strings.Contains(s, "text file busy")
 }

@@ -852,6 +852,16 @@ function updateFileBubble(fileID: string, sent: number, total: number, bps: numb
 // that complete in <100 ms — those skip the progress
 // stream entirely; without this fallback the bubble
 // would show "已发送 · 0 B" because fb.size was still 0).
+//
+// Failure bubbles only show a SHORT reason in the card
+// (the receiver's reply is often a 200+ char Go-formatted
+// error like "filetransfer: receiver reported failure: open
+// C:\Users\foo\...: The process cannot access the file…").
+// Pasting that into the bubble blows up the card and
+// leaks the receiver's filesystem path to the sender's UI
+// (it's the sender's own peer here, but still noisy).
+// The full errMsg stays available via the bubble's title
+// tooltip + the file:event 'done' handler's toast below.
 function markFileBubbleDone(fileID: string, ok: boolean, errMsg: string, total: number) {
   const fb = state.fileBubbles.get(fileID);
   if (!fb) return;
@@ -870,9 +880,20 @@ function markFileBubbleDone(fileID: string, ok: boolean, errMsg: string, total: 
       status.textContent = `已发送 · ${humanSize(fb.size)}`;
       status.classList.add('file-status-done');
     } else {
-      status.textContent = `失败: ${errMsg || '未知错误'}`;
+      // Short, friendly summary. The full reason is in
+      // the bubble title (tooltip) and the toast — never
+      // both on the same screen real estate at once.
+      status.textContent = '发送失败';
       status.classList.add('file-status-failed');
+      status.setAttribute('title', errMsg || '未知错误');
     }
+  }
+  // Stash the full errMsg on the bubble root so a future
+  // "view details" affordance could surface it without
+  // touching fb state.
+  if (!ok) {
+    const bubble = root.querySelector('.bubble.file-bubble') as HTMLElement | null;
+    if (bubble) bubble.setAttribute('data-file-error', errMsg || '');
   }
 }
 
@@ -1217,7 +1238,16 @@ function wireEvents() {
       // know the file size if the open failed) — that's
       // fine, the failure path doesn't read it.
       markFileBubbleDone(ev.fileID, !!ev.ok, ev.err || '', ev.total ?? 0);
-      if (!ev.ok) toast(`发文件失败: ${ev.err || '未知错误'}`);
+      if (!ev.ok) {
+        // The bubble shows a short "发送失败" status; the
+        // toast carries the full reason so the user can
+        // see what went wrong without it eating bubble
+        // real estate. Truncate to one line to keep the
+        // toast readable (toast lives 2.4s).
+        const fullErr = ev.err || '未知错误';
+        const oneLine = fullErr.replace(/\s+/g, ' ').slice(0, 120);
+        toast(`发文件失败: ${oneLine}${fullErr.length > 120 ? '…' : ''}`);
+      }
     }
   });
 }
