@@ -341,6 +341,7 @@ func cmdHelp() {
 	log.Println("[HELP ] send <peer-id-or-alias> <text> -- send a chat message")
 	log.Println("[HELP ] sendfile <peer-id-or-alias> <path> -- send a file")
 	log.Println("[HELP ] history [peer-id-or-alias]     -- show recent chat (filter by one peer)")
+	log.Println("[HELP ] history clear <peer-id-or-alias> -- delete every chat record with one peer (v1.1; real delete)")
 	log.Println("[HELP ] ping <peer-id-or-alias>         -- send a liveness probe")
 	log.Println("[HELP ] alias                            -- show all aliases")
 	log.Println("[HELP ] alias <name> <peer-id-hex>      -- name a peer")
@@ -357,6 +358,25 @@ func cmdHelp() {
 }
 
 func cmdHistory(nd *node.Node, args []string) {
+	// Sub-commands:
+	//   history                 -- show last 50 messages (all peers)
+	//   history <peer-ref>      -- show last 50 with one peer
+	//   history clear <peer-ref> -- DELETE every on-disk record for
+	//                                that peer (v1.1; v0.x was a no-op
+	//                                disguised as "clear")
+	if len(args) >= 2 && args[0] == "clear" {
+		peerRef := args[1]
+		if peerRef == "" {
+			log.Println("[ERROR] history clear: peer ref is empty")
+			return
+		}
+		if err := nd.DeleteHistory(peerRef); err != nil {
+			log.Printf("[ERROR] history clear %s: %v", peerRef, err)
+			return
+		}
+		log.Printf("[INFO ] deleted all chat history with %s", peerRef)
+		return
+	}
 	peerRef := ""
 	if len(args) >= 1 {
 		peerRef = args[0]

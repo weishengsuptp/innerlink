@@ -886,6 +886,55 @@ func (a *App) History(peerRef string) []node.Message {
 	return a.nd.History(peerRef)
 }
 
+// ClearHistory deletes every on-disk chat record for the
+// peer identified by peerRef (alias or 32-char hex).
+// Returns "" on success, error message on failure.
+//
+// v1.1 (2026-06-27) makes this a REAL delete — previously
+// the GUI "clear chat" button only cleared the in-memory
+// display, leaving the per-peer encrypted file untouched.
+// The frontend should refresh History() after this returns
+// to update the chat panel.
+//
+// Refuses empty / invalid refs (the storage layer also
+// rejects, but we surface a clearer error here).
+func (a *App) ClearHistory(peerRef string) string {
+	if a.nd == nil {
+		return "node not started"
+	}
+	if peerRef == "" {
+		return "peer ref is empty"
+	}
+	if err := a.nd.DeleteHistory(peerRef); err != nil {
+		return err.Error()
+	}
+	return ""
+}
+
+// CancelFile aborts an in-flight outbound file transfer.
+// fileID matches the data-file-id on the sender's
+// progress bubble. Returns "" on success, error message
+// otherwise. Idempotent: cancelling a fileID that's
+// already done is a no-op (returns "") — the GUI's ✕
+// button can fire late without a spurious toast.
+//
+// v1.1 (2026-06-27): paired with App.SendFilePath + the
+// progress bubble's ✕ button. Closes the 500 MiB
+// stuck-transfer footgun (the actual user report that
+// drove this fix).
+func (a *App) CancelFile(fileID string) string {
+	if a.nd == nil {
+		return "node not started"
+	}
+	if fileID == "" {
+		return "file id is empty"
+	}
+	if err := a.nd.CancelFile(fileID); err != nil {
+		return err.Error()
+	}
+	return ""
+}
+
 // Scan triggers a one-shot subnet scan. cidr is e.g.
 // "192.168.40.0/24". Returns "" on success.
 func (a *App) Scan(cidr string) string {

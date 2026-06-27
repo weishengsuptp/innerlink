@@ -43,6 +43,7 @@ import './style.css';
 import './app.css';
 
 import {
+  CancelFile,
   DebugReveal,
   DialAddr,
   History,
@@ -93,6 +94,11 @@ interface UIState {
   // through the regular chat-message path (no
   // fileBubbles entry, no live progress). 2026-06-25+.
   fileBubbles: Map<string, FileBubbleState>;
+  // historyDrawerOpen: is the right-side history drawer
+  // currently visible? When true, message:event / peer:event
+  // re-trigger renderHistoryList so the user sees new
+  // messages arrive live. v1.1 (2026-06-27).
+  historyDrawerOpen: boolean;
 }
 
 interface FileBubbleState {
@@ -115,6 +121,7 @@ const state: UIState = {
   nearBottom: true,
   unreadCount: new Map(),
   fileBubbles: new Map(),
+  historyDrawerOpen: false,
 };
 
 // ----- small helpers -----
@@ -286,9 +293,12 @@ function mount() {
             <button class="icon-btn" id="btn-dial" title="发文件" disabled>
               <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="m21.44 11.05-9.19 9.19a6 6 0 0 1-8.49-8.49l9.19-9.19a4 4 0 0 1 5.66 5.66l-9.2 9.19a2 2 0 0 1-2.83-2.83l8.49-8.48"/></svg>
             </button>
-            <button class="icon-btn" id="btn-more" title="更多" disabled>
-              <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="5" r="1"/><circle cx="12" cy="12" r="1"/><circle cx="12" cy="19" r="1"/></svg>
-            </button>
+            <!-- "more" (⋮) button removed v1.1 — its only
+                 action was "clear chat history", which
+                 the user downprioritized. The history
+                 affordance now lives in the composer
+                 toolbar (the 📜 button) and opens a
+                 right-side drawer with search. -->
           </div>
         </div>
         <div class="messages" id="messages">
@@ -305,6 +315,13 @@ function mount() {
             <button type="button" class="icon-btn" id="btn-attach" title="发文件" disabled>
               <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="m21.44 11.05-9.19 9.19a6 6 0 0 1-8.49-8.49l9.19-9.19a4 4 0 0 1 5.66 5.66l-9.2 9.19a2 2 0 0 1-2.83-2.83l8.49-8.48"/></svg>
             </button>
+            <!-- History button (rightmost in composer
+                 toolbar). Toggles the right-side drawer
+                 that shows every chat message across all
+                 peers + search. v1.1 (2026-06-27). -->
+            <button type="button" class="icon-btn" id="btn-history" title="历史消息">
+              <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M3 12a9 9 0 1 0 9-9 9.75 9.75 0 0 0-6.74 2.74L3 8"/><path d="M3 3v5h5"/><path d="M12 7v5l4 2"/></svg>
+            </button>
           </div>
           <div class="composer-input">
             <textarea id="composer-input" placeholder="先选一个 peer…" disabled></textarea>
@@ -320,6 +337,25 @@ function mount() {
                 JS/Go boundary on the picker. -->
         </form>
       </section>
+      <!-- History drawer (right-side overlay). Hidden
+           by default; .open class toggles visibility.
+           We render the drawer OUTSIDE the chat section
+           so its absolute positioning doesn't conflict
+           with the chat layout's flex sizing. -->
+      <aside class="drawer" id="history-drawer" aria-hidden="true">
+        <div class="drawer-header">
+          <div class="drawer-title">历史消息</div>
+          <button class="icon-btn" id="btn-history-close" title="关闭">
+            <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M18 6L6 18"/><path d="M6 6l12 12"/></svg>
+          </button>
+        </div>
+        <div class="drawer-search">
+          <input type="search" id="history-search" placeholder="搜索关键字（peer 名 / 内容）" />
+        </div>
+        <div class="drawer-body" id="history-body">
+          <!-- list of messages injected by JS -->
+        </div>
+      </aside>
     </div>
     <div class="toast" id="toast"></div>
   `;
@@ -429,7 +465,8 @@ function renderChatHeader() {
   const sub = document.getElementById('chat-id')!;
   const pingBtn = document.getElementById('btn-ping') as HTMLButtonElement;
   const dialBtn = document.getElementById('btn-dial') as HTMLButtonElement;
-  const moreBtn = document.getElementById('btn-more') as HTMLButtonElement;
+  // v1.1: btn-more removed — history lives in composer
+  // toolbar now (📜 button + drawer).
   const attachBtn = document.getElementById('btn-attach') as HTMLButtonElement;
   const input = document.getElementById('composer-input') as HTMLTextAreaElement;
   const send = document.getElementById('composer-send') as HTMLButtonElement;
@@ -440,7 +477,6 @@ function renderChatHeader() {
     sub.textContent = '—';
     pingBtn.disabled = true;
     dialBtn.disabled = true;
-    moreBtn.disabled = true;
     attachBtn.disabled = true;
     input.disabled = true;
     send.disabled = true;
@@ -463,7 +499,6 @@ function renderChatHeader() {
   sub.textContent = subParts.join(' · ') || '—';
   pingBtn.disabled = !p.Online;
   dialBtn.disabled = !p.Online;
-  moreBtn.disabled = false;
   attachBtn.disabled = false;
   input.disabled = false;
   send.disabled = false;
@@ -549,8 +584,17 @@ function renderFileBubble(fb: FileBubbleState): string {
     statusHtml = `<span class="file-status file-status-done">已发送 · ${sizeStr}</span>`;
     barClass = 'file-bar-done';
   } else if (fb.sent > 0) {
+    // Live progress: percent + speed + ETA. ETA is
+    // computed from (size - sent) / bps; we hide it
+    // when bps is still 0 (first tick, no rate yet) or
+    // when the remaining time would be misleadingly
+    // large (> 99 hours — likely a stall).
     const bpsStr = fb.bps > 0 ? humanSize(fb.bps) + '/s' : '';
-    statusHtml = `<span class="file-status">发送中 · ${pct}%${bpsStr ? ' · ' + bpsStr : ''}</span>`;
+    const etaStr = formatEta(fb.size - fb.sent, fb.bps);
+    const parts = [`发送中 · ${pct}%`];
+    if (bpsStr) parts.push(bpsStr);
+    if (etaStr) parts.push(etaStr);
+    statusHtml = `<span class="file-status">${parts.join(' · ')}</span>`;
     barClass = '';
   } else {
     statusHtml = `<span class="file-status file-status-pending">排队中…</span>`;
@@ -562,6 +606,15 @@ function renderFileBubble(fb: FileBubbleState): string {
   // routes have a real path in v4. Right-click uses
   // it to reveal in Explorer.
   const dataPath = fb.localPath || '';
+  // Cancel button: only render for in-flight bubbles
+  // (status not done / failed). v1.1 (2026-06-27): closes
+  // the 500 MiB stuck-transfer footgun via App.CancelFile.
+  const showCancel = !fb.err && fb.sent < fb.size;
+  const cancelBtn = showCancel
+    ? `<button class="file-cancel" data-cancel-file-id="${escapeHtml(fb.fileID)}" title="取消发送">
+         <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4"><path d="M18 6L6 18"/><path d="M6 6l12 12"/></svg>
+       </button>`
+    : '';
   return `
     <div class="msg self" data-file-id="${escapeHtml(fb.fileID)}">
       <div class="av">我</div>
@@ -578,6 +631,7 @@ function renderFileBubble(fb: FileBubbleState): string {
               </div>
               <div class="file-meta">${statusHtml}</div>
             </div>
+            ${cancelBtn}
           </div>
         </div>
         <div class="ts">…</div>
@@ -596,6 +650,40 @@ function humanSize(n: number): string {
   if (n < 1024 * 1024) return `${(n / 1024).toFixed(n < 10240 ? 1 : 0)} KiB`;
   if (n < 1024 * 1024 * 1024) return `${(n / 1024 / 1024).toFixed(n < 10 * 1024 * 1024 ? 1 : 0)} MiB`;
   return `${(n / 1024 / 1024 / 1024).toFixed(2)} GiB`;
+}
+
+// formatEta returns a Chinese "还需 X" string for the
+// remaining bytes at the given rate. Returns "" (hidden)
+// when the rate is too low to estimate (< 1 KiB/s —
+// first tick after transfer start) or when the
+// projected time is suspiciously long (> 99 hours,
+// likely a stall — UI shouldn't show "还需 47 天").
+//
+// Output examples:
+//   remaining=500_000_000  bps=12_000_000 → "还需 42 秒"
+//   remaining=1_500_000_000 bps=11_000_000 → "还需 2 分 16 秒"
+//   remaining=5_000_000_000_000 bps=10_000_000 → "还需 5 天 19 小时"
+//   remaining=anything bps=0 → "" (hidden)
+function formatEta(remaining: number, bps: number): string {
+  if (remaining <= 0) return '即将完成';
+  if (bps <= 0) return '';
+  const seconds = remaining / bps;
+  if (seconds < 1) return '还需 < 1 秒';
+  if (seconds >= 99 * 3600) return ''; // > 99h = stall, hide
+  if (seconds < 60) return `还需 ${Math.ceil(seconds)} 秒`;
+  if (seconds < 3600) {
+    const m = Math.floor(seconds / 60);
+    const s = Math.ceil(seconds - m * 60);
+    return s === 0 ? `还需 ${m} 分` : `还需 ${m} 分 ${s} 秒`;
+  }
+  if (seconds < 86400) {
+    const h = Math.floor(seconds / 3600);
+    const m = Math.ceil((seconds - h * 3600) / 60);
+    return m === 0 ? `还需 ${h} 小时` : `还需 ${h} 小时 ${m} 分`;
+  }
+  const d = Math.floor(seconds / 86400);
+  const h = Math.ceil((seconds - d * 86400) / 3600);
+  return h === 0 ? `还需 ${d} 天` : `还需 ${d} 天 ${h} 小时`;
 }
 
 // findFileBubbleEl looks up the DOM node for a file
@@ -734,22 +822,192 @@ async function promptDial() {
   }
 }
 
-function promptMore() {
-  // The "more" icon-btn opens a small action sheet.
-  // v0.1 mockup only has one entry here: clear chat
-  // history for the current peer. Rename moved out —
-  // aliases are now broadcast self-attributes, not
-  // per-peer local nicknames, so the rename flow
-  // doesn't make sense in the chat header anymore.
-  if (!state.selectedId) return;
-  const choice = window.prompt(
-    '操作: 1=清空聊天记录',
-    '1',
+// v1.1 (2026-06-27): promptMore is REMOVED. The "more"
+// (⋮) button used to host "clear chat history" — the
+// user downprioritized that action ("清空的功能感觉
+// 还是没啥用回头再说吧") so the whole affordance is
+// gone. The composer-toolbar 📜 button + right-side
+// drawer (added below) replaces this with a history
+// browser + search. Clear-chat itself stays available
+// at the API layer (Node.DeleteHistory + app.ClearHistory)
+// for future use, but no UI surface exposes it.
+
+// ----- history drawer (v1.1, 2026-06-27) -----
+//
+// Right-side overlay drawer toggled by the composer
+// toolbar's 📜 button. Aggregates every chat message
+// across every peer (newest first), with a search box
+// that filters by peer display name + message body.
+//
+// Data flow:
+//   - state.history is populated lazily: only the
+//     currently selected peer's history is loaded by
+//     selectPeer(). Opening the drawer calls History()
+//     for every peer we know about so the list is
+//     complete (otherwise peers you've never clicked
+//     would show zero messages).
+//   - renderHistoryList is called on every peer:event
+//     and message:event WHILE THE DRAWER IS OPEN so new
+//     messages appear live (no need to close + reopen).
+//   - Click a row → switch the chat panel to that peer
+//     + close the drawer (the row's body contains the
+//     peer's PeerID; we call selectPeer with that).
+async function toggleHistoryDrawer() {
+  const drawer = document.getElementById('history-drawer');
+  if (!drawer) return;
+  const wasOpen = state.historyDrawerOpen;
+  state.historyDrawerOpen = !wasOpen;
+  drawer.classList.toggle('open', state.historyDrawerOpen);
+  drawer.setAttribute('aria-hidden', state.historyDrawerOpen ? 'false' : 'true');
+  if (state.historyDrawerOpen) {
+    await refreshHistoryList();
+  }
+}
+
+async function refreshHistoryList() {
+  // Make sure state.history has every known peer's
+  // messages. selectPeer() only loads the selected
+  // peer's history; the rest stay empty until they're
+  // clicked. Without this lazy fetch, the drawer would
+  // show only one peer's messages on first open.
+  const ids = new Set<string>();
+  for (const p of state.peers) ids.add(p.PeerID);
+  if (state.selectedId) ids.add(state.selectedId);
+  if (state.selfId) ids.add(state.selfId);
+  for (const pid of ids) {
+    if (!state.history.has(pid)) {
+      try {
+        const h = (await History(pid)) as node.Message[];
+        state.history.set(pid, h || []);
+      } catch {
+        state.history.set(pid, []);
+      }
+    }
+  }
+  renderHistoryList();
+}
+
+function renderHistoryList() {
+  const body = document.getElementById('history-body');
+  const searchEl = document.getElementById('history-search') as HTMLInputElement | null;
+  if (!body) return;
+  const q = (searchEl?.value || '').trim().toLowerCase();
+  // Aggregate every message across every peer in state.
+  // Sort newest first (timestamps are RFC3339 strings;
+  // Date(...) is monotonic enough for a chat list).
+  type Row = { peer: string; peerName: string; msg: node.Message };
+  const rows: Row[] = [];
+  for (const [pid, msgs] of state.history) {
+    if (!msgs) continue;
+    const peerInfo = state.peers.find(p => p.PeerID === pid);
+    const peerName = pid === state.selfId
+      ? '我'
+      : peerInfo ? peerDisplay(peerInfo) : shortId(pid);
+    for (const m of msgs) {
+      if (q) {
+        const bodyHit = (m.Body || '').toLowerCase().includes(q);
+        const peerHit = peerName.toLowerCase().includes(q);
+        if (!bodyHit && !peerHit) continue;
+      }
+      rows.push({ peer: pid, peerName, msg: m });
+    }
+  }
+  rows.sort((a, b) => {
+    const ta = a.msg.Timestamp ? new Date(a.msg.Timestamp).getTime() : 0;
+    const tb = b.msg.Timestamp ? new Date(b.msg.Timestamp).getTime() : 0;
+    return tb - ta;
+  });
+  if (rows.length === 0) {
+    body.innerHTML = `<div class="history-empty">${q ? '没有匹配的聊天记录' : '还没有聊天记录'}</div>`;
+    return;
+  }
+  body.innerHTML = rows.map(r => {
+    const isSelf = r.msg.Direction === 'out';
+    const bodyText = historyBodyText(r.msg.Body);
+    const bodyHtml = highlightQuery(escapeHtml(bodyText), q);
+    return `
+      <div class="history-item" data-peer="${escapeHtml(r.peer)}">
+        <div class="history-item-meta">
+          <span class="history-item-peer ${isSelf ? 'self' : ''}">${escapeHtml(r.peerName)}</span>
+          <span>${fmtTime(r.msg.Timestamp)}</span>
+        </div>
+        <div class="history-item-body">${bodyHtml}</div>
+      </div>
+    `;
+  }).join('');
+  // Click → jump to peer + close drawer.
+  body.querySelectorAll<HTMLElement>('.history-item').forEach(el => {
+    el.addEventListener('click', () => {
+      const pid = el.getAttribute('data-peer') || '';
+      if (!pid) return;
+      if (state.selectedId !== pid) {
+        void selectPeer(pid);
+      }
+      void toggleHistoryDrawer();
+    });
+  });
+}
+
+// historyBodyText flattens a chat body for the history
+// list view. Plain text shows verbatim; "file://" bodies
+// (file message marker from the protocol layer) show as
+// "[文件] <name>" with the size, since the drawer list is
+// about skim-and-jump, not full content rendering.
+function historyBodyText(body: string): string {
+  if (!body) return '';
+  if (body.startsWith('file://')) {
+    const rest = body.slice('file://'.length);
+    const pipe = rest.indexOf('|');
+    const name = pipe >= 0 ? rest.slice(0, pipe) : rest;
+    return `📎 ${name}`;
+  }
+  return body;
+}
+
+// highlightQuery wraps every case-insensitive match of
+// query inside <mark> for visual highlight. Special
+// regex chars in query are escaped so user input is
+// safe.
+function highlightQuery(text: string, q: string): string {
+  if (!q) return text;
+  const safe = q.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+  const re = new RegExp(`(${safe})`, 'gi');
+  return text.replace(re, '<mark>$1</mark>');
+}
+
+// cancelFileInFlight sends App.CancelFile and visually
+// disables the cancel button (so a double-click doesn't
+// spam the bridge). The actual transition to "已取消"
+// state comes from the file:event 'done' event with
+// err="已取消" that core publishes when the sender
+// goroutine unwinds. v1.1 (2026-06-27).
+async function cancelFileInFlight(fileID: string) {
+  // Disable the button right away so the user gets
+  // immediate feedback (cancel can take up to one chunk
+  // worth of bytes + a network round-trip).
+  const btn = document.querySelector<HTMLElement>(
+    `.file-cancel[data-cancel-file-id="${CSS.escape(fileID)}"]`
   );
-  if (choice === '1') {
-    state.history.set(state.selectedId, []);
-    renderMessages();
-    toast('已清空当前聊天记录（仅本机显示）');
+  if (btn) {
+    btn.setAttribute('disabled', 'disabled');
+    btn.classList.add('cancelling');
+  }
+  try {
+    const err = await CancelFile(fileID);
+    if (err) {
+      toast(`取消失败: ${err}`);
+      // Re-enable so the user can try again.
+      if (btn) {
+        btn.removeAttribute('disabled');
+        btn.classList.remove('cancelling');
+      }
+    }
+  } catch (e) {
+    toast(`取消失败: ${e}`);
+    if (btn) {
+      btn.removeAttribute('disabled');
+      btn.classList.remove('cancelling');
+    }
   }
 }
 
@@ -838,7 +1096,11 @@ function updateFileBubble(fileID: string, sent: number, total: number, bps: numb
   const status = root.querySelector('.file-status');
   if (status) {
     const bpsStr = bps > 0 ? humanSize(bps) + '/s' : '';
-    status.textContent = `发送中 · ${pct}%${bpsStr ? ' · ' + bpsStr : ''}`;
+    const etaStr = formatEta(fb.size - sent, bps);
+    const parts = [`发送中 · ${pct}%`];
+    if (bpsStr) parts.push(bpsStr);
+    if (etaStr) parts.push(etaStr);
+    status.textContent = parts.join(' · ');
   }
 }
 
@@ -1011,7 +1273,7 @@ function wireEvents() {
     if (r) toast(`ping: ${r}`);
   });
   document.getElementById('btn-dial')!.addEventListener('click', () => promptDial());
-  document.getElementById('btn-more')!.addEventListener('click', () => promptMore());
+  document.getElementById('btn-history')!.addEventListener('click', () => toggleHistoryDrawer());
 
   // Sidebar self header: click to set your own alias.
   // This is the only path the user has to set their
@@ -1181,6 +1443,19 @@ function wireEvents() {
   document.addEventListener('click', (ev) => {
     const target = ev.target as HTMLElement;
     if (!target) return;
+    // Cancel button (✕) on in-flight file bubbles. v1.1
+    // (2026-06-27). We stop propagation so the click
+    // doesn't also fire the bubble's "show context menu"
+    // path below.
+    const cancelBtn = target.closest<HTMLElement>('.file-cancel');
+    if (cancelBtn) {
+      ev.preventDefault();
+      ev.stopPropagation();
+      const fid = cancelBtn.getAttribute('data-cancel-file-id') || '';
+      if (!fid) return;
+      void cancelFileInFlight(fid);
+      return;
+    }
     const info = findBubble(ev.target);
     if (!info) return;
     showFileContextMenu(ev.clientX, ev.clientY, info.name, info.dataPath);
@@ -1196,14 +1471,36 @@ function wireEvents() {
     if (t.closest('.file-bubble')) return; // bubble click handled above
     hideFileContextMenu();
   });
-  // Esc closes the menu.
+  // Esc closes the menu + the history drawer (whichever
+// is open; both close if both are).
   document.addEventListener('keydown', (ev) => {
-    if (ev.key === 'Escape') hideFileContextMenu();
+    if (ev.key === 'Escape') {
+      hideFileContextMenu();
+      if (state.historyDrawerOpen) {
+        void toggleHistoryDrawer();
+      }
+    }
   });
+
+  // History drawer wiring. The 📜 button toggles the
+  // drawer; the X button always closes; the search input
+  // re-filters the rendered list (no re-fetch).
+  document.getElementById('btn-history-close')!.addEventListener('click', () => {
+    if (state.historyDrawerOpen) void toggleHistoryDrawer();
+  });
+  const searchInput = document.getElementById('history-search') as HTMLInputElement | null;
+  if (searchInput) {
+    searchInput.addEventListener('input', () => {
+      if (state.historyDrawerOpen) renderHistoryList();
+    });
+  }
 
   // Live event streams from Go.
   EventsOn('peer:event', (_ev: any) => {
     refreshAll();
+    // New peer may have history we haven't fetched yet;
+    // refresh the drawer if it's open (cheap).
+    if (state.historyDrawerOpen) void refreshHistoryList();
   });
   EventsOn('message:event', (m: node.Message) => {
     if (!m || !m.PeerID) return;
@@ -1219,6 +1516,9 @@ function wireEvents() {
       state.unreadCount.set(m.PeerID, n);
       renderPeerList();
     }
+    // Live-update the history drawer if it's open so
+    // new messages appear without a manual refresh.
+    if (state.historyDrawerOpen) renderHistoryList();
   });
   // File-transfer events (progress + done) keyed by
   // fileID. Picker-route bubbles listen on these to draw
