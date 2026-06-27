@@ -311,16 +311,26 @@ body {
  * the status text. */
 .file-bar-done .file-bar-fill { background: #16a34a; }
 .file-bar-failed .file-bar-fill { background: #dc2626; }
+/* Cancelled: neutral gray so the eye reads "stopped" not
+ * "broken". 2026-06-27 user feedback: previously the
+ * cancel state was indistinguishable from a real error
+ * (both rendered as "失败: 已取消" in light pink on green). */
+.file-bar-cancelled .file-bar-fill { background: #6b7280; }
 /* Status row below the bar. Same colour as the bar fill
  * when done / failed so the eye links them. */
 .file-status { font-size: 11px; margin-top: 4px; font-family: 'JetBrains Mono', monospace; }
 .file-status-pending { color: var(--muted); }
 .file-status-done { color: #16a34a; }
 .file-status-failed { color: #dc2626; }
+/* Cancelled uses a high-contrast warm yellow with bold
+ * weight on the outgoing bubble — reads as "stopped by
+ * you" without the alarming red of a real failure. */
+.file-status-cancelled { color: #fde047; font-weight: 700; }
 .msg.self .file-status { color: rgba(255, 255, 255, 0.85); }
 .msg.self .file-status-pending { color: rgba(255, 255, 255, 0.55); }
 .msg.self .file-status-done { color: #bbf7d0; }
 .msg.self .file-status-failed { color: #fecaca; }
+.msg.self .file-status-cancelled { color: #fde047; font-weight: 700; }
 
 /* Cancel (✕) button on in-flight file bubbles. v1.1
  * (2026-06-27). Floats in the top-right corner of the

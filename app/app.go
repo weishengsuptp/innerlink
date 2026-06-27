@@ -235,36 +235,48 @@ func (a *App) SendText(peerRef, text string) string {
 // Drag-and-drop + CLI route: the caller already has a
 // path. core opens the file itself and runs the
 // transfer; the frontend never sees the bytes.
-func (a *App) SendFile(peerRef, path string) string {
+func (a *App) SendFile(peerRef, path string) SendFilePathResult {
 	if a.nd == nil {
-		return "node not started"
+		return SendFilePathResult{Err: "node not started"}
+	}
+	if peerRef == "" {
+		return SendFilePathResult{Err: "peer ref is empty"}
+	}
+	if path == "" {
+		return SendFilePathResult{Err: "path is empty"}
 	}
 	f, err := os.Open(path)
 	if err != nil {
-		return fmt.Sprintf("open: %v", err)
+		return SendFilePathResult{Err: fmt.Sprintf("open: %v", err)}
 	}
 	stat, err := f.Stat()
 	if err != nil {
 		_ = f.Close()
-		return fmt.Sprintf("stat: %v", err)
+		return SendFilePathResult{Err: fmt.Sprintf("stat: %v", err)}
 	}
 	if !stat.Mode().IsRegular() {
 		_ = f.Close()
-		return "not a regular file: " + path
+		return SendFilePathResult{Err: "not a regular file: " + path}
 	}
 	name := filepath.Base(path)
-	// skipChatLog=false: drag-and-drop has no live
-	// placeholder bubble, so the chat message IS the
-	// UI artefact for the sent file. localPath=path so
-	// the sender's right-click "open folder" reveals
-	// the user's actual folder.
-	if err := a.nd.SendFile(peerRef, name, stat.Size(), f, path, "", false); err != nil {
+	fileID := newFileID()
+	// skipChatLog=true: drag-and-drop now uses a live
+	// placeholder bubble (same as the picker route,
+	// 2026-06-27). Without this, the user only sees the
+	// file card AFTER the transfer finishes — a confusing
+	// "I dropped something and nothing happened" gap.
+	// The chat.enc record is written unconditionally
+	// by Node.SendFile so the bubble survives app restart
+	// either way (re-rendered from history on relaunch).
+	if err := a.nd.SendFile(peerRef, name, stat.Size(), f, path, fileID, true); err != nil {
 		_ = f.Close()
-		return err.Error()
+		return SendFilePathResult{Err: err.Error()}
 	}
 	// f is owned by Node.SendFile's goroutine now; it'll
 	// close after the transfer completes. Don't double-close.
-	return ""
+	log.Printf("[INFO  app] SendFile (drag-and-drop) peer=%s path=%s size=%d fileID=%s",
+		peerRef, path, stat.Size(), fileID)
+	return SendFilePathResult{FileID: fileID}
 }
 
 // pendingFiles is no longer needed — the picker route
