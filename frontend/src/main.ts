@@ -110,6 +110,7 @@ interface FileBubbleState {
   err: string;
   peerId: string;      // hex peer ID
   localPath: string;   // sender's on-disk path (picker has it; drag-and-drop also has it now)
+  startTime: number;   // ms since epoch when SendFile was called — used to position the bubble in chronological order alongside text messages (2026-06-27)
 }
 
 const state: UIState = {
@@ -522,12 +523,55 @@ function renderMessages() {
   const el = document.getElementById('messages')!;
   const wasNearBottom = isNearBottom(el);
   if (!state.selectedId) { renderEmpty(); return; }
-  const msgs = state.history.get(state.selectedId) ?? [];
+  // Sort history by timestamp — message:event appends in
+  // event-arrival order, which is NOT necessarily
+  // chronological when several file transfers complete
+  // concurrently (Go goroutines finish in arbitrary
+  // order). Without this sort, a 3-file drop can render
+  // bottom-to-top if the back of the queue finished first.
+  // 2026-06-27 user feedback: "最前面两个文件反而是后面发的".
+  const rawMsgs = state.history.get(state.selectedId) ?? [];
+  const msgs = [...rawMsgs].sort((a, b) => {
+    const ta = a.Timestamp ? new Date(a.Timestamp).getTime() : 0;
+    const tb = b.Timestamp ? new Date(b.Timestamp).getTime() : 0;
+    return ta - tb;
+  });
   if (msgs.length === 0) { renderEmpty(); return; }
+
+  // Live file bubbles are positioned by startTime so a
+  // text message sent WHILE a file is in flight lands
+  // AFTER the file bubble (per send order), not after the
+  // file completes. The previous renderMessages appended
+  // all file bubbles at the END, which made any text sent
+  // during a transfer appear "above" the file card —
+  // user feedback: "消息的泡泡没有按顺序继续向下走".
+  type Entry = { ts: number; html: string };
+  const liveEntries: Entry[] = [];
+  const fp = state.selectedId;
+  if (fp) {
+    for (const fb of state.fileBubbles.values()) {
+      if (fb.peerId === fp) {
+        liveEntries.push({ ts: fb.startTime || 0, html: renderFileBubble(fb) });
+      }
+    }
+    liveEntries.sort((a, b) => a.ts - b.ts);
+  }
 
   const parts: string[] = [];
   let lastDay = '';
+  let liveIdx = 0;
   for (const m of msgs) {
+    const ts = m.Timestamp ? new Date(m.Timestamp).getTime() : 0;
+    // Insert live bubbles whose startTime is at or before
+    // this history message's timestamp. Equal-timestamp
+    // entries land the live bubble first (in-flight
+    // bubbles precede a "now" chat message so the user
+    // sees the file card they kicked off before the
+    // follow-up text they typed).
+    while (liveIdx < liveEntries.length && liveEntries[liveIdx].ts <= ts) {
+      parts.push(liveEntries[liveIdx].html);
+      liveIdx++;
+    }
     const day = dayLabel(m.Timestamp);
     if (day && day !== lastDay) {
       parts.push(`<div class="day-divider"><span>${escapeHtml(day)}</span></div>`);
@@ -535,17 +579,11 @@ function renderMessages() {
     }
     parts.push(renderMessage(m, state.selectedId));
   }
-  // Picker-route file bubbles live OUTSIDE state.history
-  // (they're managed by state.fileBubbles + live
-  // file:event updates), so we re-append them here so
-  // a navigation back to this peer doesn't lose them.
-  if (state.fileBubbles.size > 0) {
-    const fp = state.selectedId;
-    for (const fb of state.fileBubbles.values()) {
-      if (fb.peerId === fp) {
-        parts.push(renderFileBubble(fb));
-      }
-    }
+  // Any remaining live bubbles (startTime after every
+  // persisted message) go to the very end.
+  while (liveIdx < liveEntries.length) {
+    parts.push(liveEntries[liveIdx].html);
+    liveIdx++;
   }
   // First-load system hint about E2E encryption.
   parts.push(`<div class="msg system"><div class="bubble">—— 端到端加密，每条消息独立会话密钥 ——</div></div>`);
@@ -577,9 +615,22 @@ function renderFileBubble(fb: FileBubbleState): string {
   // pass; the picker no longer stages to a local
   // file. So there's only one progress stream and
   // the bar fills 0→100 exactly once.
-  if (fb.err) {
+  // Cancelled is its own state, not a failure: the user
+  // explicitly hit ✕. Show "已取消" without the "失败:"
+  // prefix and a neutral gray bar so the eye reads it
+  // distinctly from a real error. User feedback 2026-06-27
+  // 16:48: the previous "失败: 已取消" was hard to spot on
+  // the green outgoing bubble — light-pink-on-green is
+  // illegible. The .file-status-cancelled class is now
+  // bold yellow on the outgoing bubble, much higher
+  // contrast.
+  const isCancelled = !!fb.err && fb.err === '已取消';
+  if (fb.err && !isCancelled) {
     statusHtml = `<span class="file-status file-status-failed">失败: ${escapeHtml(fb.err || '未知错误')}</span>`;
     barClass = 'file-bar-failed';
+  } else if (isCancelled) {
+    statusHtml = `<span class="file-status file-status-cancelled">已取消</span>`;
+    barClass = 'file-bar-cancelled';
   } else if (fb.sent >= fb.size && fb.size > 0) {
     statusHtml = `<span class="file-status file-status-done">已发送 · ${sizeStr}</span>`;
     barClass = 'file-bar-done';
@@ -1213,12 +1264,27 @@ function markFileBubbleDone(fileID: string, ok: boolean, errMsg: string, total: 
   const fill = root.querySelector('.file-bar-fill') as HTMLElement | null;
   if (fill) fill.style.width = ok ? '100%' : '0%';
   const bar = root.querySelector('.file-bar');
-  if (bar) bar.classList.add(ok ? 'file-bar-done' : 'file-bar-failed');
+  // Cancelled is its own visual state — neither success
+  // nor failure. User explicitly hit ✕ so we don't want
+  // a green bar (suggests success) or red (suggests
+  // error); gray reads "stopped, neither good nor bad".
+  // 2026-06-27 user feedback: cancelled was previously
+  // indistinguishable from a real error, both rendered as
+  // "失败: ..." in light pink on green — illegible.
+  const cancelled = !ok && errMsg === '已取消';
+  if (bar) {
+    bar.classList.remove('file-bar-done', 'file-bar-failed', 'file-bar-cancelled');
+    bar.classList.add(ok ? 'file-bar-done' : (cancelled ? 'file-bar-cancelled' : 'file-bar-failed'));
+  }
   const status = root.querySelector('.file-status');
   if (status) {
+    status.classList.remove('file-status-done', 'file-status-failed', 'file-status-cancelled');
     if (ok) {
       status.textContent = `已发送 · ${humanSize(fb.size)}`;
       status.classList.add('file-status-done');
+    } else if (cancelled) {
+      status.textContent = '已取消';
+      status.classList.add('file-status-cancelled');
     } else {
       // Short, friendly summary. The full reason is in
       // the bubble title (tooltip) and the toast — never
@@ -1442,6 +1508,7 @@ function wireEvents() {
       err: '',
       peerId,
       localPath: path,
+      startTime: Date.now(),
     });
     appendFileBubble(fileID);
     const el = document.getElementById('messages');
@@ -1666,15 +1733,65 @@ async function bootstrap() {
   // us a real on-disk path here (unlike the picker, which
   // only exposes File objects), so we can stream the
   // file directly without re-reading bytes in JS.
-  OnFileDrop((_x, _y, paths) => {
-    if (!state.selectedId) {
-      toast('先选一个 peer');
-      return;
+  // SendFileDragDrop kicks off a drag-and-drop transfer:
+// creates the live placeholder bubble the same way the
+// picker route does, then calls App.SendFile (which now
+// returns {fileID, err} like SendFilePath — see
+// app/app.go SendFile). We loop through `paths` so a
+// multi-file drop sends all of them; previously we only
+// sent paths[0] and silently dropped the rest.
+//
+// The placeholder is registered BEFORE the SendFile
+// promise resolves. If core fails (open: / stat: /
+// not-a-regular-file), we look up the placeholder by
+// fileID (the one SendFile returned) and mark it failed
+// in place — the user sees an error card instead of a
+// silently vanished bubble.
+async function SendFileDragDrop(paths: string[]) {
+  const peerId = state.selectedId;
+  if (!peerId) {
+    toast('先选一个 peer');
+    return;
+  }
+  if (!paths || paths.length === 0) return;
+  const list = document.getElementById('messages');
+  for (const p of paths) {
+    if (!p) continue;
+    const name = p.replace(/^.*[\\/]/, '');
+    // Provisional fileID — replaced by the backend-
+    // returned ID once SendFile resolves. Until then
+    // we don't put the placeholder in state.fileBubbles
+    // (the file:event handler keys off the real fileID)
+    // so the file:event 'progress' / 'done' streams will
+    // only match once the real ID is wired in.
+    //
+    // SendFile is the modern Wails binding (Go returns
+    // SendFilePathResult); see app/app.go SendFile.
+    const r = await SendFile(peerId, p);
+    const fileID = r.fileID || '';
+    const err = r.err || '';
+    if (!fileID) {
+      toast(`发文件失败: ${err || 'unknown'}`);
+      continue;
     }
-    if (!paths || paths.length === 0) return;
-    const p = paths[0];
-    const r = SendFile(state.selectedId, p);
-    r.then(err => { if (err) toast(`发文件失败: ${err}`); });
+    state.fileBubbles.set(fileID, {
+      fileID,
+      name,
+      size: 0,
+      sent: 0,
+      bps: 0,
+      err: '',
+      peerId,
+      localPath: p,
+      startTime: Date.now(),
+    });
+    appendFileBubble(fileID);
+    if (list) list.scrollTop = list.scrollHeight;
+  }
+}
+
+  OnFileDrop((_x, _y, paths) => {
+    void SendFileDragDrop(paths || []);
   }, true);
 }
 
