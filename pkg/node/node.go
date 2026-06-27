@@ -80,6 +80,16 @@ type Node struct {
 	// a fast lookup for History().
 	historyMu sync.Mutex
 	history   []*storage.Record
+
+	// cancelFiles: per-fileID cancel funcs for in-flight
+	// outbound file transfers. The GUI's ✕ button calls
+	// CancelFile(fileID) which looks up the cancel and
+	// fires it; the sender goroutine then bails out of
+	// filetransfer.Send (which already does ctx.Err()
+	// checks in its chunk loop + uses ctx for every
+	// ch.Send / waitForReply call). v1.1 (2026-06-27).
+	cancelMu   sync.Mutex
+	cancelFiles map[string]context.CancelFunc
 }
 
 // New constructs a Node. It loads (or creates) the SM2
@@ -131,6 +141,14 @@ func New(opts Options) (*Node, error) {
 	if err != nil {
 		return nil, fmt.Errorf("open chat log: %w", err)
 	}
+	// v1.1 (2026-06-27): per-peer chat files require the
+	// device's own PeerID so Append can route each record
+	// to the right peer file. SetSelfPeerID is idempotent
+	// and must run before any Append — we do it here, before
+	// returning the Node to the caller, so pkg/node and
+	// cmd/innerlink both benefit without each having to
+	// remember.
+	chatStore.SetSelfPeerID(id.PeerIDHex())
 	aliasStore, err := alias.Open(layout.Aliases)
 	if err != nil {
 		_ = chatStore.Close()
@@ -168,7 +186,8 @@ func New(opts Options) (*Node, error) {
 		// Was 32 (1.6s) which caused "排队中…" to stick on
 		// parallel sends because the GUI's 'done' event
 		// was dropped on overflow (2026-06-27).
-		fileEventCh: make(chan FileEvent, 256),
+		fileEventCh:  make(chan FileEvent, 256),
+		cancelFiles:  make(map[string]context.CancelFunc),
 	}
 
 	// Self entry in the roster: always include ourselves

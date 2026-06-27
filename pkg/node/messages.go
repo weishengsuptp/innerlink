@@ -277,17 +277,41 @@ func (n *Node) SendFile(peerRef, name string, size int64, src io.Reader, localPa
 	}
 	log.Printf("[FILE] start send peer=%s name=%s size=%d fileID=%s localPath=%q",
 		peerHexStr, name, size, fileID, localPath)
+	// v1.1 (2026-06-27): cancellable ctx so the GUI's ✕
+	// button (App.CancelFile) can abort a stuck send.
+	// The cancel func is registered in cancelFiles
+	// under fileID and removed when the goroutine exits
+	// (success or failure). filetransfer.Send checks
+	// ctx.Err() at the top of every chunk + uses ctx
+	// for ch.Send / waitForReply, so cancel propagates
+	// all the way down.
+	ctx, cancel := context.WithCancel(context.Background())
+	n.cancelMu.Lock()
+	n.cancelFiles[fileID] = cancel
+	n.cancelMu.Unlock()
+
 	n.wg.Add(1)
 	go func() {
 		defer n.wg.Done()
-		if err := filetransfer.Send(context.Background(), st.ch, src, size, name, progress, st.rcv.WaitForReply); err != nil {
+		defer func() {
+			n.cancelMu.Lock()
+			delete(n.cancelFiles, fileID)
+			n.cancelMu.Unlock()
+		}()
+		if err := filetransfer.Send(ctx, st.ch, src, size, name, progress, st.rcv.WaitForReply); err != nil {
 			log.Printf("[ERROR] sendfile: %v", err)
+			// Normalize the cancel reason so the GUI shows
+			// "已取消" instead of leaking "context canceled".
+			errMsg := err.Error()
+			if errors.Is(err, context.Canceled) {
+				errMsg = "已取消"
+			}
 			// Tell the GUI: bubble turns red, show err.
 			n.publishFileEvent(FileEvent{
 				Type:   FileEventDone,
 				FileID: fileID,
 				OK:     false,
-				Err:    err.Error(),
+				Err:    errMsg,
 			})
 			return
 		}
@@ -490,4 +514,102 @@ func humanSize(n int64) string {
 	default:
 		return fmt.Sprintf("%.2f GiB", float64(n)/GiB)
 	}
+}
+
+// CancelFile aborts an in-flight outbound file transfer
+// identified by fileID. The sender goroutine bails out
+// of filetransfer.Send on the next ctx.Err() check (top
+// of every chunk + every ch.Send / waitForReply call)
+// and publishes a 'done' event with ok=false and
+// err="已取消", which the GUI's markFileBubbleDone
+// renders as a failed bubble with the friendly cancel
+// reason.
+//
+// Idempotent: calling CancelFile on a fileID that has
+// already finished (success, failure, or already
+// cancelled) is a no-op + nil return. The GUI's ✕ button
+// is hit-or-miss on a fast transfer and that's fine.
+func (n *Node) CancelFile(fileID string) error {
+	if n.ctx == nil {
+		return errors.New("node: not started")
+	}
+	if fileID == "" {
+		return errors.New("file id is empty")
+	}
+	n.cancelMu.Lock()
+	cancel, ok := n.cancelFiles[fileID]
+	n.cancelMu.Unlock()
+	if !ok {
+		// Either the fileID was never registered, or
+		// the transfer already finished and the goroutine
+		// removed its own entry. Either way, no cancel to
+		// fire — treat as success so the GUI doesn't
+		// toast a spurious error.
+		return nil
+	}
+	cancel()
+	log.Printf("[FILE] cancel requested fileID=%s", fileID)
+	return nil
+}
+
+// DeleteHistory removes all on-disk chat records for the
+// peer identified by peerRef (alias name or 32-char hex
+// PeerID). Returns nil on success.
+//
+// What gets removed:
+//   1. The per-peer encrypted file <chatDir>/<peerID>.enc
+//      (via storage.DeleteAllForPeer).
+//   2. The matching in-memory history slice entry
+//      (so subsequent History() / SubscribeMessages
+//      re-renders don't show the deleted records).
+//   3. In-flight file:event 'done' callbacks for that
+//      peer are not affected (they update state.fileBubbles
+//      in the frontend, which has its own lifecycle).
+//
+// What is NOT removed:
+//   - The peer's roster entry (still discoverable via UDP
+//     / gossip).
+//   - The alias mapping (still resolves the alias → peer ID).
+//   - chat.enc on the OTHER device (it's their copy of the
+//     chat; deleting on our side doesn't propagate).
+//
+// v1.1 (2026-06-27) replaces the v0.x "clear in-memory
+// only" pseudo-action with a real on-disk delete. The
+// previous UI button was a lie; this API makes it real.
+func (n *Node) DeleteHistory(peerRef string) error {
+	if n.ctx == nil {
+		return errors.New("node: not started")
+	}
+	if peerRef == "" {
+		return errors.New("peer ref is empty")
+	}
+	peerHexStr, err := n.resolvePeerRef(peerRef)
+	if err != nil {
+		return err
+	}
+	if n.chatStore == nil {
+		return errors.New("node: chat store not initialised")
+	}
+	if err := n.chatStore.DeleteAllForPeer(peerHexStr); err != nil {
+		return fmt.Errorf("delete history: %w", err)
+	}
+	// Drop the matching slice from the in-memory cache.
+	// Without this, History() / SubscribeMessages-driven
+	// re-renders would still show the deleted records
+	// (until the next ReadAll refresh, which only
+	// happens at startup). Filter in place to avoid
+	// reallocating the whole slice.
+	n.historyMu.Lock()
+	filtered := n.history[:0:0]
+	for _, rec := range n.history {
+		if rec.From == peerHexStr || rec.To == peerHexStr {
+			continue
+		}
+		filtered = append(filtered, rec)
+	}
+	n.history = filtered
+	n.historyMu.Unlock()
+
+	log.Printf("[INFO ] deleted chat history for peer=%s", peerHexStr)
+	return nil
 }
