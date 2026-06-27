@@ -94,8 +94,12 @@
 
 ### 2.3 Envelope 强制 `version` 字段
 
-- 当前所有 Envelope `v=1`
-- 协议升级时 `v=2`，老 client 收到可识别后拒绝
+- 当前所有 Envelope `v=2`（v1.1+ 群聊引入，2026-06-27）
+- 历史：`v=1` 用到 v1.0.0；v2 加了 `GroupID` 字段（v1.1+ 群聊路由用）
+- 升级路径：v1 → v2 是**硬切换**——v1 receiver 收到 v2 直接拒（"unsupported version"），v2 receiver 收到 v1 也拒。两端必须同时升到 v1.1+ 才能通信
+- 内部网部署规模小（个人 / 小团队），不需要协议版本协商 / capability handshake
+- v2 wire 格式跟 v1 完全一致（`nonce(12B) || ciphertext`），新字段进 JSON envelope 内部，靠 GCM auth tag 完整性保护
+- 群间重放保护在 routing 层做（relay 解密后读 GroupID，不匹配则拒），不在 AAD 层做（避免把 MsgID + GroupID 明文前置破 wire 格式）
 - 比"加个新字段"的兼容性更明确
 
 ### 2.4 零 CGO
