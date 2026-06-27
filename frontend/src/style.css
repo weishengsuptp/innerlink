@@ -251,7 +251,6 @@ body {
 .file-msg {
   display: grid; grid-template-columns: 36px 1fr; gap: 10px;
   align-items: center;
-  position: relative; /* anchor for .file-cancel absolute positioning */
 }
 .file-icon {
   width: 36px; height: 36px; border-radius: 8px;
@@ -259,7 +258,13 @@ body {
   display: grid; place-items: center;
   font-size: 18px;
 }
-.file-name { font-size: 13px; font-weight: 600; }
+/* Right padding leaves room for the absolute-positioned
+ * .file-cancel button (28px wide, top:4 right:4). v1.1
+ * (2026-06-27): without this the cancel button overlays
+ * long file names like the 60-char tar.gz in the
+ * screenshot. */
+.file-info { padding-right: 32px; min-width: 0; }
+.file-name { font-size: 13px; font-weight: 600; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
 .file-meta { font-size: 11px; color: var(--muted); margin-top: 2px; font-family: 'JetBrains Mono', monospace; }
 /* Outgoing file bubble: file-meta is muted gray on a
  * green background, which is illegible. Override to a
@@ -267,8 +272,14 @@ body {
  * self-bubble color is. */
 .msg.self .file-meta { color: rgba(255, 255, 255, 0.78); }
 .msg.self .file-icon { background: rgba(255, 255, 255, 0.18); color: rgba(255, 255, 255, 0.95); }
-/* Cursor + hover affordance: file bubbles are clickable. */
-.bubble.file-bubble { cursor: pointer; user-select: none; }
+/* Cursor + hover affordance: file bubbles are clickable.
+ * .bubble.file-bubble is the positioning anchor for the
+ * absolute-positioned .file-cancel button. v1.1 (2026-06-27):
+ * .file-msg is `display:grid` 2-col — placing the cancel
+ * button as a 3rd child auto-flowed it to a NEW row,
+ * off-screen. Moving the anchor from .file-msg to the
+ * outer .bubble.file-bubble fixes it. */
+.bubble.file-bubble { cursor: pointer; user-select: none; position: relative; }
 .bubble.file-bubble:hover { filter: brightness(0.97); }
 .msg.self .bubble.file-bubble:hover { filter: brightness(1.06); }
 
@@ -315,27 +326,32 @@ body {
  * (2026-06-27). Floats in the top-right corner of the
  * bubble, only visible while the bubble is in flight
  * (the renderer omits it for done / failed bubbles).
- * Updated 2026-06-27 15:50: v1 — was opacity:0.55 default
- * (only visible on hover) and 22px. User reported the
- * button "couldn't be found" — fixed to opacity 1.0 +
- * 24px + bold white ✕ on a stronger dark badge so it
- * reads as an obvious affordance at a glance. */
+ *
+ * Updated 2026-06-27 16:48: v2 — was inside `.file-msg`
+ * (display:grid 2-col), which auto-flowed it to a NEW
+ * row off-screen. Moved to be a sibling of `.file-msg`
+ * inside `.bubble.file-bubble` (the anchor, now
+ * `position:relative`). Bumped to 28px + z-index 10 +
+ * drop-shadow so the affordance reads even at a glance.
+ */
 .file-cancel {
   position: absolute;
-  top: 6px;
-  right: 6px;
-  width: 24px;
-  height: 24px;
+  top: 4px;
+  right: 4px;
+  width: 28px;
+  height: 28px;
   display: inline-flex;
   align-items: center;
   justify-content: center;
-  background: rgba(0, 0, 0, 0.55);
+  background: rgba(0, 0, 0, 0.65);
   color: #ffffff;
-  border: none;
+  border: 1px solid rgba(255, 255, 255, 0.18);
   border-radius: 50%;
   cursor: pointer;
   padding: 0;
   opacity: 1;
+  z-index: 10;
+  box-shadow: 0 2px 6px rgba(0, 0, 0, 0.25);
   transition: background 0.15s, transform 0.1s;
 }
 .file-cancel:hover {
@@ -555,6 +571,54 @@ body {
   color: var(--text);
   padding: 0 2px;
   border-radius: 2px;
+}
+/* File message in history list — same icon+name+meta
+ * pattern as live chat bubbles, but compact for the
+ * drawer row. v1.1 (2026-06-27): preserves the file's
+ * essence (not just text label) so right-click works
+ * the same as in the chat panel. */
+.history-item-file {
+  display: grid;
+  grid-template-columns: 28px 1fr;
+  gap: 8px;
+  align-items: center;
+  padding: 6px 8px;
+  background: var(--primary-soft);
+  border-radius: 8px;
+  margin-top: 4px;
+  cursor: pointer;
+  transition: background 0.12s;
+}
+.history-item-file:hover {
+  background: var(--primary);
+  color: white;
+}
+.history-item-file:hover .file-meta { color: rgba(255, 255, 255, 0.85); }
+.history-item-file .file-icon {
+  width: 28px;
+  height: 28px;
+  border-radius: 6px;
+  background: rgba(255, 255, 255, 0.4);
+  display: grid;
+  place-items: center;
+  color: var(--primary);
+}
+.history-item-file:hover .file-icon {
+  background: rgba(255, 255, 255, 0.25);
+  color: white;
+}
+.history-item-file .file-name {
+  font-size: 12.5px;
+  font-weight: 600;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.history-item-file .file-meta {
+  font-size: 11px;
+  color: var(--muted);
+  font-family: 'JetBrains Mono', monospace;
+  margin-top: 1px;
 }
 .history-empty {
   padding: 32px 16px;
