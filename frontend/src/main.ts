@@ -247,11 +247,22 @@ function isNearBottom(el: HTMLElement): boolean {
   return (el.scrollHeight - el.scrollTop - el.clientHeight) < 60;
 }
 
-function toast(msg: string) {
+// toast shows a transient notification. The default
+// variant is a soft dark-glass pill (matches the cancel
+// button / file-bubble palette so it reads as "this app
+// telling you something", not "your system warning you
+// about an error"). Error / success variants layer a
+// coloured tint on top of the same pill so the form stays
+// consistent. 2026-06-27 user feedback: the previous
+// bottom-center warn-orange toast looked like a debugger
+// error popup.
+function toast(msg: string, variant: 'info' | 'success' | 'error' = 'info') {
   const t = document.getElementById('toast')!;
   t.textContent = msg;
-  t.classList.add('show');
-  setTimeout(() => t.classList.remove('show'), 2400);
+  t.className = 'toast toast-' + variant + ' show';
+  window.setTimeout(() => {
+    t.className = 'toast toast-' + variant;
+  }, 2400);
 }
 
 // ----- DOM injection (one-shot at startup) -----
@@ -657,10 +668,16 @@ function renderFileBubble(fb: FileBubbleState): string {
   // routes have a real path in v4. Right-click uses
   // it to reveal in Explorer.
   const dataPath = fb.localPath || '';
-  // Cancel button: only render for in-flight bubbles
-  // (status not done / failed). v1.1 (2026-06-27): closes
-  // the 500 MiB stuck-transfer footgun via App.CancelFile.
-  const showCancel = !fb.err && fb.sent < fb.size;
+  // Cancel button: show for ANY not-yet-done bubble. v1.1
+  // (2026-06-27) fix: the previous condition `fb.sent < fb.size`
+  // evaluated to false at the moment of send (both are 0 —
+// `0 < 0` is false), so the ✕ button didn't appear until
+  // the FIRST progress event arrived (and only if the user
+  // had triggered a peer switch to force a re-render). The
+  // right test is "not done": either size is still unknown
+  // (waiting for first file:event progress) or we haven't
+  // sent all the bytes yet.
+  const showCancel = !fb.err && !(fb.size > 0 && fb.sent >= fb.size);
   const cancelBtn = showCancel
     ? `<button class="file-cancel" data-cancel-file-id="${escapeHtml(fb.fileID)}" title="取消发送">
          <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4"><path d="M18 6L6 18"/><path d="M6 6l12 12"/></svg>
@@ -1124,7 +1141,7 @@ async function cancelFileInFlight(fileID: string) {
   try {
     const err = await CancelFile(fileID);
     if (err) {
-      toast(`取消失败: ${err}`);
+      toast(`取消失败: ${err}`, 'error');
       // Re-enable so the user can try again.
       if (btn) {
         btn.removeAttribute('disabled');
@@ -1132,7 +1149,7 @@ async function cancelFileInFlight(fileID: string) {
       }
     }
   } catch (e) {
-    toast(`取消失败: ${e}`);
+    toast(`取消失败: ${e}`, 'error');
     if (btn) {
       btn.removeAttribute('disabled');
       btn.classList.remove('cancelling');
@@ -1489,7 +1506,7 @@ function wireEvents() {
     const sendRes = await SendFilePath(peerId, path);
     const fileID = sendRes.fileID;
     if (!fileID) {
-      toast('发文件失败: ' + (sendRes.err || 'unknown'));
+      toast('发送失败: ' + (sendRes.err || 'unknown'), 'error');
       return;
     }
 
@@ -1703,14 +1720,24 @@ function wireEvents() {
       // fine, the failure path doesn't read it.
       markFileBubbleDone(ev.fileID, !!ev.ok, ev.err || '', ev.total ?? 0);
       if (!ev.ok) {
-        // The bubble shows a short "发送失败" status; the
-        // toast carries the full reason so the user can
-        // see what went wrong without it eating bubble
-        // real estate. Truncate to one line to keep the
-        // toast readable (toast lives 2.4s).
-        const fullErr = ev.err || '未知错误';
-        const oneLine = fullErr.replace(/\s+/g, ' ').slice(0, 120);
-        toast(`发文件失败: ${oneLine}${fullErr.length > 120 ? '…' : ''}`);
+        if (ev.err === '已取消') {
+          // User-initiated cancel — distinct from a real
+          // failure. No scary red, no "失败:" prefix.
+          // 2026-06-27: the previous toast said
+          // "发文件失败: 已取消" in orange and read like a
+          // software bug. Now: soft dark-glass pill with
+          // a neutral message.
+          toast('已取消发送', 'info');
+        } else {
+          // The bubble shows a short "发送失败" status; the
+          // toast carries the full reason so the user can
+          // see what went wrong without it eating bubble
+          // real estate. Truncate to one line to keep the
+          // toast readable (toast lives 2.4s).
+          const fullErr = ev.err || '未知错误';
+          const oneLine = fullErr.replace(/\s+/g, ' ').slice(0, 120);
+          toast(`发送失败: ${oneLine}${fullErr.length > 120 ? '…' : ''}`, 'error');
+        }
       }
     }
   });
@@ -1771,7 +1798,7 @@ async function SendFileDragDrop(paths: string[]) {
     const fileID = r.fileID || '';
     const err = r.err || '';
     if (!fileID) {
-      toast(`发文件失败: ${err || 'unknown'}`);
+      toast(`发送失败: ${err || 'unknown'}`, 'error');
       continue;
     }
     state.fileBubbles.set(fileID, {

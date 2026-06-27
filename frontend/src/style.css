@@ -459,25 +459,56 @@ body {
 .empty h3 { font-size: 15px; color: var(--text-2); margin-bottom: 6px; font-weight: 600; }
 .empty p { font-size: 12.5px; }
 
-/* ========== Toast ========== */
+/* ========== Toast ==========
+ * v1.1 (2026-06-27): redesigned the toast surface. The
+ * previous version was warn-orange on a soft-amber
+ * background with a thick border, which read like a
+ * "system error popup" instead of an in-app message
+ * (user feedback: "给人一种软件报错有bug的感觉"). Now:
+ *   - Default surface is a dark glass pill (matches the
+ *     file-cancel button's rgba(0,0,0,0.65) badge and the
+ *     overall green outgoing-bubble palette — same UI
+ *     family, no foreign "warning" red).
+ *   - Position is bottom-center, slightly higher (24px)
+ *     and with a more lifted shadow.
+ *   - Three variants (.toast-info / -success / -error)
+ *     layer a coloured accent on the same pill so the
+ *     form stays consistent; only the colour differs.
+ *   - Border-radius bumped to 999px so it reads as a
+ *     "chip" not a "dialog".
+ */
 .toast {
   position: fixed;
-  bottom: 16px;
+  bottom: 24px;
   left: 50%;
-  transform: translateX(-50%);
-  background: var(--warn-soft);
-  color: #92400e;
-  padding: 8px 16px;
-  border-radius: 8px;
-  border: 1px solid var(--warn);
+  transform: translateX(-50%) translateY(8px);
+  background: rgba(20, 22, 28, 0.92);
+  color: rgba(255, 255, 255, 0.94);
+  padding: 9px 18px;
+  border-radius: 999px;
   font-size: 13px;
-  box-shadow: var(--shadow-md);
+  font-weight: 500;
+  letter-spacing: 0.01em;
+  box-shadow: 0 8px 24px rgba(0, 0, 0, 0.18),
+              0 1px 3px rgba(0, 0, 0, 0.12);
+  -webkit-backdrop-filter: blur(8px);
+  backdrop-filter: blur(8px);
+  border: 1px solid rgba(255, 255, 255, 0.06);
   z-index: 1000;
   opacity: 0;
-  transition: opacity 0.2s, transform 0.2s;
+  transition: opacity 0.25s ease, transform 0.25s ease;
   pointer-events: none;
+  max-width: 80vw;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
 }
-.toast.show { opacity: 1; transform: translateX(-50%) translateY(-4px); }
+.toast.show { opacity: 1; transform: translateX(-50%) translateY(0); }
+/* Variant accents — keep the form, tint the colour. */
+.toast.toast-success { background: rgba(22, 163, 74, 0.92); }
+.toast.toast-error   { background: rgba(220, 38, 38, 0.92); }
+.toast.toast-success,
+.toast.toast-error { color: white; border-color: rgba(255, 255, 255, 0.10); }
 
 /* ========== History drawer (v1.1, 2026-06-27) ==========
  *
