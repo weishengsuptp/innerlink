@@ -87,6 +87,18 @@ func (inv *Invite) toCanonical() []byte {
 	return b
 }
 
+// Canonical exposes toCanonical so callers with their own
+// signing pipeline (e.g. pkg/node which holds *identity.Identity
+// but not the raw *sm2.PrivateKey) can produce the same
+// signature by calling Identity.Sign(Canonical()) and copying
+// the bytes into Invite.Signature.
+//
+// Equivalent to:
+//
+//	sig, _ := identity.Sign(canonical)
+//	inv.Signature = sig
+func (inv *Invite) Canonical() []byte { return inv.toCanonical() }
+
 // NewInvite constructs an unsigned Invite. Caller must call
 // Sign(priv) before sending. IssuedAt is set to time.Now().UTC();
 // callers wanting a fixed timestamp (for tests) should set it

@@ -618,7 +618,12 @@ func (n *Node) wrapChannel(conn *transport.Conn, sess *handshake.Session) {
 		}
 		n.appendHistory(rec)
 	})
-	if !n.channels.set(sess.RemotePeerID, &channelState{ch: ch, rcv: rcv, peerID: append([]byte(nil), sess.RemotePeerID...)}) {
+	if !n.channels.set(sess.RemotePeerID, &channelState{
+		ch:     ch,
+		rcv:    rcv,
+		peerID: append([]byte(nil), sess.RemotePeerID...),
+		pubKey: append([]byte(nil), sess.RemotePubKey...),
+	}) {
 		log.Printf("[INFO ] channel superseded peer=%s (keeping existing)", peerHexStr)
 		_ = ch.Close()
 		return
@@ -757,6 +762,29 @@ func (n *Node) wrapChannel(conn *transport.Conn, sess *handshake.Session) {
 							len(sh.Scanned), peerHexStr)
 					}
 				}
+			case protocol.TypeGroupInvite:
+				// Inbound group invite (1:1 from current
+				// member → us, prospective member). v1.1
+				// auto-accepts after Verify; the GUI / CLI
+				// can also call DeclineGroupInvite directly
+				// in response to a "would you like to
+				// join?" prompt (deferred to a UI follow-
+				// up — for now we accept on receive).
+				log.Printf("[GROUP ] invite from %s", peerHexStr)
+				if err := n.AcceptGroupInvite(env, sess.RemotePeerID); err != nil {
+					log.Printf("[ERROR] AcceptGroupInvite: %v", err)
+				}
+			case protocol.TypeGroupInviteAccept:
+				// Accepter's confirmation. Add them to
+				// our local members.json roster.
+				log.Printf("[GROUP ] accept from %s", peerHexStr)
+				if err := n.CreatorOnAccept(env, sess.RemotePeerID); err != nil {
+					log.Printf("[ERROR] CreatorOnAccept: %v", err)
+				}
+			case protocol.TypeGroupInviteDecline:
+				log.Printf("[GROUP ] decline from %s (invite was declined)", peerHexStr)
+				// TODO: notify the user via the GUI; for
+				// now we just log.
 			default:
 				// File traffic + anything else: hand off
 				// to the file receiver. Handle() is also

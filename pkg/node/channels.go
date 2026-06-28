@@ -16,6 +16,7 @@ type channelState struct {
 	ch     *protocol.Channel
 	rcv    *filetransfer.Receiver
 	peerID []byte // 16-byte raw peer id (key in the registry)
+	pubKey []byte // 64-byte SM2 marshaled pubkey from handshake (v1.1 group invite verify)
 }
 
 // channelRegistry tracks active encrypted Channels, keyed

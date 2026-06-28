@@ -101,6 +101,15 @@ type Store struct {
 	files      map[string]*peerFile // peerID (32 hex) -> open handle + unsynced count
 	readAllMu  sync.Mutex         // serializes ReadAll (read-then-close each file)
 	closed     bool               // guarded by filesMu
+
+	// v1.1 group-chat persistence. groups/<renderedGroupID>/
+	// is a parallel directory to chat/, with the same SM4-CBC
+	// frame format but keyed by group ID instead of peer ID.
+	// groupMu guards the groupFiles map; per-group appends
+	// serialize on the groupFile's own mu (different groups
+	// don't block each other).
+	groupMu     sync.Mutex
+	groupFiles  map[string]*groupFile
 }
 
 // peerFile is one open per-peer chat file. Each file has
