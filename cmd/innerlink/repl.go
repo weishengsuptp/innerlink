@@ -50,6 +50,8 @@ func replDispatch(nd *node.Node, cmd, line string, parts []string) {
 		cmdScan(nd, parts)
 	case "autoscan":
 		cmdAutoScan(nd)
+	case "group":
+		cmdGroup(nd, parts)
 	case "help":
 		cmdHelp()
 	case "quit", "exit":
@@ -353,6 +355,7 @@ func cmdHelp() {
 	log.Println("[HELP ] dial <ip:port>                   -- connect directly (skip discovery)")
 	log.Println("[HELP ] scan <ipv4-cidr>                 -- batch-dial a subnet to find innerlink peers")
 	log.Println("[HELP ] autoscan                         -- show v0.5.2 auto-scan queue status")
+	log.Println("[HELP ] group ...                        -- group chat sub-commands (group help for details)")
 	log.Println("[HELP ] help                             -- this list")
 	log.Println("[HELP ] quit                             -- exit")
 }
