@@ -581,8 +581,8 @@ func (n *Node) wrapChannel(conn *transport.Conn, sess *handshake.Session) {
 	// "file://<name>" message so the chat UI can render
 	// a file card next to the drop. Body is intentionally
 	// prefixed with file:// (frontend parses this).
-	rcv.SetOnComplete(func(name, finalPath string) {
-		log.Printf("[FILE] received %s -> %s (peer=%s)", name, finalPath, peerHexStr)
+	rcv.SetOnComplete(func(name, finalPath, groupID string) {
+		log.Printf("[FILE] received %s -> %s (peer=%s group=%q)", name, finalPath, peerHexStr, groupID)
 		// The body's name field reflects what the receiver
 		// ACTUALLY saved, not the original offer name. If
 		// the receiver had to rename on collision (e.g.
@@ -599,6 +599,54 @@ func (n *Node) wrapChannel(conn *transport.Conn, sess *handshake.Session) {
 			body += "|" + sizeStr
 		}
 		now := time.Now().UTC()
+		// v1.1 (2026-06-28): group vs 1:1 routing. For
+		// group file offers, we route to per-group chat.enc
+		// + publish Message with PeerID = groupID and
+		// SenderID = the member who sent it. We also move
+		// the file from the default received/ dir to
+		// groups/<id>/received/ so all of a group's
+		// artefacts live under one directory tree.
+		if groupID != "" {
+			groupDir := filepath.Join(n.dataDir(), storage.GroupDirName, groupID, storage.GroupReceivedDirName)
+			if err := os.MkdirAll(groupDir, 0o755); err != nil {
+				log.Printf("[WARN  ] mkdir group received dir %s: %v (keeping default location)", groupDir, err)
+			} else {
+				target := filetransfer.UniquePath(groupDir, savedName)
+				if err := os.Rename(finalPath, target); err == nil {
+					finalPath = target
+				} else {
+					// Cross-device link etc.; fall back to copy+remove.
+					if err2 := moveFileCrossDev(finalPath, target); err2 != nil {
+						log.Printf("[WARN  ] move group file %s -> %s: %v (keeping default location)", finalPath, target, err2)
+					} else {
+						finalPath = target
+					}
+				}
+			}
+			rec := &storage.Record{
+				Timestamp: now,
+				From:      peerHexStr,
+				To:        "",
+				Direction: "in",
+				Body:      body,
+				MsgID:     "",
+				LocalPath: finalPath,
+				GroupID:   groupID,
+			}
+			if err := n.chatStore.AppendGroup(groupID, rec); err != nil {
+				log.Printf("[ERROR] chat log group append (file): %v", err)
+			}
+			n.appendHistory(rec)
+			n.publishMessage(Message{
+				PeerID:    groupID,
+				SenderID:  peerHexStr,
+				Body:      body,
+				Timestamp: now,
+				Direction: DirIn,
+				LocalPath: finalPath,
+			})
+			return
+		}
 		n.publishMessage(Message{
 			PeerID:    peerHexStr,
 			Body:      body,

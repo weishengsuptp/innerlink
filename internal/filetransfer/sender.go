@@ -14,6 +14,14 @@ import (
 // FileOffer is the JSON payload of protocol.TypeFileOffer. The
 // receiver uses it to decide whether it can store the file
 // (size, name) and to verify integrity on completion (sha256).
+//
+// GroupID (v1.1, 2026-06-28) carries the rendered "g_<64hex>"
+// when the offer is for a group conversation. Empty for 1:1
+// transfers (the existing field-set). On the receiver side,
+// the OnComplete callback reads it back from the in-flight
+// offer to route the saved file to per-group storage and the
+// file message record to per-group chat.enc. omitempty keeps
+// the wire shape unchanged for the 1:1 case.
 type FileOffer struct {
 	FileID      string `json:"fileID"`
 	Name        string `json:"name"`
@@ -21,6 +29,7 @@ type FileOffer struct {
 	SHA256      string `json:"sha256"`      // full-file hex
 	TotalChunks uint32 `json:"totalChunks"` // ceil(Size / ChunkSize)
 	ChunkSize   int32  `json:"chunkSize"`   // always ChunkSize in v0.1
+	GroupID     string `json:"groupID,omitempty"`
 }
 
 // FileAccept is the JSON payload of protocol.TypeFileAccept. The
@@ -97,6 +106,19 @@ type WaitForReplyFunc func(ctx context.Context, wantType protocol.MsgType, fileI
 // sole reader of ch.Recv (e.g. in a file-only loopback test
 // where the cmd dispatcher pattern is not in use).
 //
+// fileID (v1.1, 2026-06-28) is the pre-assigned offer
+// FileID; pass "" to auto-generate. The GUI's picker route
+// generates a UUID client-side so the live progress bubble
+// can be wired up before the offer reaches the peer.
+// SendGroupFile uses pre-assigned IDs derived from a base
+// UUID + per-member hex so the GUI can correlate each
+// per-member transfer back to one logical send.
+//
+// groupID (v1.1, 2026-06-28) is the rendered "g_<64hex>"
+// when this transfer is for a group conversation; pass ""
+// for 1:1 (existing wire shape; omitempty keeps the JSON
+// unchanged for the common case).
+//
 // Note (v0.1): full-file SHA-256 in the Offer is omitted
 // (set to ""). The receiver verifies per-chunk SHA-256
 // during transmission; the channel itself is SM4-GCM
@@ -107,7 +129,7 @@ type WaitForReplyFunc func(ctx context.Context, wantType protocol.MsgType, fileI
 // this is what removes the "JS reads file → IPC → staging
 // → Go reads staging → encrypt → send" double-pass that
 // users reported as confusing.
-func Send(ctx context.Context, ch *protocol.Channel, src io.Reader, size int64, offerName string, progress ProgressFn, waitForReply WaitForReplyFunc) error {
+func Send(ctx context.Context, ch *protocol.Channel, src io.Reader, size int64, offerName, fileID, groupID string, progress ProgressFn, waitForReply WaitForReplyFunc) error {
 	if waitForReply == nil {
 		waitForReply = defaultWaitForReply(ch)
 	}
@@ -128,14 +150,19 @@ func Send(ctx context.Context, ch *protocol.Channel, src io.Reader, size int64, 
 		return fmt.Errorf("filetransfer: empty offer name")
 	}
 
+	effectiveFileID := fileID
+	if effectiveFileID == "" {
+		effectiveFileID = NewFileID()
+	}
 	totalChunks := uint32((size + int64(ChunkSize) - 1) / int64(ChunkSize))
 	offer := FileOffer{
-		FileID:      NewFileID(),
+		FileID:      effectiveFileID,
 		Name:        name,
 		Size:        size,
-		SHA256:      "", // see doc comment for rationale
+		SHA256:      "", // populated after the read
 		TotalChunks: totalChunks,
 		ChunkSize:   int32(ChunkSize),
+		GroupID:     groupID,
 	}
 
 	// 1) Send Offer.

@@ -13,6 +13,7 @@ import (
 	"time"
 
 	ic "github.com/weishengsuptp/innerlink/internal/crypto"
+	"github.com/weishengsuptp/innerlink/internal/filetransfer"
 	"github.com/weishengsuptp/innerlink/internal/protocol"
 	"github.com/weishengsuptp/innerlink/internal/storage"
 	"github.com/weishengsuptp/innerlink/pkg/group"
@@ -625,6 +626,196 @@ func (n *Node) LeaveGroup(renderedID string) error {
 	})
 	return nil
 }
+
+// SendGroupFile broadcasts a file to every online member
+// of the group (peer who currently has an active channel).
+// It mirrors SendGroupMessage: one logical send, one fileID
+// the caller pre-assigned (so the GUI can correlate the
+// per-member transfers), and per-member fileIDs derived
+// by appending "_<shortHex>" — each transfer runs as its
+// own filetransfer.Send() call against the existing
+// per-member channel.
+//
+// Per-member transfers are concurrent (filetransfer.Send
+// spawns its own goroutine via pkg/node.SendFile). We open
+// the file once per member rather than share a single
+// reader: sharing would serialize 20 concurrent streams
+// against one file handle, and at LAN scale 20 × open()
+// is fine. Drop the offer to any member that has no
+// active channel (offline = silent drop; outbox replay
+// is Phase 5).
+//
+// Sender-side chat record: a single "file://<name>"
+// bubble in the per-group chat.enc (not per-member —
+// the GUI shows ONE bubble per logical file send, not N
+// bubbles for N members). The chat record lands once
+// regardless of how many members received the bytes.
+//
+// Returns the per-member fileIDs (one per online member
+// that actually accepted the transfer) so the caller /
+// GUI can track each transfer independently. The CLI
+// doesn't care about this list today; the GUI does.
+//
+// v1.1 (2026-06-28).
+func (n *Node) SendGroupFile(rawGroupID []byte, filePath, baseFileID string) ([]string, error) {
+	if n.id == nil {
+		return nil, errors.New("node: not started")
+	}
+	if filePath == "" {
+		return nil, errors.New("node: SendGroupFile: empty path")
+	}
+	if baseFileID == "" {
+		return nil, errors.New("node: SendGroupFile: empty baseFileID")
+	}
+	info, err := os.Stat(filePath)
+	if err != nil {
+		return nil, fmt.Errorf("node: SendGroupFile stat: %w", err)
+	}
+	if !info.Mode().IsRegular() {
+		return nil, fmt.Errorf("node: SendGroupFile: not a regular file: %s", filePath)
+	}
+	size := info.Size()
+	if size < 0 {
+		return nil, errors.New("node: SendGroupFile: negative size")
+	}
+	rendered := group.RenderGroupID(rawGroupID)
+	m, err := group.LoadMembers(n.dataDir(), rawGroupID)
+	if err != nil {
+		return nil, fmt.Errorf("node: SendGroupFile load members: %w", err)
+	}
+	selfHex := n.id.PeerIDHex()
+	if !m.Contains(selfHex) {
+		return nil, errors.New("node: SendGroupFile: sender is not a member")
+	}
+	name := info.Name()
+
+	// Persist a single chat record for this send — one
+	// bubble in our own group chat, regardless of how many
+	// members received the file. Mirrors SendFile's per-peer
+	// chat record semantics.
+	now := time.Now().UTC()
+	base := filepath.Base(name)
+	sizeStr := humanSize(size)
+	body := "file://" + base
+	if sizeStr != "" {
+		body += "|" + sizeStr
+	}
+	rec := &storage.Record{
+		Timestamp: now,
+		From:      selfHex,
+		To:        "",
+		Direction: "out",
+		Body:      body,
+		MsgID:     "",
+		LocalPath: filePath,
+		GroupID:   rendered,
+	}
+	if err := n.chatStore.AppendGroup(rendered, rec); err != nil {
+		return nil, fmt.Errorf("node: SendGroupFile append chat: %w", err)
+	}
+	n.appendHistory(rec)
+	n.publishMessage(Message{
+		PeerID:    rendered,
+		Body:      body,
+		Timestamp: now,
+		Direction: DirOut,
+		LocalPath: filePath,
+	})
+
+	// Iterate online members and fan the file out.
+	delivered := make([]string, 0, len(m.Members))
+	for _, mem := range m.Members {
+		if mem.PeerID == selfHex {
+			continue
+		}
+		pid, err := hexToBytes(mem.PeerID)
+		if err != nil {
+			log.Printf("[WARN  ] SendGroupFile: bad member id %q: %v", mem.PeerID, err)
+			continue
+		}
+		st := n.channels.get(pid)
+		if st == nil {
+			// Member offline — drop. Phase 5 outbox replay.
+			continue
+		}
+		// Per-member fileID = base + "_" + first 8 chars of
+		// member hex. The GUI sees each as a separate
+		// file:event entry but the user-facing bubble remains
+		// the single chat record we wrote above.
+		memberShort := mem.PeerID
+		if len(memberShort) > 8 {
+			memberShort = memberShort[:8]
+		}
+		memberFileID := baseFileID + "_" + memberShort
+		if err := n.sendGroupFileToOne(st.ch, filePath, name, size, memberFileID, rendered); err != nil {
+			log.Printf("[WARN  ] SendGroupFile send to %s: %v", mem.PeerID, err)
+			continue
+		}
+		delivered = append(delivered, memberFileID)
+	}
+	log.Printf("[GROUP ] sent file=%s to %d members (group=%s)", name, len(delivered), rendered)
+	return delivered, nil
+}
+
+// sendGroupFileToOne opens filePath and streams one
+// copy of it through ch via the existing per-member
+// channel. The opened reader is bounded by the call's
+// lifetime — filetransfer.Send returns after the offer
+// is on the wire (it doesn't wait for chunks to drain),
+// so by the time this function returns the file
+// handle's refcount is up to 1 (the background sender
+// goroutine). Caller must not close the underlying
+// file until that goroutine has finished streaming —
+// we transfer ownership via the io.Reader.
+//
+// In practice, opening a fresh *os.File per member is
+// safe: the OS file handle lifetime is independent of
+// this function returning, and the filetransfer sender
+// reads until EOF. We use os.Open (not os.OpenFile)
+// so the default perms match what SendFile does for
+// 1:1 sends.
+func (n *Node) sendGroupFileToOne(ch *protocol.Channel, filePath, name string, size int64, memberFileID, renderedGroupID string) error {
+	f, err := os.Open(filePath)
+	if err != nil {
+		return fmt.Errorf("open: %w", err)
+	}
+	defer f.Close()
+	// skipChatLog=true because we already wrote the
+	// chat record above (single-bubble-per-send
+	// semantics). Per-member filetransfer.Send calls
+	// into n.SendFile internally via... actually no,
+	// they don't — SendGroupFile has its own per-member
+	// loop and doesn't go through SendFile (SendFile
+	// also writes a chat record, which we don't want
+	// per-member). We use filetransfer.Send directly
+	// here so we have full control.
+	//
+	// The fileID we pass is per-member so each
+	// concurrent transfer can be tracked independently
+	// by the GUI's file:event stream.
+	progressFn := func(sent, total int64) {
+		pct := int64(0)
+		if total > 0 {
+			pct = sent * 100 / total
+		}
+		log.Printf("[FILE] group sending %s to <member> %d/%d bytes (%d%%)",
+			name, sent, total, pct)
+	}
+	// We use n.ctx so the transfer respects Close().
+	// Per-file cancel isn't exposed in v1.1 (would
+	// require a per-member CancelFileGroup binding).
+	return filetransfer.Send(n.ctx, ch, f, size, name, memberFileID, renderedGroupID, progressFn, nil)
+}
+
+	// humanSize is defined in messages.go (same package)
+	// — we use the existing helper for the chat record's
+	// "file://name|<size>" body so the GUI's bubble sees
+	// identical formatting whether the send was 1:1 or
+	// group.
+
+// ctxWithNoCancel helper removed — SendGroupFile uses
+// n.ctx directly so per-member transfers respect
+// Node.Close() without needing a separate context.
 
 // toGroupInfo converts pkg/group.Members → public GroupInfo.
 // Reads the Aliases fresh from the alias store so the GUI
