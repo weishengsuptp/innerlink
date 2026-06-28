@@ -22,6 +22,7 @@ import (
 	"github.com/weishengsuptp/innerlink/internal/roster"
 	"github.com/weishengsuptp/innerlink/internal/storage"
 	"github.com/weishengsuptp/innerlink/internal/transport"
+	"github.com/weishengsuptp/innerlink/pkg/group"
 )
 
 // Node is the long-lived innerlink runtime.
@@ -655,8 +656,38 @@ func (n *Node) wrapChannel(conn *transport.Conn, sess *handshake.Session) {
 			case protocol.TypeText:
 				log.Printf("[MSG  ] in  <%s> %s", peerHexStr, string(env.Payload))
 				n.aliasStore.Touch(peerHexStr)
+				now := time.Now().UTC()
+				if env.IsGroup() {
+					// Group text: route to per-group chat.enc,
+					// publish with PeerID = group ID so the GUI
+					// sidebar lands the bubble in the group
+					// conversation, and SenderID = original
+					// sender so the GUI can render "Alice: hi".
+					rendered := group.RenderGroupID(env.GroupID)
+					rec := &storage.Record{
+						Timestamp: now,
+						From:      peerHexStr,
+						To:        "",
+						Direction: "in",
+						Body:      string(env.Payload),
+						MsgID:     "",
+						GroupID:   rendered,
+					}
+					if err := n.chatStore.AppendGroup(rendered, rec); err != nil {
+						log.Printf("[ERROR] chat log group append: %v", err)
+					}
+					n.appendHistory(rec)
+					n.publishMessage(Message{
+						PeerID:    rendered,
+						SenderID:  peerHexStr,
+						Body:      string(env.Payload),
+						Timestamp: rec.Timestamp,
+						Direction: "in",
+					})
+					break
+				}
 				rec := &storage.Record{
-					Timestamp: time.Now().UTC(),
+					Timestamp: now,
 					From:      peerHexStr,
 					To:        n.id.PeerIDHex(),
 					Direction: "in",
