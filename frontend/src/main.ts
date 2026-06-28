@@ -47,6 +47,8 @@ import {
   DebugReveal,
   DialAddr,
   History,
+  HistoryGroup,
+  ListGroups,
   ListPeers,
   OpenPath,
   PickFile,
@@ -57,6 +59,7 @@ import {
   SelfPeerID,
   SendFile,
   SendFilePath,
+  SendGroupMessage,
   SendText,
   SetMyAlias,
 } from '../wailsjs/go/app/App';
@@ -76,8 +79,14 @@ interface UIState {
   selfId: string;
   selfEntry: node.PeerInfo | null;
   peers: node.PeerInfo[];             // peers minus self
-  selectedId: string | null;          // peer hex ID of open conversation
-  history: Map<string, node.Message[]>; // peer hex ID -> msgs
+  // groups: every group on disk (v1.1, 2026-06-28). The
+  // sidebar renders a "群组" section above "Peers" with
+  // these. Each GroupInfo has GroupID (rendered), Name,
+  // Members[] (peer hex), CreatedAt (RFC3339), Self=true
+  // when our peerID is in the roster.
+  groups: node.GroupInfo[];
+  selectedId: string | null;          // peer hex OR rendered group ID
+  history: Map<string, node.Message[]>; // conversation key -> msgs
   // nearBottom: are we within ~60px of the message list
   // bottom? Used by renderMessages to decide whether to
   // auto-stick to bottom on new incoming messages.
@@ -85,6 +94,10 @@ interface UIState {
   // unreadCount: peer hex ID -> number of incoming
   // messages not yet seen. Reset to 0 in selectPeer.
   unreadCount: Map<string, number>;
+  // groupUnread: rendered group ID -> incoming unread count
+  // (mirrors unreadCount but for group conversations; they
+  // share the same conversation-key routing).
+  groupUnread: Map<string, number>;
   // fileBubbles: fileID -> file-bubble state. Picker
   // route creates a placeholder bubble the moment the
   // user picks a file (so the UI shows progress even
@@ -117,13 +130,35 @@ const state: UIState = {
   selfId: '',
   selfEntry: null,
   peers: [],
+  groups: [],
   selectedId: null,
   history: new Map(),
   nearBottom: true,
   unreadCount: new Map(),
+  groupUnread: new Map(),
   fileBubbles: new Map(),
   historyDrawerOpen: false,
 };
+
+// isGroupId reports whether the conversation key is a
+// rendered GroupID ("g_<64hex>"). Used everywhere we have
+// to branch behavior: selectX / renderMessages / composer
+// submit / message:event routing. v1.1 (2026-06-28).
+function isGroupId(id: string | null): boolean {
+  return !!id && id.startsWith('g_');
+}
+
+// senderDisplay looks up a 32-char hex PeerID in the
+// current peer roster and returns the alias or hostname
+// (never the peerID — internal routing only). Returns ""
+// for unknown senders (e.g. a member we haven't seen
+// online yet, or the local user when Direction == "out").
+function senderDisplay(hex: string): string {
+  if (!hex) return '';
+  if (hex === state.selfId) return '';
+  const p = state.peers.find(pp => pp.PeerID === hex);
+  return p ? peerDisplay(p) : '';
+}
 
 // ----- small helpers -----
 function shortId(id: string): string {
@@ -240,7 +275,16 @@ function peerDisplay(p: node.PeerInfo): string {
 
 function selectedPeer(): node.PeerInfo | null {
   if (!state.selectedId) return null;
+  if (isGroupId(state.selectedId)) return null;
   return state.peers.find(p => p.PeerID === state.selectedId) ?? null;
+}
+
+// selectedGroup returns the GroupInfo for the currently
+// selected conversation, or null if it's not a group.
+// v1.1 (2026-06-28).
+function selectedGroup(): node.GroupInfo | null {
+  if (!isGroupId(state.selectedId)) return null;
+  return state.groups.find(g => g.group_id === state.selectedId) ?? null;
 }
 
 function isNearBottom(el: HTMLElement): boolean {
@@ -276,11 +320,20 @@ function mount() {
           <div class="me-host" id="me-host">本机 · —</div>
           <div class="me-status"><span class="led"></span><span id="me-status">启动中…</span></div>
         </div>
+        <div class="sidebar-section">
+          <div class="sidebar-header">
+            <span class="sidebar-title">群组</span>
+            <span class="sidebar-count"><span id="group-count">0</span></span>
+          </div>
+          <div class="peer-list group-list" id="group-list"></div>
+        </div>
+        <div class="sidebar-section">
         <div class="sidebar-header">
           <span class="sidebar-title">Peers</span>
           <span class="sidebar-count"><span id="peer-online">0</span> / <span id="peer-count">0</span></span>
         </div>
         <div class="peer-list" id="peer-list"></div>
+        </div>
         <div class="sidebar-footer">
           <button class="btn-mini" id="btn-scan" title="扫描 IP 段">
             <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2"><circle cx="11" cy="11" r="7"/><path d="m21 21-4.3-4.3"/></svg>
@@ -470,8 +523,59 @@ function renderPeerList() {
   document.getElementById('peer-count')!.textContent = String(state.peers.length);
 }
 
+// renderGroupList renders the "群组" section in the
+// sidebar. One row per group, with:
+//   - "#" avatar glyph (distinct from the peer avatar)
+//   - group name
+//   - meta line: "N 成员 · K 在线" (where K is members
+//     currently in our peer roster as online)
+//   - unread badge (groupUnread)
+//   - active highlight when selectedId === GroupID
+//
+// Sorted: self groups first (you're a member), then by
+// name. v1.1 (2026-06-28).
+function renderGroupList() {
+  const list = document.getElementById('group-list');
+  if (!list) return;
+  const sorted = [...state.groups].sort((a, b) => {
+    const sa = a.self ? 0 : 1;
+    const sb = b.self ? 0 : 1;
+    if (sa !== sb) return sa - sb;
+    return (a.group_name || '').localeCompare(b.group_name || '');
+  });
+  list.innerHTML = sorted.map(g => {
+    const unread = state.groupUnread.get(g.group_id) || 0;
+    const onlineCount = g.members.filter(m =>
+      m !== state.selfId &&
+      state.peers.some(p => p.PeerID === m && p.Online)
+    ).length;
+    const memberLabel = `${g.members.length} 成员`;
+    const onlineLabel = onlineCount > 0 ? ` · ${onlineCount} 在线` : '';
+    return `
+      <div class="peer group ${g.group_id === state.selectedId ? 'active' : ''}" data-group="${escapeHtml(g.group_id)}">
+        <span class="peer-dot ${g.self ? 'online' : 'offline'}"></span>
+        <div class="peer-info">
+          <div class="peer-name">${escapeHtml(g.group_name || '(未命名群组)')}</div>
+          <div class="peer-meta">${memberLabel}${onlineLabel}</div>
+        </div>
+        <span class="badge ${unread > 0 ? 'show' : ''}">${unread > 0 ? unread : ''}</span>
+      </div>
+    `;
+  }).join('');
+
+  list.querySelectorAll<HTMLElement>('.peer.group').forEach(el => {
+    el.addEventListener('click', () => {
+      const gid = el.getAttribute('data-group')!;
+      void selectGroup(gid);
+    });
+  });
+
+  document.getElementById('group-count')!.textContent = String(state.groups.length);
+}
+
 function renderChatHeader() {
   const p = selectedPeer();
+  const g = selectedGroup();
   const avatar = document.getElementById('chat-avatar')!;
   const name = document.getElementById('chat-name')!;
   const sub = document.getElementById('chat-id')!;
@@ -482,6 +586,32 @@ function renderChatHeader() {
   const attachBtn = document.getElementById('btn-attach') as HTMLButtonElement;
   const input = document.getElementById('composer-input') as HTMLTextAreaElement;
   const send = document.getElementById('composer-send') as HTMLButtonElement;
+
+  // Group takes precedence over peer — the selectedId
+  // branch (g_<64hex> vs 32-char hex) decides which
+  // header variant we render. v1.1 (2026-06-28).
+  if (g) {
+    avatar.textContent = '#';
+    name.textContent = g.group_name || '(未命名群组)';
+    sub.textContent = `${g.members.length} 成员${g.self ? '' : ' · 只读'}`;
+    // Ping/dial aren't meaningful for groups (we don't
+    // call Ping / DialAddr on a group ID — they're per
+    // member channels handled internally by the Go side).
+    pingBtn.disabled = true;
+    dialBtn.disabled = true;
+    // Composer: enabled only when self=true. Receiving
+    // a message in a group we're not a member of
+    // shouldn't be writable from the GUI; we'd have to
+    // call SendGroupMessage and the server would reject
+    // it because we're not in the roster.
+    attachBtn.disabled = !g.self;
+    input.disabled = !g.self;
+    send.disabled = !g.self;
+    input.placeholder = g.self
+      ? `发到群 ${g.group_name || ''}…（Enter 发送，Shift+Enter 换行）`
+      : `你不是群 ${g.group_name || ''} 的成员`;
+    return;
+  }
 
   if (!p) {
     avatar.textContent = '?';
@@ -765,7 +895,22 @@ function renderMessage(m: node.Message, peerId: string): string {
   const sideClass = isOut ? 'self' : '';
   const ts = fmtTime(m.Timestamp);
   const peer = state.peers.find(p => p.PeerID === peerId);
-  const avChar = isOut ? '我' : avatarChar(peer ? peerDisplay(peer) : '');
+  const isGroup = isGroupId(peerId);
+  // v1.1 (2026-06-28): in a group, the avatar glyph comes
+  // from the original sender (m.SenderID), NOT the
+  // conversation partner (peerId, which is the group ID).
+  // For outbound, we still show "我" (our own avatar is
+  // always "我" regardless of conversation type).
+  let avChar = isOut ? '我' : avatarChar(peer ? peerDisplay(peer) : '');
+  let senderLabel = '';
+  if (isGroup && !isOut) {
+    const senderName = senderDisplay(m.SenderID || '');
+    avChar = avatarChar(senderName || shortId(m.SenderID || ''));
+    // Sender label above the bubble — "Alice" line so the
+    // eye knows who's talking. Empty if sender is unknown
+    // (member we haven't seen online yet).
+    senderLabel = senderName;
+  }
 
   // File message: Body has prefix "file://" (per core
   // pkg/node/messages.go SendFile + OnComplete), with an
@@ -810,6 +955,7 @@ function renderMessage(m: node.Message, peerId: string): string {
     <div class="msg ${sideClass}" ${msgAttrs}>
       <div class="av">${escapeHtml(avChar)}</div>
       <div>
+        ${senderLabel ? `<div class="sender">${escapeHtml(senderLabel)}</div>` : ''}
         <div class="bubble">${escapeHtml(m.Body)}</div>
         <div class="ts">${ts}</div>
       </div>
@@ -830,10 +976,44 @@ async function selectPeer(peerId: string) {
     toast(`读取历史失败: ${e}`);
   }
   renderPeerList();
+  renderChatList();
   renderChatHeader();
   renderMessages();
   const input = document.getElementById('composer-input') as HTMLTextAreaElement;
   input.focus();
+}
+
+// selectGroup opens a group conversation. Mirrors
+// selectPeer but calls HistoryGroup (per-group chat.enc)
+// instead of History (per-peer chat.enc). v1.1 (2026-06-28).
+async function selectGroup(renderedID: string) {
+  state.selectedId = renderedID;
+  // Group sidebar entry uses .group class, so we need to
+  // re-render both lists (the active highlight lives in
+  // different DOM nodes for the two sections).
+  state.groupUnread.set(renderedID, 0);
+  try {
+    const r = await HistoryGroup(renderedID);
+    state.history.set(renderedID, (r && r.messages) || []);
+  } catch (e) {
+    state.history.set(renderedID, []);
+    toast(`读取群历史失败: ${e}`);
+  }
+  renderPeerList();
+  renderGroupList();
+  renderChatHeader();
+  renderMessages();
+  const input = document.getElementById('composer-input') as HTMLTextAreaElement;
+  if (!input.disabled) input.focus();
+}
+
+// renderChatList re-renders BOTH the group list and the
+// peer list. After selectPeer / selectGroup we need to
+// keep the active highlight in sync across both sections
+// (a peer can become selected, an active group gets
+// unselected, etc.). v1.1 (2026-06-28).
+function renderChatList() {
+  renderGroupList();
 }
 
 async function refreshAll() {
@@ -846,15 +1026,43 @@ async function refreshAll() {
     // in the chat header).
     state.peers = peers.filter(p => !p.IsSelf && p.PeerID !== state.selfId);
     state.selfEntry = peers.find(p => p.IsSelf || p.PeerID === state.selfId) ?? null;
+    // Also load groups — the sidebar's "群组" section
+    // reflects the on-disk group roster. v1.1 (2026-06-28).
+    await loadGroups();
     renderMe();
     renderPeerList();
+    renderGroupList();
     renderChatHeader();
-    if (state.selectedId && !state.peers.find(p => p.PeerID === state.selectedId)) {
-      state.selectedId = null;
-      renderChatHeader();
+    if (state.selectedId) {
+      const stillThere = isGroupId(state.selectedId)
+        ? state.groups.some(g => g.group_id === state.selectedId)
+        : state.peers.some(p => p.PeerID === state.selectedId);
+      if (!stillThere) {
+        state.selectedId = null;
+        renderChatHeader();
+      }
     }
   } catch (e) {
     toast(`刷新失败: ${e}`);
+  }
+}
+
+// loadGroups fetches the on-disk group roster and
+// updates state.groups. Called by refreshAll and after
+// any group-membership change (currently only via
+// peer:event, which fires when a new peer appears —
+// v1.1 auto-accepts invites, so the roster change
+// happens out-of-band; we re-pull to reflect it).
+// v1.1 (2026-06-28).
+async function loadGroups() {
+  try {
+    const r = await ListGroups();
+    state.groups = (r && r.groups) || [];
+  } catch (e) {
+    // ListGroups failing shouldn't kill the rest of
+    // refresh — surface as a toast and continue with
+    // whatever we had cached.
+    toast(`读取群列表失败: ${e}`);
   }
 }
 
@@ -1404,15 +1612,30 @@ function hideFileContextMenu() {
 function wireEvents() {
   // Composer submit: text only. File transfer is wired
   // to 📎 click and drag-drop (auto-send on selection).
+  // v1.1 (2026-06-28): dispatch on group vs 1:1 — group
+  // conversations go through SendGroupMessage which
+  // broadcasts via per-member channels.
   document.getElementById('composer')!.addEventListener('submit', async (ev) => {
     ev.preventDefault();
     if (!state.selectedId) return;
     const input = document.getElementById('composer-input') as HTMLTextAreaElement;
     const text = input.value.trim();
     if (!text) return;
-    const r = await SendText(state.selectedId, text);
-    if (r) {
-      toast(`发送失败: ${r}`);
+    const isGroup = isGroupId(state.selectedId);
+    let err = '';
+    if (isGroup) {
+      // SendGroupMessage returns GroupMessageResult
+      // { status, err }; empty err means success.
+      const r = await SendGroupMessage(state.selectedId, text);
+      err = (r && r.err) || '';
+    } else {
+      // SendText returns the error string directly;
+      // empty string means success. (Wails binding
+      // convention: first return value only.)
+      err = await SendText(state.selectedId, text);
+    }
+    if (err) {
+      toast(`发送失败: ${err}`);
     } else {
       input.value = '';
     }
@@ -1685,17 +1908,27 @@ function wireEvents() {
   });
   EventsOn('message:event', (m: node.Message) => {
     if (!m || !m.PeerID) return;
+    // v1.1 (2026-06-28): the conversation key is just
+    // m.PeerID — for 1:1 it's the peer's 32-char hex;
+    // for groups it's the rendered "g_<64hex>" string.
+    // The history Map already keys on this; we only need
+    // to dispatch the unread-badge bump into the right
+    // counter (unreadCount for 1:1, groupUnread for group).
     const list = state.history.get(m.PeerID) || [];
     list.push(m);
     state.history.set(m.PeerID, list);
     if (state.selectedId === m.PeerID) {
       renderMessages();
     } else if (m.Direction === 'in') {
-      // Incoming message to a peer we aren't looking at:
-      // bump the unread badge.
-      const n = (state.unreadCount.get(m.PeerID) || 0) + 1;
-      state.unreadCount.set(m.PeerID, n);
-      renderPeerList();
+      if (isGroupId(m.PeerID)) {
+        const n = (state.groupUnread.get(m.PeerID) || 0) + 1;
+        state.groupUnread.set(m.PeerID, n);
+        renderGroupList();
+      } else {
+        const n = (state.unreadCount.get(m.PeerID) || 0) + 1;
+        state.unreadCount.set(m.PeerID, n);
+        renderPeerList();
+      }
     }
     // Live-update the history drawer if it's open so
     // new messages appear without a manual refresh.
