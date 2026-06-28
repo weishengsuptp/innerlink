@@ -23,8 +23,24 @@ const (
 // Message is one chat message, either received from a
 // peer (Direction == "in") or sent to one (Direction == "out").
 // Delivered on SubscribeMessages; also returned by History().
+//
+// Group context (v1.1, 2026-06-27):
+// For messages in a group conversation, PeerID is the
+// rendered GroupID ("g_<64hex>"). SenderID is the 32-char
+// hex PeerID of the original sender when Direction == "in";
+// for Direction == "out" SenderID is empty (the local user
+// is the sender). For 1:1 messages SenderID is always empty
+// (PeerID alone identifies the conversation partner).
+//
+// The frontend uses PeerID as the conversation key (sidebar
+// routing + History() lookup), and SenderID to render the
+// "Alice: hello" prefix on incoming group bubbles. Without
+// SenderID, the GUI would either misroute a group message
+// as a 1:1 message from the original sender, or lose the
+// sender identity entirely.
 type Message struct {
-	PeerID    string    // sender (in) or recipient (out)
+	PeerID    string    // peer hex (1:1) or "g_<64hex>" (group)
+	SenderID  string    // sender's peer hex (group inbound only); empty otherwise
 	Body      string    // text body (UTF-8)
 	Timestamp time.Time // UTC; UI may render in local tz
 	Direction string    // DirIn or DirOut
