@@ -486,6 +486,19 @@ func (n *Node) History(peerRef string) []Message {
 	}
 	out := make([]Message, 0, len(src))
 	for _, r := range src {
+		// v1.1 (2026-06-28) hotfix: skip group records.
+		// Group messages live in per-group chat.enc and
+		// are surfaced via HistoryGroup(); the per-peer
+		// history slice (this loop) is for 1:1 chat only.
+		// Without this filter, the GUI's history drawer
+		// would show the same record twice — once under
+		// the group ID (resolved to "群 <name>") and once
+		// under selfId (resolved to "我") — because
+		// SendGroupMessage appends to n.history with
+		// From=selfHex (matching the 1:1 filter).
+		if r.GroupID != "" {
+			continue
+		}
 		if filterPeer != "" && r.From != filterPeer && r.To != filterPeer {
 			continue
 		}
