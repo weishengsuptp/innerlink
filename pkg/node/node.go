@@ -70,11 +70,15 @@ type Node struct {
 	// transitions. fileEventCh receives file-transfer
 	// progress / done notifications keyed by fileID so
 	// the GUI can update its bubble in real time.
-	// All three are buffered to absorb short bursts
+	// groupEventCh receives group added / removed
+	// transitions so the GUI can refresh its "群组"
+	// sidebar section without polling. v1.1 (2026-06-28).
+	// All four are buffered to absorb short bursts
 	// from gossip storms / network floods.
-	messageCh   chan Message
-	peerEventCh chan PeerEvent
-	fileEventCh chan FileEvent
+	messageCh    chan Message
+	peerEventCh  chan PeerEvent
+	fileEventCh  chan FileEvent
+	groupEventCh chan GroupEvent
 
 	// In-memory chat history cache. Source of truth is
 	// the encrypted chat.enc on disk; this slice is just
@@ -178,8 +182,9 @@ func New(opts Options) (*Node, error) {
 		rosterStore: rosterStore,
 		selfAlias:   selfAliasStore,
 		channels:    newChannelRegistry(),
-		messageCh:   make(chan Message, 64),
-		peerEventCh: make(chan PeerEvent, 64),
+		messageCh:    make(chan Message, 64),
+		peerEventCh:  make(chan PeerEvent, 64),
+		groupEventCh: make(chan GroupEvent, 32),
 		// 256 = ~12.8s of progress events per transfer at
 		// the ~10 Hz flush cadence; comfortable margin for
 		// 3 concurrent transfers without dropping events
@@ -404,6 +409,7 @@ func (n *Node) Close() error {
 	close(n.messageCh)
 	close(n.peerEventCh)
 	close(n.fileEventCh)
+	close(n.groupEventCh)
 	return nil
 }
 

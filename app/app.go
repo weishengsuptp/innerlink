@@ -111,6 +111,7 @@ func (a *App) Startup(ctx context.Context) {
 	go a.pumpPeers()
 	go a.pumpMessages()
 	go a.pumpFiles()
+	go a.pumpGroups()
 	log.Printf("[INFO  app] Startup RETURN (goroutines=%d)", runtime.NumGoroutine())
 }
 
@@ -982,6 +983,19 @@ func (a *App) pumpMessages() {
 	for msg := range a.nd.SubscribeMessages() {
 		log.Printf("[INFO  app] pumpMessages emit message:event %+v", msg)
 		wruntime.EventsEmit(a.ctx, "message:event", msg)
+	}
+}
+
+// pumpGroups forwards group add/remove transitions to
+// the frontend as "group:event" runtime events. Exits
+// when SubscribeGroups' channel is closed (Node.Close).
+// v1.1 (2026-06-28).
+func (a *App) pumpGroups() {
+	log.Printf("[INFO  app] pumpGroups ENTER (goroutines=%d)", runtime.NumGoroutine())
+	defer log.Printf("[INFO  app] pumpGroups EXIT (goroutines=%d)", runtime.NumGoroutine())
+	for ev := range a.nd.SubscribeGroups() {
+		log.Printf("[INFO  app] pumpGroups emit group:event %+v", ev)
+		wruntime.EventsEmit(a.ctx, "group:event", ev)
 	}
 }
 
