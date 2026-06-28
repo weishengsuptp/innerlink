@@ -1310,6 +1310,49 @@ async function leaveGroup(renderedID: string) {
   toast(`已退出群 ${name}`);
 }
 
+// onGroupEvent handles Go-side "group:event" runtime
+// events (mirror of the peer:event handler but for
+// groups). Three responsibilities:
+//   1. Refresh state.groups so the sidebar reflects
+//      the new / removed row
+//   2. Clear selectedId if the removed group was the
+//      open conversation (UI safety)
+//   3. Surface a toast for the invite-received path
+//      so the user knows where the new row came from
+//      and who pulled them in
+// v1.1 (2026-06-28).
+async function onGroupEvent(ev: any) {
+  // Reload first so any subsequent render sees fresh data.
+  await loadGroups();
+  renderGroupList();
+  if (ev.Type === 'removed') {
+    if (state.selectedId === ev.GroupID) {
+      state.selectedId = null;
+      renderChatHeader();
+      renderMessages();
+    }
+    return;
+  }
+  if (ev.Type !== 'added') return;
+  // InviterHex set ⇒ someone invited us; the toast is
+  // the only place we show "who pulled me in" since the
+  // sidebar row only shows the group name. Self-created
+  // groups (modal flow) don't fire an InviterHex — the
+  // user just clicked "create" so they know where the
+  // row came from.
+  if (ev.InviterHex) {
+    const inviter = state.peers.find(p => p.PeerID === ev.InviterHex);
+    const inviterName = inviter ? peerDisplay(inviter) : shortId(ev.InviterHex);
+    toast(`${inviterName} 把你拉进了「${ev.GroupName || '群'}」`, 'success');
+  }
+  // If the user already had this group selected (rare but
+  // possible after a restart), the new GroupInfo needs
+  // to land in the header — re-render.
+  if (state.selectedId === ev.GroupID) {
+    renderChatHeader();
+  }
+}
+
 async function promptMyAlias() {
   // Click on the .me box to set your own broadcast
   // alias (what other peers see for you). Empty clears.
@@ -2199,6 +2242,19 @@ function wireEvents() {
     // New peer may have history we haven't fetched yet;
     // refresh the drawer if it's open (cheap).
     if (state.historyDrawerOpen) void refreshHistoryList();
+  });
+  // v1.1 (2026-06-28): group lifecycle events from Go.
+  // Triggered by:
+  //   - pkg/node CreateGroup (we just created a group)
+  //   - pkg/node AcceptGroupInvite (we auto-accepted
+  //     someone inviting us — InviterHex identifies them)
+  //   - pkg/node LeaveGroup (we left a group)
+  // We refresh the sidebar's group list in all cases
+  // and surface a toast for the "you were invited" path
+  // so the user knows where the new row came from.
+  EventsOn('group:event', (ev: any) => {
+    if (!ev || !ev.Type) return;
+    void onGroupEvent(ev);
   });
   EventsOn('message:event', (m: node.Message) => {
     if (!m || !m.PeerID) return;

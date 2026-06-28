@@ -152,6 +152,14 @@ func (n *Node) CreateGroup(name string, memberPeerIDs []string) (*GroupInfo, err
 	}
 
 	log.Printf("[GROUP ] created group=%s name=%q members=%d", rendered, name, len(members))
+	// v1.1 (2026-06-28): tell the GUI a new group exists
+	// so its sidebar refreshes without waiting for the
+	// next peer:event. InviterHex is empty for self-create.
+	n.publishGroupEvent(GroupEvent{
+		Type:      GroupAdded,
+		GroupID:   rendered,
+		GroupName: name,
+	})
 	return n.toGroupInfo(m, rawID, true), nil
 }
 
@@ -349,6 +357,17 @@ func (n *Node) AcceptGroupInvite(env protocol.Envelope, fromPeerID []byte) error
 		return fmt.Errorf("node: AcceptGroupInvite save: %w", err)
 	}
 	log.Printf("[GROUP ] accepted invite to %s (inviter=%s)", inv.GroupID, inviterHex)
+	// v1.1 (2026-06-28): notify the GUI a new group exists
+	// so the sidebar refreshes and the "你被拉进群 X"
+	// toast fires. InviterHex is the peer's 32-char hex
+	// (not raw bytes) so the frontend can use it directly
+	// to look up the inviter's alias in its peer roster.
+	n.publishGroupEvent(GroupEvent{
+		Type:       GroupAdded,
+		GroupID:    inv.GroupID,
+		GroupName:  inv.GroupName,
+		InviterHex: inviterHex,
+	})
 
 	// Send accept back to the inviter.
 	return n.sendAcceptResponse(inv, fromPeerID)
@@ -595,6 +614,15 @@ func (n *Node) LeaveGroup(renderedID string) error {
 		return err
 	}
 	log.Printf("[GROUP ] left group=%s (local cleanup done)", renderedID)
+	// v1.1 (2026-06-28): tell the GUI the group is gone
+	// so it stops showing it in the sidebar. The frontend
+	// also clears any selectedId that pointed at this
+	// group (handled in leaveGroup()).
+	n.publishGroupEvent(GroupEvent{
+		Type:      GroupRemoved,
+		GroupID:   renderedID,
+		GroupName: m.GroupName,
+	})
 	return nil
 }
 
