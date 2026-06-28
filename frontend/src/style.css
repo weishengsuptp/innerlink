@@ -758,6 +758,34 @@ body {
   background: rgba(0, 0, 0, 0.05);
   color: var(--text);
 }
+
+/* ========== Context menu (v1.1, 2026-06-28) ==========
+ *
+ * Used by the group-list right-click handler. Anchored
+ * to the click position via inline style.left/top;
+ * removed on outside click. Sits above the modal (z=400)
+ * but below any toast (toast has its own high z).
+ */
+.ctx-menu {
+  position: fixed;
+  background: var(--surface);
+  border: 1px solid var(--border-strong);
+  border-radius: 6px;
+  box-shadow: var(--shadow-md);
+  z-index: 400;
+  padding: 4px 0;
+  min-width: 140px;
+}
+.ctx-menu-item {
+  padding: 7px 14px;
+  cursor: pointer;
+  font-size: 13px;
+  color: var(--text);
+  user-select: none;
+}
+.ctx-menu-item:hover { background: var(--bg); }
+.ctx-menu-item.danger { color: #b91c1c; }
+.ctx-menu-item.danger:hover { background: #fee2e2; }
 .history-item-meta {
   display: flex;
   justify-content: space-between;

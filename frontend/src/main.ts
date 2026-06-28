@@ -1261,7 +1261,17 @@ async function submitCreateGroup() {
     await selectGroup(info.group_id);
     closeCreateGroupModal();
     if (failedInvites.length > 0) {
-      toast(`已建群，${failedInvites.length} 个邀请发送失败（peer 不在线？）`, 'error');
+      // v1.1 (2026-06-28) hotfix: previous wording
+      // "(peer 不在线?)" was misleading because peers
+      // in the PEERS list might still show as online
+      // even when their 1:1 channel hasn't been
+      // established yet (the GUI shows Online=true from
+      // the last UDP announcement; the TCP/TLS
+      // handshake lags behind). Pass through the
+      // actual Go error per invitee so the user can
+      // distinguish "offline" vs "send failed" vs
+      // "context cancelled" without guessing.
+      toast(`已建群，${failedInvites.length} 个邀请未送达：${failedInvites.join('; ')}`, 'error');
     } else {
       toast(`群 ${info.group_name} 已创建，${memberHexes.length} 个邀请已发送`);
     }
@@ -1273,22 +1283,69 @@ async function submitCreateGroup() {
 
 // ----- leave-group (v1.1, 2026-06-28) -----
 //
-// Right-click (or context button — long-press on touch)
-// on a group row opens a small context menu with
-// "退出群组". Calls App.LeaveGroup which deletes the
-// local members.json + chat.enc + sender-keys/. We do
-// NOT notify remaining members in v1.1 — that's a
-// follow-up (a "user has left" system message broadcast
-// through the per-member channels, similar to the
-// existing TypeRosterSync plumbing).
+// Right-click on a group row in the sidebar opens a
+// small context menu with "退出群聊" (v1.1, 2026-06-28
+// hotfix; previous version jumped straight to a confirm
+// dialog, surprising users who expected Windows-style
+// menu-first). The menu's click handler calls leaveGroup
+// which prompts + dispatches.
 //
-// Leaving a group you're the creator of is allowed in
-// this minimal UI; the Go-side LeaveGroup enforces
-// "creator must dissolve" as a follow-up but for now
-// it just deletes locally. The remote members still
-// have us in their roster (stale entry); a re-key or
-// explicit "creator left" event will be added when
-// SenderKeys distribution lands.
+// leaveGroup prompts the user to confirm, then calls
+// App.LeaveGroup which deletes the local members.json +
+// chat.enc + sender-keys/. We do NOT notify remaining
+// members in v1.1 — that's a follow-up (a "user has
+// left" system message broadcast through the per-member
+// channels, similar to the existing TypeRosterSync
+// plumbing).
+//
+// v1.1 (2026-06-28) hotfix: when we're the creator AND
+// no other members remain, Go allows the leave and the
+// empty-members branch deletes the group (self-dissolve).
+// The error message for "creator + others present" is
+// translated from the Go-side marker "群主无法直接退出"
+// into a friendly toast. The proper "dissolve group"
+// broadcast lands in DissolveGroup (v1.1.x TODO).
+//
+// showGroupContextMenu builds the right-click popup
+// shown over a group row in the sidebar. Anchored at
+// (clientX, clientY); removed on outside click. v1.1
+// (2026-06-28).
+function showGroupContextMenu(x: number, y: number, gid: string) {
+  // Tear down any previous instance before mounting a
+  // new one (the click outside handler hasn't fired yet
+  // when the user right-clicks a second row).
+  document.getElementById('group-ctx-menu')?.remove();
+  const menu = document.createElement('div');
+  menu.id = 'group-ctx-menu';
+  menu.className = 'ctx-menu';
+  menu.style.left = x + 'px';
+  menu.style.top = y + 'px';
+  // v1.1: only "退出群聊" for now. Future items:
+  // "解散群聊" (creator only), "邀请成员" (creator
+  // only), "群设置". Each would be a new ctx-menu-item.
+  const item = document.createElement('div');
+  item.className = 'ctx-menu-item danger';
+  item.textContent = '退出群聊';
+  item.addEventListener('click', () => {
+    menu.remove();
+    void leaveGroup(gid);
+  });
+  menu.appendChild(item);
+  document.body.appendChild(menu);
+  // Close on outside click — wrap in setTimeout(0) so
+  // the click that opened the menu doesn't immediately
+  // close it (it bubbles after the menu item's listener
+  // fires).
+  setTimeout(() => {
+    const onOutside = (ev: MouseEvent) => {
+      if (menu.contains(ev.target as Node)) return;
+      menu.remove();
+      document.removeEventListener('click', onOutside);
+    };
+    document.addEventListener('click', onOutside);
+  }, 0);
+}
+
 async function leaveGroup(renderedID: string) {
   const g = state.groups.find(x => x.group_id === renderedID);
   const name = g ? g.group_name : renderedID;
@@ -1297,7 +1354,17 @@ async function leaveGroup(renderedID: string) {
   const r = await LeaveGroup(renderedID);
   const err = (r && r.err) || '';
   if (err) {
-    toast(`退出失败: ${err}`);
+    // v1.1 (2026-06-28) hotfix: Go returns a Chinese marker
+    // "群主无法直接退出..." when the creator tries to
+    // leave while other members remain. Translate that
+    // to a friendly toast instead of leaking the raw Go
+    // string ("node: LeaveGroup: 群主..."). Any other
+    // error passes through verbatim.
+    if (err.includes('群主无法直接退出')) {
+      toast(`群主无法直接退出。请等所有成员先离开，或等「解散群聊」功能（v1.1.x TODO）`, 'error');
+    } else {
+      toast(`退出失败: ${err}`, 'error');
+    }
     return;
   }
   if (state.selectedId === renderedID) {
@@ -1434,19 +1501,34 @@ async function toggleHistoryDrawer() {
 
 async function refreshHistoryList() {
   // Make sure state.history has every known peer's
-  // messages. selectPeer() only loads the selected
-  // peer's history; the rest stay empty until they're
-  // clicked. Without this lazy fetch, the drawer would
-  // show only one peer's messages on first open.
+  // messages AND every known group's messages.
+  // selectPeer() / selectGroup() only load the
+  // currently selected conversation; the rest stay
+  // empty until clicked. Without this lazy fetch the
+  // drawer would show only the open conversation's
+  // messages on first open.
   const ids = new Set<string>();
   for (const p of state.peers) ids.add(p.PeerID);
   if (state.selectedId) ids.add(state.selectedId);
   if (state.selfId) ids.add(state.selfId);
+  for (const gid of state.groups) ids.add(gid.group_id);
   for (const pid of ids) {
     if (!state.history.has(pid)) {
       try {
-        const h = (await History(pid)) as node.Message[];
-        state.history.set(pid, h || []);
+        if (isGroupId(pid)) {
+          // v1.1 (2026-06-28) hotfix: history drawer
+          // used to display group messages with their
+          // raw rendered ID ("g_<64hex>") because the
+          // peerName lookup fell through to shortId().
+          // Now we fetch per-group chat.enc via
+          // HistoryGroup so the row can render with the
+          // group's display name.
+          const r = await HistoryGroup(pid);
+          state.history.set(pid, (r && r.messages) || []);
+        } else {
+          const h = (await History(pid)) as node.Message[];
+          state.history.set(pid, h || []);
+        }
       } catch {
         state.history.set(pid, []);
       }
@@ -1467,10 +1549,21 @@ function renderHistoryList() {
   const rows: Row[] = [];
   for (const [pid, msgs] of state.history) {
     if (!msgs) continue;
-    const peerInfo = state.peers.find(p => p.PeerID === pid);
-    const peerName = pid === state.selfId
-      ? '我'
-      : peerInfo ? peerDisplay(peerInfo) : shortId(pid);
+    // v1.1 (2026-06-28) hotfix: peerName for a group
+    // (PeerID starts with "g_") is the group name, not
+    // a peer alias. Look up state.groups; fall back to
+    // "(未知群)" if the group isn't loaded yet (e.g.
+    // drawer opened before refreshAll finished).
+    let peerName: string;
+    if (isGroupId(pid)) {
+      const g = state.groups.find(gg => gg.group_id === pid);
+      peerName = g ? `群 ${g.group_name}` : '(未知群)';
+    } else if (pid === state.selfId) {
+      peerName = '我';
+    } else {
+      const peerInfo = state.peers.find(p => p.PeerID === pid);
+      peerName = peerInfo ? peerDisplay(peerInfo) : shortId(pid);
+    }
     for (const m of msgs) {
       if (q) {
         const bodyHit = (m.Body || '').toLowerCase().includes(q);
@@ -1568,8 +1661,13 @@ function renderHistoryList() {
       const ts = el.getAttribute('data-ts') || '';
       const dir = el.getAttribute('data-dir') || 'in';
       if (!pid) return;
+      // v1.1 (2026-06-28) hotfix: row click was
+      // unconditionally calling selectPeer, which sent
+      // History(g_<64hex>) and surfaced empty results.
+      // Now dispatch on group vs 1:1.
       if (state.selectedId !== pid) {
-        void selectPeer(pid);
+        if (isGroupId(pid)) void selectGroup(pid);
+        else void selectPeer(pid);
       }
       void toggleHistoryDrawer();
       // The chat panel renders after selectPeer resolves;
@@ -2008,17 +2106,19 @@ function wireEvents() {
   // Event delegation on the list — cheaper than N
   // listeners if the user has a 20-peer roster.
   document.getElementById('create-group-members')!.addEventListener('change', () => updateCreateGroupSubmitButton());
-  // Right-click on a group row → "退出群组" prompt.
-  // The list re-renders on every peer:event / group
-  // refresh, so we use delegation on the parent and
-  // read data-group off the event target's ancestors.
+  // Right-click on a group row → context menu with
+  // "退出群聊" option. v1.1 (2026-06-28) hotfix:
+  // previous version jumped straight to a confirm
+  // dialog, which surprised users who right-clicked
+  // expecting a menu (Windows convention is menu-first
+  // → action via menu item, not action-on-right-click).
   document.getElementById('group-list')!.addEventListener('contextmenu', (ev) => {
     const e = ev as MouseEvent;
     const row = (e.target as HTMLElement).closest<HTMLElement>('.peer.group');
     if (!row) return;
     e.preventDefault();
     const gid = row.getAttribute('data-group');
-    if (gid) void leaveGroup(gid);
+    if (gid) void showGroupContextMenu(e.clientX, e.clientY, gid);
   });
 
   // 📎 picker: open the native OS file dialog via

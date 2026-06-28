@@ -594,9 +594,17 @@ func (n *Node) LeaveGroup(renderedID string) error {
 	if !m.Contains(selfHex) {
 		return errors.New("node: LeaveGroup: not a member")
 	}
-	// Don't allow creator to leave (would orphan the group).
-	if m.Creator == selfHex {
-		return errors.New("node: LeaveGroup: creator cannot leave (dissolve group instead)")
+	// v1.1 (2026-06-28, hotfix): allow the creator to leave
+	// when they're the SOLE remaining member — this is
+	// effectively a self-dissolve (the empty-members branch
+	// below deletes the local group). When other members
+	// remain, the creator still can't leave: doing so would
+	// orphan the group on their end while leaving stale
+	// creator entries in everyone else's roster. The proper
+	// path for "I'm done with this group and want everyone
+	// out" is a DissolveGroup broadcast (v1.1.x TODO).
+	if m.Creator == selfHex && len(m.Members) > 1 {
+		return errors.New("node: LeaveGroup: 群主无法直接退出，请等待其他成员先退出或解散群聊（v1.1.x TODO DissolveGroup）")
 	}
 	if !m.RemoveMember(selfHex) {
 		return errors.New("node: LeaveGroup: RemoveMember returned false")
