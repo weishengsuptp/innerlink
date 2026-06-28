@@ -314,7 +314,7 @@ func (n *Node) SendFile(peerRef, name string, size int64, src io.Reader, localPa
 			delete(n.cancelFiles, fileID)
 			n.cancelMu.Unlock()
 		}()
-		if err := filetransfer.Send(ctx, st.ch, src, size, name, progress, st.rcv.WaitForReply); err != nil {
+		if err := filetransfer.Send(ctx, st.ch, src, size, name, fileID, "", progress, st.rcv.WaitForReply); err != nil {
 			log.Printf("[ERROR] sendfile: %v", err)
 			// Normalize the cancel reason so the GUI shows
 			// "已取消" instead of leaking "context canceled".

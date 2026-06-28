@@ -37,6 +37,12 @@ const (
 	GroupDirName = "groups"
 	// GroupChatFileName is the encrypted chat log for one group.
 	GroupChatFileName = "chat.enc"
+	// GroupReceivedDirName is the subdirectory under
+	// <groupID>/ that holds files received into this group.
+	// Kept separate from chat.enc so the user can browse
+	// "what files did I get in this group" via Explorer
+	// without wading through the chat log. v1.1 (2026-06-28).
+	GroupReceivedDirName = "received"
 )
 
 // groupFilePath returns <dataDir>/groups/<groupID>/chat.enc.

@@ -43,7 +43,7 @@ type OnOffer func(offer FileOffer, fromPeer string) error
 // human-readable file name. Used by the GUI to publish a
 // chat message announcing "you received foo.txt" so the
 // chat panel can render a file card next to the drop.
-type OnComplete func(name, finalPath string)
+type OnComplete func(name, finalPath, groupID string)
 
 // Receiver handles incoming file offers on a Channel. Run Loop
 // in its own goroutine; it returns when ctx is cancelled or
@@ -425,7 +425,7 @@ func (r *Receiver) finalize(ctx context.Context, pf *partFile) error {
 	if pf.offer.SHA256 != "" && pf.hashWhole.SumHex() != pf.offer.SHA256 {
 		return errors.New("full-file sha256 mismatch")
 	}
-	finalPath := uniquePath(r.saveDir, pf.offer.Name)
+	finalPath := UniquePath(r.saveDir, pf.offer.Name)
 	if err := os.Rename(pf.path, finalPath); err != nil {
 		// Cross-device rename: fall back to copy + unlink.
 		if err := copyFile(pf.path, finalPath); err != nil {
@@ -439,7 +439,7 @@ func (r *Receiver) finalize(ctx context.Context, pf *partFile) error {
 	// the callback runs; the callback may post-process
 	// the file (size check, etc.) without races.
 	if r.onComplete != nil {
-		r.onComplete(pf.offer.Name, finalPath)
+		r.onComplete(pf.offer.Name, finalPath, pf.offer.GroupID)
 	}
 	return r.sendDone(ctx, pf, true, "")
 }
@@ -485,7 +485,16 @@ func copyFile(src, dst string) error {
 // " 2" suffix convention. The on-complete callback gets
 // the final path so the GUI's LocalPath always points at
 // the actual on-disk file.
-func uniquePath(dir, name string) string {
+//
+// UniquePath returns a path under dir that does not
+// currently exist. If dir/<name> is free, returns it
+// unchanged; otherwise appends " (N)" before the
+// extension, scanning up to 9999 collisions. Exported
+// so callers in other packages (e.g. pkg/node's group
+// file OnComplete path) can move received files into
+// per-group directories without overwriting an existing
+// file with the same name.
+func UniquePath(dir, name string) string {
 	candidate := filepath.Join(dir, name)
 	if _, err := os.Stat(candidate); err != nil {
 		return candidate
