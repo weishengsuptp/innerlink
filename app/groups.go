@@ -182,3 +182,45 @@ func (a *App) LeaveGroup(renderedID string) GroupMessageResult {
 	}
 	return GroupMessageResult{Status: "left"}
 }
+
+// SendGroupFileResult mirrors SendFilePathResult for the
+// group case. fileID is the BASE id (one per logical send);
+// the backend derives per-member ids by appending "_<hex>".
+// fileIDs lists the per-member ids that actually went out
+// (online members only) — the GUI listens on file:event
+// for each to drive the live progress bubble.
+type SendGroupFileResult struct {
+	FileID  string   `json:"fileID"`  // base fileID (GUI uses this as the conversation key)
+	Sent    int      `json:"sent"`    // count of online members the file was sent to
+	FileIDs []string `json:"fileIDs"` // per-member fileIDs that were dispatched
+	Err     string   `json:"err"`
+}
+
+// SendGroupFile broadcasts filePath to every online member
+// of the group. Returns the base fileID so the GUI can
+// wire up a single live progress bubble per send (per-
+// member file:event streams are derived from this base).
+//
+// Caller (frontend) supplies baseFileID so the placeholder
+// bubble can be inserted into the chat panel BEFORE the
+// Go side responds — matches the 1:1 SendFile pattern.
+//
+// v1.1 (2026-06-28).
+func (a *App) SendGroupFile(renderedID, filePath, baseFileID string) SendGroupFileResult {
+	if a.nd == nil {
+		return SendGroupFileResult{Err: "node not started"}
+	}
+	rawID, err := group.ParseGroupID(renderedID)
+	if err != nil {
+		return SendGroupFileResult{Err: "bad GroupID: " + err.Error()}
+	}
+	delivered, err := a.nd.SendGroupFile(rawID, filePath, baseFileID)
+	if err != nil {
+		return SendGroupFileResult{Err: err.Error(), FileID: baseFileID}
+	}
+	return SendGroupFileResult{
+		FileID:  baseFileID,
+		FileIDs: delivered,
+		Sent:    len(delivered),
+	}
+}
