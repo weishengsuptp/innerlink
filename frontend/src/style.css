@@ -608,6 +608,156 @@ body {
 .history-item:hover {
   background: var(--bg);
 }
+
+/* ========== Modal (v1.1, 2026-06-28) ==========
+ *
+ * Centered overlay used by the create-group flow.
+ * .modal-hidden flips display:none so the modal is
+ * invisible AND outside the tab order when closed.
+ *
+ * Inside: .modal-dialog with header + body + footer.
+ * Member picker is a scrollable .modal-list of
+ * .modal-list-item rows with a checkbox + name. */
+.modal-overlay {
+  position: fixed;
+  inset: 0;
+  background: rgba(20, 23, 30, 0.42);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  z-index: 300;
+}
+.modal-overlay.modal-hidden { display: none; }
+.modal-dialog {
+  background: var(--surface);
+  border-radius: 10px;
+  box-shadow: var(--shadow-md);
+  width: 420px;
+  max-width: 90vw;
+  max-height: 80vh;
+  display: flex;
+  flex-direction: column;
+}
+.modal-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 14px 18px;
+  border-bottom: 1px solid var(--border);
+  flex: 0 0 auto;
+}
+.modal-title { font-weight: 600; font-size: 15px; }
+.modal-body {
+  flex: 1 1 auto;
+  overflow-y: auto;
+  padding: 14px 18px;
+}
+.modal-field {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  margin-bottom: 14px;
+}
+.modal-field label {
+  font-size: 12px;
+  color: var(--muted);
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+}
+.modal-field input[type=text] {
+  padding: 8px 10px;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  background: var(--bg);
+  font-size: 14px;
+  outline: none;
+  font-family: inherit;
+}
+.modal-field input[type=text]:focus {
+  border-color: var(--primary);
+  background: var(--surface);
+}
+.modal-list {
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  max-height: 240px;
+  overflow-y: auto;
+  background: var(--bg);
+}
+.modal-list-item {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 8px 12px;
+  cursor: pointer;
+  border-bottom: 1px solid var(--border);
+  transition: background 0.1s;
+}
+.modal-list-item:last-child { border-bottom: none; }
+.modal-list-item:hover { background: var(--surface); }
+.modal-list-item input[type=checkbox] {
+  margin: 0;
+  cursor: pointer;
+}
+.modal-list-item .name {
+  font-size: 13.5px;
+  font-weight: 500;
+}
+.modal-list-item .meta {
+  font-size: 11px;
+  color: var(--muted);
+}
+.modal-list-item.disabled {
+  cursor: not-allowed;
+  opacity: 0.5;
+}
+.modal-footer {
+  padding: 12px 18px;
+  border-top: 1px solid var(--border);
+  display: flex;
+  justify-content: flex-end;
+  gap: 8px;
+  flex: 0 0 auto;
+}
+.modal-btn {
+  padding: 7px 14px;
+  border-radius: 6px;
+  border: 1px solid var(--border-strong);
+  background: var(--surface);
+  font-size: 13px;
+  cursor: pointer;
+  font-family: inherit;
+  font-weight: 500;
+}
+.modal-btn:hover { background: var(--bg); }
+.modal-btn.primary {
+  background: var(--primary);
+  color: white;
+  border-color: var(--primary);
+}
+.modal-btn.primary:hover { filter: brightness(1.05); }
+.modal-btn.primary:disabled {
+  background: var(--border-strong);
+  border-color: var(--border-strong);
+  cursor: not-allowed;
+}
+/* "+ 新建群组" button in the sidebar 群组 header */
+.sidebar-add-btn {
+  background: none;
+  border: none;
+  color: var(--muted);
+  cursor: pointer;
+  padding: 2px 4px;
+  border-radius: 4px;
+  display: inline-flex;
+  align-items: center;
+  line-height: 1;
+}
+.sidebar-add-btn:hover {
+  background: rgba(0, 0, 0, 0.05);
+  color: var(--text);
+}
 .history-item-meta {
   display: flex;
   justify-content: space-between;

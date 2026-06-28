@@ -44,10 +44,13 @@ import './app.css';
 
 import {
   CancelFile,
+  CreateGroup,
   DebugReveal,
   DialAddr,
   History,
   HistoryGroup,
+  InviteToGroup,
+  LeaveGroup,
   ListGroups,
   ListPeers,
   OpenPath,
@@ -323,7 +326,12 @@ function mount() {
         <div class="sidebar-section">
           <div class="sidebar-header">
             <span class="sidebar-title">群组</span>
-            <span class="sidebar-count"><span id="group-count">0</span></span>
+            <span class="sidebar-count">
+              <span id="group-count">0</span>
+              <button class="sidebar-add-btn" id="btn-create-group" title="新建群组">
+                <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4"><path d="M12 5v14"/><path d="M5 12h14"/></svg>
+              </button>
+            </span>
           </div>
           <div class="peer-list group-list" id="group-list"></div>
         </div>
@@ -421,6 +429,37 @@ function mount() {
           <!-- list of messages injected by JS -->
         </div>
       </aside>
+    </div>
+    <!-- Create-group modal (v1.1, 2026-06-28). Hidden by
+         default via .modal-hidden; toggled by
+         openCreateGroupModal(). Centered overlay with
+         name input + member multi-select + Cancel /
+         Create buttons. The member list shows every peer
+         in the current roster (online first, then
+         offline). Self is omitted (creator is implicit). -->
+    <div class="modal-overlay modal-hidden" id="create-group-modal" aria-hidden="true">
+      <div class="modal-dialog" role="dialog" aria-labelledby="create-group-title">
+        <div class="modal-header">
+          <div class="modal-title" id="create-group-title">新建群组</div>
+          <button class="icon-btn" id="btn-create-group-close" title="关闭">
+            <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M18 6L6 18"/><path d="M6 6l12 12"/></svg>
+          </button>
+        </div>
+        <div class="modal-body">
+          <div class="modal-field">
+            <label for="create-group-name">群组名称</label>
+            <input type="text" id="create-group-name" maxlength="30" placeholder="例如：周末饭局" autocomplete="off" />
+          </div>
+          <div class="modal-field">
+            <label>选择成员</label>
+            <div class="modal-list" id="create-group-members"></div>
+          </div>
+        </div>
+        <div class="modal-footer">
+          <button class="modal-btn" id="btn-create-group-cancel">取消</button>
+          <button class="modal-btn primary" id="btn-create-group-submit" disabled>创建</button>
+        </div>
+      </div>
     </div>
     <div class="toast" id="toast"></div>
   `;
@@ -1066,6 +1105,211 @@ async function loadGroups() {
   }
 }
 
+// ----- create-group modal (v1.1, 2026-06-28) -----
+//
+// Click the "+ 新建群组" button in the sidebar header
+// to open a modal with:
+//   - name input (required, max 30 chars — matches
+//     pkg/node CreateGroup's hard cap)
+//   - member multi-select (checkboxes; one row per peer
+//     in state.peers; self is omitted — the creator is
+//     implicit)
+//
+// Submit flow:
+//   1. App.CreateGroup(name, peerHexes) → local members.json
+//      + chat.enc. The group exists on disk; nothing
+//      has been sent over the network yet.
+//   2. For each member, App.InviteToGroup(renderedID,
+//      memberHex). This signs a 1:1 invite envelope and
+//      sends it over the existing per-member channel.
+//      The remote side auto-accepts (Go dispatcher
+//      TypeGroupInvite case), adds us to their
+//      members.json, and starts receiving broadcasts.
+//   3. Refresh the sidebar list, auto-select the new
+//      group so the user lands in the chat panel.
+//
+// Failure modes we tolerate:
+//   - CreateGroup rejects (bad name, too many members) →
+//     toast the error, keep modal open so the user can
+//     fix and retry.
+//   - CreateGroup succeeds but InviteToGroup fails for
+//     some members → toast the partial failure but still
+//     select the group; the local group is real even if
+//     some invites didn't go through (the user can
+//     re-invite from a future menu). The offline members
+//     will see nothing — invites over an inactive channel
+//     silently fail (no queue yet).
+function openCreateGroupModal() {
+  const modal = document.getElementById('create-group-modal');
+  if (!modal) return;
+  // Reset state.
+  const nameInput = document.getElementById('create-group-name') as HTMLInputElement;
+  nameInput.value = '';
+  renderCreateGroupMemberList();
+  updateCreateGroupSubmitButton();
+  modal.classList.remove('modal-hidden');
+  modal.setAttribute('aria-hidden', 'false');
+  // Focus the name field on next tick so the click that
+  // opened the modal doesn't bubble into focus loss.
+  setTimeout(() => nameInput.focus(), 0);
+}
+
+function closeCreateGroupModal() {
+  const modal = document.getElementById('create-group-modal');
+  if (!modal) return;
+  modal.classList.add('modal-hidden');
+  modal.setAttribute('aria-hidden', 'true');
+}
+
+// renderCreateGroupMemberList injects one .modal-list-item
+// per peer (self omitted). Online peers first, then
+// offline. Click anywhere on the row to toggle the
+// checkbox; the input itself is the visual only.
+function renderCreateGroupMemberList() {
+  const list = document.getElementById('create-group-members');
+  if (!list) return;
+  if (state.peers.length === 0) {
+    list.innerHTML = `<div style="padding:14px 12px;color:var(--muted);font-size:12px;">没有可邀请的 peer。先在右侧"Peers"列表里确认至少一个 peer 在网。</div>`;
+    return;
+  }
+  const sorted = [...state.peers].sort((a, b) => {
+    const sa = a.Online ? 0 : 1;
+    const sb = b.Online ? 0 : 1;
+    if (sa !== sb) return sa - sb;
+    return peerDisplay(a).localeCompare(peerDisplay(b));
+  });
+  list.innerHTML = sorted.map(p => `
+    <label class="modal-list-item" data-peer="${p.PeerID}">
+      <input type="checkbox" data-pick-peer="${p.PeerID}" ${p.Online ? '' : 'disabled'} />
+      <span class="peer-dot ${p.Online ? 'online' : 'offline'}" style="width:6px;height:6px;"></span>
+      <div>
+        <div class="name">${escapeHtml(peerDisplay(p))}</div>
+        <div class="meta">${escapeHtml(p.Addrs[0]?.split(':')[0] || '')}${p.Online ? '' : ' · 离线'}</div>
+      </div>
+    </label>
+  `).join('');
+}
+
+// pickedMemberPeerIDs returns the array of peerIDs the
+// user checked. Used by submit + the disabled-state
+// check below. Reads DOM each call (cheap; < 50 peers).
+function pickedMemberPeerIDs(): string[] {
+  const inputs = document.querySelectorAll<HTMLInputElement>('#create-group-members input[type=checkbox]:checked');
+  const out: string[] = [];
+  inputs.forEach(i => {
+    const pid = i.getAttribute('data-pick-peer');
+    if (pid) out.push(pid);
+  });
+  return out;
+}
+
+// updateCreateGroupSubmitButton enables the Create
+// button only when the name is non-empty AND at least
+// one member is checked. Wires the listener once via
+// event delegation on the modal.
+function updateCreateGroupSubmitButton() {
+  const nameInput = document.getElementById('create-group-name') as HTMLInputElement;
+  const submit = document.getElementById('btn-create-group-submit') as HTMLButtonElement;
+  if (!nameInput || !submit) return;
+  const hasName = nameInput.value.trim().length > 0;
+  const hasMember = pickedMemberPeerIDs().length > 0;
+  submit.disabled = !(hasName && hasMember);
+}
+
+async function submitCreateGroup() {
+  const nameInput = document.getElementById('create-group-name') as HTMLInputElement;
+  const submit = document.getElementById('btn-create-group-submit') as HTMLButtonElement;
+  const name = nameInput.value.trim();
+  const memberHexes = pickedMemberPeerIDs();
+  if (!name || memberHexes.length === 0) return;
+  // Lock the button while we wait so a double-click
+  // doesn't fire two CreateGroup calls (and produce
+  // two groups with the same name — different
+  // timestamps make them distinct GroupIDs but still
+  // an annoying duplicate for the user).
+  submit.disabled = true;
+  try {
+    const r = await CreateGroup(name, memberHexes);
+    const err = (r && r.err) || '';
+    if (err) {
+      toast(`建群失败: ${err}`);
+      submit.disabled = false;
+      return;
+    }
+    const info = r && r.group_info;
+    if (!info) {
+      toast('建群失败: 无返回');
+      submit.disabled = false;
+      return;
+    }
+    // Fire invites. Per-member: each gets its own 1:1
+    // envelope via the existing channel. We collect
+    // per-member errors and report a partial-failure
+    // toast if any failed (offline / channel not up).
+    const failedInvites: string[] = [];
+    for (const hex of memberHexes) {
+      const ir = await InviteToGroup(info.group_id, hex);
+      const ierr = (ir && ir.err) || '';
+      if (ierr) failedInvites.push(`${shortId(hex)}: ${ierr}`);
+    }
+    // Refresh the sidebar so the new group shows up,
+    // then auto-select it so the user lands in the
+    // chat panel.
+    await loadGroups();
+    renderGroupList();
+    await selectGroup(info.group_id);
+    closeCreateGroupModal();
+    if (failedInvites.length > 0) {
+      toast(`已建群，${failedInvites.length} 个邀请发送失败（peer 不在线？）`, 'error');
+    } else {
+      toast(`群 ${info.group_name} 已创建，${memberHexes.length} 个邀请已发送`);
+    }
+  } catch (e) {
+    toast(`建群失败: ${e}`);
+    submit.disabled = false;
+  }
+}
+
+// ----- leave-group (v1.1, 2026-06-28) -----
+//
+// Right-click (or context button — long-press on touch)
+// on a group row opens a small context menu with
+// "退出群组". Calls App.LeaveGroup which deletes the
+// local members.json + chat.enc + sender-keys/. We do
+// NOT notify remaining members in v1.1 — that's a
+// follow-up (a "user has left" system message broadcast
+// through the per-member channels, similar to the
+// existing TypeRosterSync plumbing).
+//
+// Leaving a group you're the creator of is allowed in
+// this minimal UI; the Go-side LeaveGroup enforces
+// "creator must dissolve" as a follow-up but for now
+// it just deletes locally. The remote members still
+// have us in their roster (stale entry); a re-key or
+// explicit "creator left" event will be added when
+// SenderKeys distribution lands.
+async function leaveGroup(renderedID: string) {
+  const g = state.groups.find(x => x.group_id === renderedID);
+  const name = g ? g.group_name : renderedID;
+  const ok = window.confirm(`退出群组 "${name}"？本机会删除本地聊天记录，其他成员仍能看到你之前的消息。`);
+  if (!ok) return;
+  const r = await LeaveGroup(renderedID);
+  const err = (r && r.err) || '';
+  if (err) {
+    toast(`退出失败: ${err}`);
+    return;
+  }
+  if (state.selectedId === renderedID) {
+    state.selectedId = null;
+  }
+  await loadGroups();
+  renderGroupList();
+  renderPeerList();
+  renderChatHeader();
+  renderMessages();
+  toast(`已退出群 ${name}`);
+}
+
 async function promptMyAlias() {
   // Click on the .me box to set your own broadcast
   // alias (what other peers see for you). Empty clears.
@@ -1681,6 +1925,56 @@ function wireEvents() {
     } else {
       toast('reveal FAIL: ' + r);
     }
+  });
+
+  // Create-group modal (v1.1, 2026-06-28).
+  document.getElementById('btn-create-group')!.addEventListener('click', () => openCreateGroupModal());
+  document.getElementById('btn-create-group-close')!.addEventListener('click', () => closeCreateGroupModal());
+  document.getElementById('btn-create-group-cancel')!.addEventListener('click', () => closeCreateGroupModal());
+  document.getElementById('btn-create-group-submit')!.addEventListener('click', () => void submitCreateGroup());
+  // Submit on Enter in the name field.
+  document.getElementById('create-group-name')!.addEventListener('input', () => updateCreateGroupSubmitButton());
+  document.getElementById('create-group-name')!.addEventListener('keydown', (ev) => {
+    const ke = ev as KeyboardEvent;
+    if (ke.key === 'Enter') {
+      ke.preventDefault();
+      if (!(document.getElementById('btn-create-group-submit') as HTMLButtonElement).disabled) {
+        void submitCreateGroup();
+      }
+    }
+  });
+  // Close the modal on backdrop click (clicking the
+  // overlay itself, not the dialog — the dialog click
+  // bubbles up here too but stopPropagation in the
+  // dialog handler would block it; we check the
+  // event target instead).
+  document.getElementById('create-group-modal')!.addEventListener('click', (ev) => {
+    if (ev.target === ev.currentTarget) closeCreateGroupModal();
+  });
+  // Esc closes the modal too.
+  document.addEventListener('keydown', (ev) => {
+    const ke = ev as KeyboardEvent;
+    if (ke.key !== 'Escape') return;
+    const modal = document.getElementById('create-group-modal');
+    if (modal && !modal.classList.contains('modal-hidden')) {
+      closeCreateGroupModal();
+    }
+  });
+  // Update submit button when a member checkbox toggles.
+  // Event delegation on the list — cheaper than N
+  // listeners if the user has a 20-peer roster.
+  document.getElementById('create-group-members')!.addEventListener('change', () => updateCreateGroupSubmitButton());
+  // Right-click on a group row → "退出群组" prompt.
+  // The list re-renders on every peer:event / group
+  // refresh, so we use delegation on the parent and
+  // read data-group off the event target's ancestors.
+  document.getElementById('group-list')!.addEventListener('contextmenu', (ev) => {
+    const e = ev as MouseEvent;
+    const row = (e.target as HTMLElement).closest<HTMLElement>('.peer.group');
+    if (!row) return;
+    e.preventDefault();
+    const gid = row.getAttribute('data-group');
+    if (gid) void leaveGroup(gid);
   });
 
   // 📎 picker: open the native OS file dialog via
