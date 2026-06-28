@@ -126,6 +126,38 @@ const (
 	// ~10KB) that the simplicity beats the bandwidth saving.
 	TypeRosterSync MsgType = "roster-sync"
 
+	// -- Group chat (v2 / v1.1) --
+
+	// TypeGroupInvite carries a group.Invite in Payload
+	// (JSON). Sent 1:1 from an inviter to a prospective
+	// member. The recipient calls group.Invite.Verify
+	// against the inviter's SM2 public key (received
+	// during handshake) before accepting.
+	//
+	// This is a NEW MsgType added in v2; v1 receivers
+	// reject any Type they don't know — but v2 was a
+	// hard cutover, so all v2 peers must be on this build
+	// or later to handle it. There is no v1 receiver to
+	// break compat with.
+	TypeGroupInvite MsgType = "group-invite"
+
+	// TypeGroupInviteAccept is the recipient's confirmation
+	// after Verify succeeds. The recipient's accept message
+	// triggers the inviter to add them to members.json and
+	// start distributing sender keys. Payload is JSON:
+	//   {group_id (rendered), accept_nonce}
+	// accept_nonce echoes Invite.Nonce so the inviter can
+	// match this accept to the original invite.
+	TypeGroupInviteAccept MsgType = "group-accept"
+
+	// TypeGroupInviteDecline is the recipient's polite "no".
+	// Not strictly required (silence is also valid) but
+	// lets the inviter show a "Bob declined" toast in the
+	// GUI without polling.
+	//
+	// Payload: {group_id (rendered), reason (optional)}.
+	TypeGroupInviteDecline MsgType = "group-decline"
+
 	// -- Scan history (v0.5.3) --
 
 	// TypeScanHistory carries the list of /24

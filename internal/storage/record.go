@@ -69,10 +69,23 @@ type Record struct {
 	Timestamp time.Time `json:"ts"`
 	From      string    `json:"from"`     // 32-char hex PeerID
 	To        string    `json:"to"`       // 32-char hex PeerID
-	Direction string    `json:"dir"`      // "in" or "out"
+	Direction string    `json:"dir"`      // "in", "out", or "system"
 	Body      string    `json:"body"`     // chat text
 	MsgID     string    `json:"msgID"`    // 16-char hex, envelope MsgID
 	LocalPath string    `json:"localPath,omitempty"`
+	// GroupID (v1.1, 2026-06-27) is the rendered GroupID
+	// ("g_<hex>") for messages in a group. Empty for 1:1
+	// chat (the existing field-set). For group messages,
+	// To is left empty — there's no single recipient;
+	// the GroupID + From uniquely identifies a row.
+	//
+	// omitempty keeps the on-disk shape unchanged for the
+	// common case (1:1 chat), and an old reader that
+	// doesn't know this field defaults GroupID to "" and
+	// treats the row as 1:1 (which would mis-route it,
+	// but old readers won't have any group records to
+	// read since this is a v1.1 addition).
+	GroupID string `json:"groupID,omitempty"`
 }
 
 // CurrentVersion is the on-disk record version produced by
