@@ -9,6 +9,7 @@ import (
 	"os"
 	"path/filepath"
 	"sort"
+	"strings"
 	"sync"
 	"time"
 
@@ -780,31 +781,92 @@ func (n *Node) sendGroupFileToOne(ch *protocol.Channel, filePath, name string, s
 		return fmt.Errorf("open: %w", err)
 	}
 	defer f.Close()
-	// skipChatLog=true because we already wrote the
-	// chat record above (single-bubble-per-send
-	// semantics). Per-member filetransfer.Send calls
-	// into n.SendFile internally via... actually no,
-	// they don't — SendGroupFile has its own per-member
-	// loop and doesn't go through SendFile (SendFile
-	// also writes a chat record, which we don't want
-	// per-member). We use filetransfer.Send directly
-	// here so we have full control.
-	//
-	// The fileID we pass is per-member so each
-	// concurrent transfer can be tracked independently
-	// by the GUI's file:event stream.
-	progressFn := func(sent, total int64) {
-		pct := int64(0)
-		if total > 0 {
-			pct = sent * 100 / total
-		}
-		log.Printf("[FILE] group sending %s to <member> %d/%d bytes (%d%%)",
-			name, sent, total, pct)
+	// Strip the "_<shortHex>" suffix to recover the base
+	// fileID the GUI registered the placeholder with.
+	// We emit FileEvent.FileID = baseFileID so the GUI's
+	// existing state.fileBubbles lookup matches — one
+	// bubble per logical send, not N per member.
+	baseFileID := memberFileID
+	if i := strings.LastIndex(memberFileID, "_"); i > 0 {
+		baseFileID = memberFileID[:i]
 	}
-	// We use n.ctx so the transfer respects Close().
-	// Per-file cancel isn't exposed in v1.1 (would
-	// require a per-member CancelFileGroup binding).
-	return filetransfer.Send(n.ctx, ch, f, size, name, memberFileID, renderedGroupID, progressFn, nil)
+	// Sliding-window speed estimate (same approach as
+	// SendFile — last 1s of progress samples, ~10 Hz
+	// emit cadence). All per-member senders update the
+	// SAME FileEvent.FileID = baseFileID, so the GUI
+	// sees the LAST writer's progress. Imperfect but
+	// works at LAN scale where all members' speeds are
+	// similar; a future commit can do proper aggregation
+	// (slowest-member as the bottleneck).
+	var lastFlush time.Time
+	var lastSent int64
+	var windowBytes int64
+	progressFn := func(sent, total int64) {
+		now := time.Now()
+		if lastFlush.IsZero() {
+			lastFlush = now
+			lastSent = sent
+		}
+		windowBytes += sent - lastSent
+		lastSent = sent
+		if now.Sub(lastFlush) < 100*time.Millisecond {
+			return
+		}
+		bps := int64(float64(windowBytes) / now.Sub(lastFlush).Seconds())
+		n.publishFileEvent(FileEvent{
+			Type:        FileEventProgress,
+			FileID:      baseFileID,
+			Sent:        sent,
+			Total:       total,
+			BytesPerSec: bps,
+			GroupID:     renderedGroupID,
+		})
+		lastFlush = now
+		windowBytes = 0
+	}
+	if err := filetransfer.Send(n.ctx, ch, f, size, name, memberFileID, renderedGroupID, progressFn, nil); err != nil {
+		// Surface the per-member failure to the GUI. The
+		// bubble will get a 'done' event with ok=false; the
+		// GUI's existing file:event 'done' handler shows
+		// "失败: <err>" and a red bar. The baseFileID routing
+		// means every member's failure overwrites the bubble
+		// with that member's error string — again imperfect
+		// but matches the v1.1 "one bubble, last write wins"
+		// simplification. Aggregating per-member failure
+		// counts would need a real coordinator goroutine.
+		log.Printf("[WARN  ] sendGroupFileToOne: %v", err)
+		n.publishFileEvent(FileEvent{
+			Type:    FileEventDone,
+			FileID:  baseFileID,
+			Total:   size,
+			OK:      false,
+			Err:     err.Error(),
+			GroupID: renderedGroupID,
+		})
+		return err
+	}
+	// Per-member success: emit a final progress tick +
+	// a 'done' event. Note: if 3 members are streaming
+	// concurrently, the GUI sees 3 'done' events in
+	// quick succession; markFileBubbleDone is idempotent
+	// (subsequent calls on an already-done bubble just
+	// re-write the same state). This matches the
+	// v1.1 "last-write-wins" simplification.
+	n.publishFileEvent(FileEvent{
+		Type:    FileEventProgress,
+		FileID:  baseFileID,
+		Sent:    size,
+		Total:   size,
+		GroupID: renderedGroupID,
+	})
+	n.publishFileEvent(FileEvent{
+		Type:    FileEventDone,
+		FileID:  baseFileID,
+		Total:   size,
+		OK:      true,
+		GroupID: renderedGroupID,
+	})
+	return nil
 }
 
 	// humanSize is defined in messages.go (same package)

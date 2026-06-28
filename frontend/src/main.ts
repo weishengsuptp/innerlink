@@ -62,6 +62,7 @@ import {
   SelfPeerID,
   SendFile,
   SendFilePath,
+  SendGroupFile,
   SendGroupMessage,
   SendText,
   SetMyAlias,
@@ -2043,6 +2044,7 @@ function wireEvents() {
       return;
     }
     const peerId = state.selectedId;
+    const isGroup = isGroupId(peerId);
 
     // 1. Native OS picker → path.
     //    Wails v2 only exposes the FIRST return value of a
@@ -2061,13 +2063,33 @@ function wireEvents() {
     }
 
     // 2. core opens the file + starts the transfer.
-    //    Returns a fileID we use as the bubble key AND
-    //    to match file:event progress.
-    const sendRes = await SendFilePath(peerId, path);
-    const fileID = sendRes.fileID;
-    if (!fileID) {
-      toast('发送失败: ' + (sendRes.err || 'unknown'), 'error');
-      return;
+    //    v1.1 (2026-06-28): dispatch on group vs 1:1.
+    //    Group sends broadcast per-member via SendGroupFile
+    //    and the returned baseFileID is what we use as
+    //    the bubble key (per-member fileIDs are derived
+    //    inside Go and not surfaced to the GUI's progress
+    //    stream — single bubble per logical send).
+    let baseFileID = '';
+    if (isGroup) {
+      baseFileID = crypto.randomUUID();
+      const sendRes = await SendGroupFile(peerId, path, baseFileID);
+      if (sendRes.err) {
+        toast('发送失败: ' + sendRes.err, 'error');
+        return;
+      }
+      if (sendRes.sent === 0) {
+        // No online members — file is still recorded in
+        // the chat log but nothing went out. Warn so the
+        // user understands why no live progress appears.
+        toast('群内没有在线成员，文件已记录在聊天中（Phase 5 后离线消息会送达）', 'error');
+      }
+    } else {
+      const sendRes = await SendFilePath(peerId, path);
+      baseFileID = sendRes.fileID;
+      if (!baseFileID) {
+        toast('发送失败: ' + (sendRes.err || 'unknown'), 'error');
+        return;
+      }
     }
 
     // 3. Placeholder bubble. Progress comes from
@@ -2078,8 +2100,8 @@ function wireEvents() {
     //    in hand the moment OpenFileDialog returns, no
     //    reason to gate the affordance on completion.
     const name = path.replace(/^.*[\\/]/, '');
-    state.fileBubbles.set(fileID, {
-      fileID, name,
+    state.fileBubbles.set(baseFileID, {
+      fileID: baseFileID, name,
       size: 0, // populated by first file:event 'progress'
       sent: 0, bps: 0,
       err: '',
@@ -2087,7 +2109,7 @@ function wireEvents() {
       localPath: path,
       startTime: Date.now(),
     });
-    appendFileBubble(fileID);
+    appendFileBubble(baseFileID);
     const el = document.getElementById('messages');
     if (el) el.scrollTop = el.scrollHeight;
   });
@@ -2364,25 +2386,44 @@ async function SendFileDragDrop(paths: string[]) {
     return;
   }
   if (!paths || paths.length === 0) return;
+  const isGroup = isGroupId(peerId);
   const list = document.getElementById('messages');
   for (const p of paths) {
     if (!p) continue;
     const name = p.replace(/^.*[\\/]/, '');
-    // Provisional fileID — replaced by the backend-
-    // returned ID once SendFile resolves. Until then
-    // we don't put the placeholder in state.fileBubbles
-    // (the file:event handler keys off the real fileID)
-    // so the file:event 'progress' / 'done' streams will
-    // only match once the real ID is wired in.
-    //
-    // SendFile is the modern Wails binding (Go returns
-    // SendFilePathResult); see app/app.go SendFile.
-    const r = await SendFile(peerId, p);
-    const fileID = r.fileID || '';
-    const err = r.err || '';
-    if (!fileID) {
-      toast(`发送失败: ${err || 'unknown'}`, 'error');
-      continue;
+    let fileID = '';
+    if (isGroup) {
+      // v1.1 (2026-06-28): GUI generates the baseFileID
+      // so the placeholder bubble can wire up before
+      // Go resolves. The Go side derives per-member
+      // fileIDs from this base by appending "_<shortHex>".
+      fileID = crypto.randomUUID();
+      const r = await SendGroupFile(peerId, p, fileID);
+      const err = r.err || '';
+      if (err) {
+        toast(`发送失败: ${err || 'unknown'}`, 'error');
+        continue;
+      }
+      if (r.sent === 0) {
+        toast('群内没有在线成员，文件已记录在聊天中', 'error');
+      }
+    } else {
+      // Provisional fileID — replaced by the backend-
+      // returned ID once SendFile resolves. Until then
+      // we don't put the placeholder in state.fileBubbles
+      // (the file:event handler keys off the real fileID)
+      // so the file:event 'progress' / 'done' streams will
+      // only match once the real ID is wired in.
+      //
+      // SendFile is the modern Wails binding (Go returns
+      // SendFilePathResult); see app/app.go SendFile.
+      const r = await SendFile(peerId, p);
+      fileID = r.fileID || '';
+      const err = r.err || '';
+      if (!fileID) {
+        toast(`发送失败: ${err || 'unknown'}`, 'error');
+        continue;
+      }
     }
     state.fileBubbles.set(fileID, {
       fileID,

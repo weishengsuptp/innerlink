@@ -123,6 +123,14 @@ type FileEvent struct {
 	BytesPerSec int64       `json:"bytesPerSec"`
 	OK        bool          `json:"ok"`
 	Err       string        `json:"err,omitempty"`
+	// GroupID (v1.1, 2026-06-28) is the rendered "g_<64hex>"
+	// when this event is for a group file transfer. Empty
+	// for 1:1 transfers (existing field-set). The frontend
+	// uses this to route the live-progress bubble to the
+	// right sidebar entry when the user has both a peer
+	// and a group open. omitempty keeps the wire shape
+	// unchanged for 1:1.
+	GroupID string `json:"groupID,omitempty"`
 }
 
 // SubscribeFiles returns a channel of file-transfer
