@@ -354,6 +354,33 @@ func (n *Node) AcceptGroupInvite(env protocol.Envelope, fromPeerID []byte) error
 		return fmt.Errorf("node: AcceptGroupInvite save: %w", err)
 	}
 	log.Printf("[GROUP ] accepted invite to %s (inviter=%s)", inv.GroupID, inviterHex)
+	// v1.1 (2026-06-29) hotfix: seed chat.enc so ListGroups
+	// (which filters by chat.enc existence in storage/group.go)
+	// returns this group on the receiver's sidebar. Without
+	// this seed, members.json alone isn't enough — the
+	// receiver's sidebar would refuse to show the group until
+	// the very first message arrives (AppendGroup creates
+	// chat.enc lazily on first write). The user-facing
+	// symptom: "I created a group, but it doesn't auto-appear
+	// on the invitee's side" — because the invitee sees no
+	// chat.enc, so the sidebar refresh post-GroupAdded
+	// returned an empty list. Mirrors CreateGroup's seed
+	// pattern (it appends the same "system" record for the
+	// same reason).
+	if err := n.chatStore.AppendGroup(inv.GroupID, &storage.Record{
+		Timestamp: now,
+		From:      selfHex,
+		To:        "",
+		Direction: "system",
+		Body:      "已加入群聊",
+		GroupID:   inv.GroupID,
+		MsgID:     "",
+	}); err != nil {
+		// Non-fatal: even without chat.enc, members.json +
+		// the group:event below still let the user access
+		// the group once a first message creates chat.enc.
+		log.Printf("[WARN  ] AcceptGroupInvite: seed chat.enc: %v", err)
+	}
 	// v1.1 (2026-06-28): notify the GUI a new group exists
 	// so the sidebar refreshes and the "你被拉进群 X"
 	// toast fires. InviterHex is the peer's 32-char hex
