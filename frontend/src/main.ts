@@ -277,6 +277,56 @@ function peerDisplay(p: node.PeerInfo): string {
   return p.SelfAlias || p.Hostname || '-';
 }
 
+// senderNameForRow returns the display name to show in the
+// history drawer's per-row "who said this?" position.
+// Differs from the per-pid conversation label: this is the
+// SENDER of each message, so:
+//   - outbound ("Direction == out"): "我", regardless of
+//     whether pid is a peer or a group.
+//   - 1:1 inbound: the OTHER party's display name (looked
+//     up from state.peers via pid).
+//   - group inbound: the actual member's display name,
+//     looked up from state.peers via m.SenderID (populated
+//     by HistoryGroup for reloaded records, by the live
+//     dispatcher for in-session messages).
+//
+// v1.1 (2026-06-28) hotfix: prior version computed the row
+// name from pid (group ID → "群 X") so every row in a group
+// — even ones I typed — showed "群 X" instead of "我". The
+// per-row sender is the correct granularity; the per-pid
+// conversation label is still preserved separately
+// (rows[*].convLabel) for context + click-to-scroll.
+//
+// Fallback policy: the unknown sender / unknown peer never
+// crashes the row; it shortens the hex peer ID so the user
+// can still tell rows apart even when the alias cache is
+// stale.
+function senderNameForRow(pid: string, m: node.Message): string {
+  if (m.Direction === 'out') {
+    return '我';
+  }
+  // inbound
+  if (isGroupId(pid)) {
+    // Group inbound: m.SenderID is the original member
+    // peer hex. If history was reloaded from disk,
+    // pkg/node.HistoryGroup populates it from
+    // storage.Record.From (see groups.go). Live dispatch
+    // also sets it. If empty (corrupted record /
+    // pre-fix message), fall back to "(未知成员)".
+    if (m.SenderID) {
+      const senderInfo = state.peers.find(p => p.PeerID === m.SenderID);
+      if (senderInfo) return peerDisplay(senderInfo);
+      return shortId(m.SenderID);
+    }
+    return '(未知成员)';
+  }
+  // 1:1 inbound: the sender IS the conversation partner.
+  // pid is already the peer's hex.
+  const peerInfo = state.peers.find(p => p.PeerID === pid);
+  if (peerInfo) return peerDisplay(peerInfo);
+  return shortId(pid);
+}
+
 function selectedPeer(): node.PeerInfo | null {
   if (!state.selectedId) return null;
   if (isGroupId(state.selectedId)) return null;
@@ -1545,32 +1595,44 @@ function renderHistoryList() {
   // Aggregate every message across every peer in state.
   // Sort newest first (timestamps are RFC3339 strings;
   // Date(...) is monotonic enough for a chat list).
-  type Row = { peer: string; peerName: string; msg: node.Message };
+  type Row = { peer: string; peerName: string; msg: node.Message; convLabel: string };
   const rows: Row[] = [];
+  // Compute the conversation label ONCE per pid (only used
+  // for the row's `data-peer` routing and search hit on the
+  // conversation name — NOT as the per-row display name).
+  // v1.1 (2026-06-28) hotfix: peerName for a row is the
+  // SENDER, not the conversation. Previously we computed
+  // peerName per pid (group ID → "群 X") and stamped it on
+  // every row, which made every group message — even ones
+  // I typed — render as "群 X" instead of "我". This is
+  // wrong: the drawer is asking "who said this?" per row,
+  // not "which conversation is this?". For 1:1 chats this
+  // incidentally happened to be the same value (outbound
+  // shows "我", inbound shows the other party's name); for
+  // groups the conversation routing was drowning out the
+  // actual sender identity (Alice's message and my message
+  // both → "群 X"). Per-row peerName is correct for both.
   for (const [pid, msgs] of state.history) {
     if (!msgs) continue;
-    // v1.1 (2026-06-28) hotfix: peerName for a group
-    // (PeerID starts with "g_") is the group name, not
-    // a peer alias. Look up state.groups; fall back to
-    // "(未知群)" if the group isn't loaded yet (e.g.
-    // drawer opened before refreshAll finished).
-    let peerName: string;
+    let convLabel: string;
     if (isGroupId(pid)) {
       const g = state.groups.find(gg => gg.group_id === pid);
-      peerName = g ? `群 ${g.group_name}` : '(未知群)';
+      convLabel = g ? `群 ${g.group_name}` : '(未知群)';
     } else if (pid === state.selfId) {
-      peerName = '我';
+      convLabel = '我';
     } else {
       const peerInfo = state.peers.find(p => p.PeerID === pid);
-      peerName = peerInfo ? peerDisplay(peerInfo) : shortId(pid);
+      convLabel = peerInfo ? peerDisplay(peerInfo) : shortId(pid);
     }
     for (const m of msgs) {
+      const peerName = senderNameForRow(pid, m);
       if (q) {
         const bodyHit = (m.Body || '').toLowerCase().includes(q);
         const peerHit = peerName.toLowerCase().includes(q);
-        if (!bodyHit && !peerHit) continue;
+        const convHit = convLabel.toLowerCase().includes(q);
+        if (!bodyHit && !peerHit && !convHit) continue;
       }
-      rows.push({ peer: pid, peerName, msg: m });
+      rows.push({ peer: pid, peerName, msg: m, convLabel });
     }
   }
   rows.sort((a, b) => {
@@ -1622,6 +1684,7 @@ function renderHistoryList() {
            data-dir="${escapeHtml(r.msg.Direction || '')}">
         <div class="history-item-meta">
           <span class="history-item-peer ${isSelf ? 'self' : ''}">${escapeHtml(r.peerName)}</span>
+          <span class="history-item-conv">${escapeHtml(r.convLabel)}</span>
           <span>${fmtTime(r.msg.Timestamp)}</span>
         </div>
         <div class="history-item-body">${bodyHtml}</div>

@@ -109,20 +109,15 @@ func (n *Node) CreateGroup(name string, memberPeerIDs []string) (*GroupInfo, err
 	rawID := group.ComputeGroupID(creator, name, now)
 	rendered := group.RenderGroupID(rawID)
 
-	// Build members.json — creator first, then invitees
-	// (sorted by joinedAt to match the on-disk stability
-	// invariant from pkg/group).
+	// Build members.json with ONLY the creator. Invitees
+	// are added by CreatorOnAccept when each invitee
+	// actually accepts — pre-listing them here would make
+	// InviteToGroup's `m.Contains(invitee)` check
+	// (groups.go) return true and reject the freshly-added
+	// invitee with "invitee already a member". The
+	// proper "joined" moment is when the accept arrives.
 	members := []group.Member{
 		{PeerID: selfHex, Alias: n.GetSelfAlias(), JoinedAt: now, IsCreator: true},
-	}
-	// Invitees get their own JoinedAt = creator's now (they
-	// haven't actually joined yet — InviteToGroup will add
-	// the canonical JoinedAt when they accept).
-	for _, pid := range memberPeerIDs {
-		if pid == "" || pid == selfHex {
-			continue // skip self + empty
-		}
-		members = append(members, group.Member{PeerID: pid, JoinedAt: now})
 	}
 	m := &group.Members{
 		GroupID:   rendered,
@@ -564,8 +559,25 @@ func (n *Node) HistoryGroup(renderedID string) ([]Message, error) {
 	}
 	out := make([]Message, 0, len(recs))
 	for _, r := range recs {
+		// v1.1 (2026-06-28) hotfix: populate SenderID from
+		// the record's From so the history drawer can
+		// render the actual member name per row instead
+		// of falling back to the conversation group name.
+		// Without this, every group message reloaded from
+		// disk has empty SenderID, and the drawer's
+		// per-row sender lookup hits the fallback path
+		// → "(未知成员)" for inbound or "我" for outbound
+		// (fine) but loses the per-member distinction.
+		// Outbound records have From = selfHex too, so we
+		// gate by Direction — only inbound messages are
+		// not self-typed, hence only those need SenderID.
+		var senderID string
+		if r.Direction == "in" {
+			senderID = r.From
+		}
 		out = append(out, Message{
 			PeerID:    renderedID,
+			SenderID:  senderID,
 			Body:      r.Body,
 			Timestamp: r.Timestamp,
 			Direction: r.Direction,

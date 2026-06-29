@@ -799,6 +799,18 @@ body {
 .history-item-peer.self {
   color: var(--primary);
 }
+/* Conversation label (which group / which 1:1 partner
+   this row's pid points at). v1.1 (2026-06-28): the
+   per-row display name is the SENDER (peerName); the
+   conversation label is shown muted so the drawer can
+   still answer "which chat was this in?" without making
+   it the row title the way the old layout did. */
+.history-item-conv {
+  margin-left: 8px;
+  color: var(--muted);
+  font-weight: 400;
+  font-size: 11px;
+}
 .history-item-body {
   font-size: 13px;
   color: var(--text);
