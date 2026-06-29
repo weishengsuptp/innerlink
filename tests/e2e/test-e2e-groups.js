@@ -245,6 +245,51 @@ at(16000, async () => {
   console.log('  (CLI rename not yet wired — covered by Go unit tests)');
 }, 'A: rename (TODO: CLI command)');
 
+// G4: best-effort dial for VM-to-VM (no direct channel)
+// pre-fix bug: VM-B sends a message; VM-C has no channel
+// to VM-B (they dialed A only); the broadcast loop in
+// SendGroupMessage drops silently. Post-fix (v1.1.1,
+// 2026-06-30): it fires a best-effort dialAddr() in
+// the background. The CURRENT message still drops,
+// but the NEXT message after dial completes goes
+// through.
+//
+// Setup: B and C dialed A only (per DISCOVERY at T+2500).
+// No direct B-C channel. C sends a message; we verify:
+//   1. C's log shows "firing best-effort dial" for B
+//   2. A receives the first message immediately
+//   3. B drops the first message (logged)
+//   4. After waiting for dial (~2 s), C sends another
+//      message and B picks it up.
+at(17000, async () => {
+  console.log('\n=== G4: best-effort dial for VM-to-VM group broadcast ===');
+  // First message — expect B to NOT have it (no channel yet).
+  send('C', `group send ${createdGroupID} g4-first`);
+  await sleep(1500);
+  // Second message after the dial should have completed.
+  send('C', `group send ${createdGroupID} g4-second`);
+  await sleep(2500);
+
+  const cLog = fs.readFileSync(path.join(ROOT, 'c.log'), 'utf8');
+  const aLog = fs.readFileSync(path.join(ROOT, 'a.log'), 'utf8');
+  const bLog = fs.readFileSync(path.join(ROOT, 'b.log'), 'utf8');
+
+  assert(/firing best-effort dial/.test(cLog),
+    'C log shows best-effort dial fired for offline peer');
+  // A should have received BOTH messages (it always has a channel).
+  assert(/\[MSG  \] in  <[^>]+> g4-first/.test(aLog),
+    'A received g4-first on first send');
+  assert(/\[MSG  \] in  <[^>]+> g4-second/.test(aLog),
+    'A received g4-second on second send');
+  // B's first message must have been dropped (no channel yet at that moment).
+  // We check by absence of an inbound log line for g4-first.
+  const bHasFirst = /\[MSG  \] in  <[^>]+> g4-first/.test(bLog);
+  assert(!bHasFirst, 'B did NOT receive g4-first (no channel yet) — pre-fix bug dropped silently without firing dial; post-fix fires the dial but this specific message still drops');
+  // After the dial fired + completed, B should have g4-second.
+  assert(/\[MSG  \] in  <[^>]+> g4-second/.test(bLog),
+    'B DID receive g4-second after the dial completed (best-effort dial worked)');
+}, 'best-effort VM-to-VM dial');
+
 at(20000, async () => {
   console.log('\n=== FINAL ===');
   if (failures > 0) {
