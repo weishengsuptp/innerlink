@@ -561,7 +561,7 @@ func (n *Node) SendGroupMessage(rawGroupID []byte, text string) error {
 		Timestamp: now, Direction: "out",
 	})
 
-	// Build the envelope ONCE, send to every online member.
+	// Build the envelope ONCE, send to every member.
 	// Per-member sends share the same envelope bytes — the
 	// only thing that differs is the Channel (different
 	// session keys per peer).
@@ -571,6 +571,7 @@ func (n *Node) SendGroupMessage(rawGroupID []byte, text string) error {
 		Payload: []byte(text),
 	}
 	delivered := 0
+	skippedOffline := 0
 	for _, mem := range m.Members {
 		if mem.PeerID == selfHex {
 			continue // skip self
@@ -582,10 +583,29 @@ func (n *Node) SendGroupMessage(rawGroupID []byte, text string) error {
 		}
 		st := n.channels.get(pid)
 		if st == nil {
-			// Member offline — drop this copy. They'd
-			// pick up the chat.enc via outbox replay
-			// (phase 5). For v1.1 group, offline
-			// messages are silently dropped.
+			// Member offline (no active TCP channel).
+			// Pre-fix: dropped silently. Post-fix
+			// (v1.1.1, 2026-06-30): if the roster has
+			// an Addrs[] entry for this peer, fire a
+			// best-effort dialAddr() in the background
+			// so the NEXT message reaches them. The
+			// CURRENT message still drops here — we
+			// don't wait for the dial (it could take
+			// 100 ms to 5 s depending on network).
+			// This is the fix for "VM-to-VM group
+			// messages don't cross" — on different
+			// subnets the VMs never directly dial
+			// each other, only A. Without this, a
+			// broadcast sent by VM-B to anyone other
+			// than A silently drops.
+			if entry, eerr := n.rosterStore.Get(mem.PeerID); eerr == nil && entry.Addrs != nil && len(entry.Addrs) > 0 {
+				addr := entry.Addrs[0]
+				log.Printf("[GROUP ] no channel to %s @ %s, firing best-effort dial for NEXT message", mem.PeerID, addr)
+				n.dialAddr(addr)
+			} else {
+				log.Printf("[GROUP ] no channel to %s and no roster addr (member offline / unknown IP), message drops", mem.PeerID)
+			}
+			skippedOffline++
 			continue
 		}
 		if err := st.ch.Send(n.ctx, env); err != nil {
@@ -594,7 +614,8 @@ func (n *Node) SendGroupMessage(rawGroupID []byte, text string) error {
 		}
 		delivered++
 	}
-	log.Printf("[GROUP ] sent to %s: %d/%d delivered (out)", rendered, delivered, len(m.Members)-1)
+	log.Printf("[GROUP ] sent to %s: %d/%d delivered, %d dropped (offline, dial fired) (out)",
+		rendered, delivered, len(m.Members)-1, skippedOffline)
 	return nil
 }
 

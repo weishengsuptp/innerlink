@@ -167,6 +167,48 @@ function senderDisplay(hex: string): string {
   return p ? peerDisplay(p) : '';
 }
 
+// senderLabelWithDisambig returns the label to show above a
+// group-message bubble, with a peerID-prefix suffix when
+// the candidate name collides with another member of the
+// same group. Without the suffix, two peers both named
+// "<vm-clone-host>" (a common VM-clone hostname) render
+// indistinguishably in the chat — user feedback
+// 2026-06-30. We prefix only when there's actual
+// ambiguity; for unique aliases / hostnames the suffix
+// would be noise.
+//
+// contextHex is the rendered GroupID ("g_<64hex>") we're
+// rendering the bubble inside. groupPeers is the optional
+// list of member peer hexes for that group (pass it from
+// renderMessages which already has m.SenderID context).
+// Falls back to "·<shortId>" when sender can't be
+// resolved at all.
+function senderLabelWithDisambig(hex: string, contextHex: string): string {
+  const base = senderDisplay(hex);
+  if (!base) return hex ? shortId(hex) : '';
+  // Find this group's other members. We look up via
+  // state.groups by rendered ID and pluck its members
+  // array (string peer hexes, not PeerInfo — so we
+  // compare by name equivalence on the union of known
+  // peer display names + own selfId).
+  const g = state.groups.find(gg => gg.group_id === contextHex);
+  if (!g) return base;
+  const members = g.members || [];
+  if (!members.includes(hex)) return base;
+  // Count how many of my group peers would resolve to
+  // base. If it's just me, no collision; if ≥2, suffix.
+  let n = 0;
+  for (const m of members) {
+    if (m === state.selfId) {
+      if (senderDisplay(state.selfId) === base) n++;
+    } else if (senderDisplay(m) === base) {
+      n++;
+    }
+  }
+  if (n < 2) return base;
+  return `${base}·${shortId(hex)}`;
+}
+
 // ----- small helpers -----
 function shortId(id: string): string {
   return id ? id.slice(0, 8) : '';
@@ -665,9 +707,17 @@ function renderGroupList() {
   });
   list.innerHTML = sorted.map(g => {
     const unread = state.groupUnread.get(g.group_id) || 0;
+    // "X 在线" 数字包含 self —— 因为 self 永远在群里（这是 sidebar
+    // 列出这个群的前提 = g.self === true），把 self 排除会让
+    // 用户看着"群主本人不在线?"——其实他只是在看自己的视角，
+    // 当然在。self 用 state.selfEntry 的设备级状态判断在线
+    // （UDP 监听中 + 至少一个 IP；这跟 self header 那边的
+    // 判定一致，避免两个地方写两套逻辑）。
+    // v1.1.1 (2026-06-30) hotfix.
+    const selfOnline = (state.selfEntry?.Addrs?.length ?? 0) > 0;
     const onlineCount = g.members.filter(m =>
-      m !== state.selfId &&
-      state.peers.some(p => p.PeerID === m && p.Online)
+      (m === state.selfId && selfOnline) ||
+      (m !== state.selfId && state.peers.some(p => p.PeerID === m && p.Online))
     ).length;
     const memberLabel = `${g.members.length} 成员`;
     const onlineLabel = onlineCount > 0 ? ` · ${onlineCount} 在线` : '';
@@ -1041,11 +1091,17 @@ function renderMessage(m: node.Message, peerId: string): string {
   let avChar = isOut ? '我' : avatarChar(peer ? peerDisplay(peer) : '');
   let senderLabel = '';
   if (isGroup && !isOut) {
-    const senderName = senderDisplay(m.SenderID || '');
-    avChar = avatarChar(senderName || shortId(m.SenderID || ''));
-    // Sender label above the bubble — "Alice" line so the
-    // eye knows who's talking. Empty if sender is unknown
-    // (member we haven't seen online yet).
+    // v1.1.1 (2026-06-30): use the disambiguating label
+    // when sender's display name collides with another
+    // group member (e.g. two VMs both named
+    // "<vm-clone-host>"). Without the suffix, two
+    // distinct senders render identically — user
+    // feedback 2026-06-30 "群主这里显示是一个样".
+    const senderName = senderLabelWithDisambig(m.SenderID || '', peerId);
+    // Resolve the BaseName (no shortId) for the avatar
+    // glyph so the "DE" / "Alice" character matches what
+    // other parts of the UI use.
+    avChar = avatarChar(senderDisplay(m.SenderID || '') || shortId(m.SenderID || ''));
     senderLabel = senderName;
   }
 
