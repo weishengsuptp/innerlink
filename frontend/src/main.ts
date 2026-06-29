@@ -1498,6 +1498,27 @@ async function onGroupEvent(ev: any) {
     }
     return;
   }
+  // v1.1.1 (2026-06-29): "updated" fires when an existing
+  // group's roster or metadata changed on disk. Triggered
+  // by CreatorOnAccept (creator's own GUI refresh), by
+  // ApplyRosterUpdate / ApplyMetaUpdate (a peer received
+  // a sync envelope from the creator), and by SetGroupName
+  // / SetGroupRemark (creator edited name / remark and
+  // wants their own sidebar to refresh). The flow is the
+  // same as "added": ListGroups already re-ran above, so
+  // we just need to re-render the chat header if this is
+  // the open conversation + refresh the settings panel if
+  // it's open. Skip the "你被拉进群" toast — only "added"
+  // gets that (an updated event isn't a new group, just
+  // a roster / meta change).
+  if (ev.Type === 'updated') {
+    if (state.selectedId === ev.GroupID) {
+      renderChatHeader();
+    }
+    // v1.1.1: live-update the settings panel if open.
+    refreshGroupSettingsIfOpen();
+    return;
+  }
   if (ev.Type !== 'added') return;
   // InviterHex set ⇒ someone invited us; the toast is
   // the only place we show "who pulled me in" since the
@@ -1516,12 +1537,9 @@ async function onGroupEvent(ev: any) {
   if (state.selectedId === ev.GroupID) {
     renderChatHeader();
   }
-  // v1.1.1 (2026-06-29): if the settings panel for this
-  // group is currently open, refresh its in-place content
-  // so roster changes (a new joiner arriving via the
-  // TypeGroupRosterUpdate envelope) are reflected
-  // immediately. Cheap (one ListGroupMembers RPC + a
-  // re-render).
+  // v1.1.1 (2026-06-29): "added" (someone invited us) also
+  // opens the settings panel if it's already open — a fresh
+  // group arriving means the member list is brand new.
   refreshGroupSettingsIfOpen();
 }
 

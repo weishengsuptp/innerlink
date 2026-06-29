@@ -9,7 +9,7 @@
 package node
 
 // GroupEventType enumerates the kinds of transitions
-// delivered on SubscribeGroups. Two for now; expand
+// delivered on SubscribeGroups. Three for now; expand
 // when SenderKeys distribution adds membership /
 // re-key / dissolve events.
 type GroupEventType string
@@ -25,6 +25,24 @@ const (
 	// so the sidebar is always in sync without having to
 	// embed the full GroupInfo in the event payload.
 	GroupAdded GroupEventType = "added"
+	// GroupUpdated fires when an EXISTING group's roster
+	// or metadata changed on our local disk:
+	//   - CreatorOnAccept added a new joiner
+	//   - ApplyRosterUpdate replaced our local roster
+	//     with the creator's broadcast
+	//   - ApplyMetaUpdate applied a name/remark edit
+	//   - SetGroupName / SetGroupRemark wrote the change
+	//     locally (so the creator's own sidebar refreshes
+	//     without waiting for an external envelope)
+	// The frontend reloads ListGroups + ListGroupMembers
+	// on every GroupUpdated so the sidebar count + member
+	// list stay in sync. v1.1.1 (2026-06-29). Without this
+	// event, the creator's sidebar would freeze at
+	// "1 成员" (the moment-of-creation state) forever —
+	// the AddMember inside CreatorOnAccept updates
+	// members.json on disk but never tells the frontend
+	// to re-read GroupInfo.
+	GroupUpdated GroupEventType = "updated"
 	// GroupRemoved fires when our local copy of a group
 	// is deleted. Currently only LeaveGroup produces this
 	// (creator-dissolve is not yet a GUI option).
