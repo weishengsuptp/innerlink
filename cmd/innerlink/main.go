@@ -144,7 +144,7 @@ func runREPL(nd *node.Node) {
 			printPrompt()
 			continue
 		}
-		parts := strings.SplitN(line, " ", 3)
+		parts := strings.Split(line, " ")
 		cmd := parts[0]
 		replDispatch(nd, cmd, line, parts)
 		printPrompt()

@@ -484,17 +484,13 @@ func (n *Node) CreatorOnAccept(env protocol.Envelope, fromPeerID []byte) error {
 	}
 	log.Printf("[GROUP ] %s accepted invite to %s; roster updated", accepterHex, ap.GroupID)
 	// v1.1.1 (2026-06-29): broadcast the updated roster to
-	// every other member so they refresh their local
-	// members.json. Without this, non-creator members only
-	// learn about new joiners when the next group message
-	// arrives (and even then, only the from-line shows the
-	// sender — their own members.json stays stale, which
-	// surfaces as "group shows N members on this peer but
-	// N+1 on the creator"). Best-effort: a failed broadcast
-	// to one peer doesn't roll back the accept — that peer
-	// just stays stale until the next roster-changing event
-	// (or they re-fetch via a future API).
-	n.broadcastRosterUpdate(m, accepterHex)
+	// every member (including the just-joined accepter —
+	// they only know [creator, self] from AcceptGroupInvite
+	// and need the full roster too). Best-effort: a failed
+	// broadcast to one peer doesn't roll back the accept —
+	// that peer just stays stale until the next roster-
+	// changing event.
+	n.broadcastRosterUpdate(m)
 	// v1.1.1 (2026-06-29): also tell the creator's own
 	// GUI to re-read the roster — the broadcast above
 	// doesn't include self (self already has the latest
@@ -1051,13 +1047,22 @@ type metaPayload struct {
 }
 
 // broadcastRosterUpdate sends the current roster to every
-// existing member (except `excludePeerID`, which is the
-// joiner that just got added and already has the new state
-// from AcceptGroupInvite). Best-effort: a failed send to
-// one peer doesn't fail the whole broadcast — that peer
-// just stays stale until the next roster-changing event.
-// v1.1.1 (2026-06-29).
-func (n *Node) broadcastRosterUpdate(m *group.Members, excludePeerID string) {
+// member in m.Members. Best-effort: a failed send to one
+// peer doesn't fail the whole broadcast — that peer just
+// stays stale until the next roster-changing event.
+//
+// v1.1.1 (2026-06-29) hotfix: this used to take an
+// `excludePeerID` parameter that skipped the joiner (the
+// peer that just sent TypeGroupInviteAccept). That was
+// wrong — the joiner only knows [creator, self] from
+// AcceptGroupInvite, not the full roster, so excluding
+// them left them permanently out of date about any
+// OTHER members. Removed the parameter: every member
+// (including the joiner) needs the roster so their
+// local members.json matches the canonical one.
+// Best-effort / idempotent — receiving a roster update
+// that's identical to your local state is a no-op.
+func (n *Node) broadcastRosterUpdate(m *group.Members) {
 	if n.channels == nil {
 		return
 	}
@@ -1079,10 +1084,12 @@ func (n *Node) broadcastRosterUpdate(m *group.Members, excludePeerID string) {
 	}
 	delivered := 0
 	for _, mem := range m.Members {
-		if mem.PeerID == excludePeerID {
-			continue
-		}
 		if n.id != nil && mem.PeerID == n.id.PeerIDHex() {
+			// Skip self — self just wrote the same data
+			// to its own members.json in the caller's
+			// Save() right before calling us. The
+			// GroupUpdated event fired alongside takes
+			// care of refreshing the local frontend.
 			continue
 		}
 		pid, err := hexToBytes(mem.PeerID)
@@ -1108,8 +1115,8 @@ func (n *Node) broadcastRosterUpdate(m *group.Members, excludePeerID string) {
 		}
 		delivered++
 	}
-	log.Printf("[GROUP ] roster update broadcast to %d/%d members (exclude=%s)",
-		delivered, len(m.Members)-1, excludePeerID)
+	log.Printf("[GROUP ] roster update broadcast to %d/%d members",
+		delivered, len(m.Members)-1)
 }
 
 // broadcastMetaUpdate sends an updated name + remark to

@@ -75,7 +75,16 @@ func cmdSend(nd *node.Node, parts []string) {
 		log.Println("[ERROR] send: peer ref is empty (got: send <empty> <text>)")
 		return
 	}
-	if err := nd.SendText(parts[1], parts[2]); err != nil {
+	// parts[2:] is the message body — re-join with single
+	// spaces so multi-word text (`send alice hello world
+	// how are you`) sends as one string. The REPL splits
+	// on whitespace, so we have to undo that here.
+	body := strings.TrimSpace(strings.Join(parts[2:], " "))
+	if body == "" {
+		log.Println("[ERROR] send: text is empty")
+		return
+	}
+	if err := nd.SendText(parts[1], body); err != nil {
 		log.Printf("[ERROR] %v", err)
 	}
 }
