@@ -870,6 +870,28 @@ func (n *Node) wrapChannel(conn *transport.Conn, sess *handshake.Session) {
 				log.Printf("[GROUP ] decline from %s (invite was declined)", peerHexStr)
 				// TODO: notify the user via the GUI; for
 				// now we just log.
+			case protocol.TypeGroupRosterUpdate:
+				// v1.1.1 (2026-06-29): creator (or any
+				// future roster-sync authority) broadcasts
+				// the updated members.json to every existing
+				// member when membership changes. Replace
+				// our local members.json wholesale so the
+				// sidebar + settings panel show the same
+				// roster on every peer.
+				log.Printf("[GROUP ] roster update from %s", peerHexStr)
+				if err := n.ApplyRosterUpdate(env, sess.RemotePeerID); err != nil {
+					log.Printf("[ERROR] ApplyRosterUpdate: %v", err)
+				}
+			case protocol.TypeGroupMetaUpdate:
+				// v1.1.1 (2026-06-29): same idea as
+				// roster update but for editable metadata
+				// (name, remark). Sent on a SetGroupName /
+				// SetGroupRemark so all peers see the new
+				// name without having to re-fetch.
+				log.Printf("[GROUP ] meta update from %s", peerHexStr)
+				if err := n.ApplyMetaUpdate(env, sess.RemotePeerID); err != nil {
+					log.Printf("[ERROR] ApplyMetaUpdate: %v", err)
+				}
 			default:
 				// File traffic + anything else: hand off
 				// to the file receiver. Handle() is also

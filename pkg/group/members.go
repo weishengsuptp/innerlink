@@ -38,7 +38,15 @@ type Members struct {
 	GroupName string    `json:"group_name"`
 	Creator   string    `json:"creator"`    // creator's peerID (also in Members[0])
 	CreatedAt time.Time `json:"created_at"`
-	Members   []Member  `json:"members"`
+	// Remark is the group's user-editable note / announcement
+	// (WeChat-style "群公告"-ish). Optional; "" means unset.
+	// v1.1.1 (2026-06-29). Mirrored across all members via
+	// TypeGroupMetaUpdate; receivers update their local
+	// members.json so the sidebar + settings panel show the
+	// same value across peers. Old files without this field
+	// unmarshal to "" (json default).
+	Remark   string   `json:"remark,omitempty"`
+	Members  []Member `json:"members"`
 }
 
 // membersFileName is exported as a constant so tests and storage
