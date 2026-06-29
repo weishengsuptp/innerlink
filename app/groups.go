@@ -224,3 +224,70 @@ func (a *App) SendGroupFile(renderedID, filePath, baseFileID string) SendGroupFi
 		Sent:    len(delivered),
 	}
 }
+
+// SetGroupNameResult is the success-or-error envelope for
+// SetGroupName / SetGroupRemark — the updated GroupInfo is
+// returned so the GUI can refresh its local cache without
+// a follow-up GetGroup call. v1.1.1 (2026-06-29).
+type SetGroupNameResult struct {
+	GroupInfo node.GroupInfo `json:"group_info"`
+	Err       string         `json:"err"`
+}
+
+// SetGroupRemarkResult reuses SetGroupNameResult — both
+// edits return the same shape (updated GroupInfo).
+type SetGroupRemarkResult = SetGroupNameResult
+
+// SetGroupName updates the group's display name. Only the
+// creator may rename (v1.1.1). The change is broadcast to
+// every other member via TypeGroupMetaUpdate. v1.1.1
+// (2026-06-29).
+func (a *App) SetGroupName(renderedID, name string) SetGroupNameResult {
+	if a.nd == nil {
+		return SetGroupNameResult{Err: "node not started"}
+	}
+	info, err := a.nd.SetGroupName(renderedID, strings.TrimSpace(name))
+	if err != nil {
+		return SetGroupNameResult{Err: err.Error()}
+	}
+	return SetGroupNameResult{GroupInfo: *info}
+}
+
+// SetGroupRemark updates the group's editable remark /
+// notice. Only the creator may edit (v1.1.1). The change
+// is broadcast to every other member. v1.1.1 (2026-06-29).
+func (a *App) SetGroupRemark(renderedID, remark string) SetGroupRemarkResult {
+	if a.nd == nil {
+		return SetGroupRemarkResult{Err: "node not started"}
+	}
+	info, err := a.nd.SetGroupRemark(renderedID, remark)
+	if err != nil {
+		return SetGroupRemarkResult{Err: err.Error()}
+	}
+	return SetGroupRemarkResult{GroupInfo: *info}
+}
+
+// ListGroupMembersResult wraps the per-member detail slice
+// for the settings panel's member list. v1.1.1 (2026-06-29).
+type ListGroupMembersResult struct {
+	Members []node.GroupMemberDetail `json:"members"`
+	Err     string                   `json:"err"`
+}
+
+// ListGroupMembers returns every member of a group with
+// alias / joined_at / is_creator / self flags. Reads from
+// local members.json (kept in sync via TypeGroupRosterUpdate
+// for non-creator peers). v1.1.1 (2026-06-29).
+func (a *App) ListGroupMembers(renderedID string) ListGroupMembersResult {
+	if a.nd == nil {
+		return ListGroupMembersResult{Err: "node not started"}
+	}
+	members, err := a.nd.ListGroupMembers(renderedID)
+	if err != nil {
+		return ListGroupMembersResult{Err: err.Error()}
+	}
+	if members == nil {
+		members = []node.GroupMemberDetail{}
+	}
+	return ListGroupMembersResult{Members: members}
+}

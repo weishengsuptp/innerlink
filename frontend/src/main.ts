@@ -51,6 +51,7 @@ import {
   HistoryGroup,
   InviteToGroup,
   LeaveGroup,
+  ListGroupMembers,
   ListGroups,
   ListPeers,
   OpenPath,
@@ -65,6 +66,8 @@ import {
   SendGroupFile,
   SendGroupMessage,
   SendText,
+  SetGroupName,
+  SetGroupRemark,
   SetMyAlias,
 } from '../wailsjs/go/app/App';
 import { EventsOn, OnFileDrop } from '../wailsjs/runtime/runtime';
@@ -417,6 +420,14 @@ function mount() {
             <button class="icon-btn" id="btn-dial" title="发文件" disabled>
               <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="m21.44 11.05-9.19 9.19a6 6 0 0 1-8.49-8.49l9.19-9.19a4 4 0 0 1 5.66 5.66l-9.2 9.19a2 2 0 0 1-2.83-2.83l8.49-8.48"/></svg>
             </button>
+            <!-- v1.1.1 (2026-06-29): group settings button.
+                 Only enabled when the selected conversation
+                 is a group (WeChat-style ⋯ → 群设置 panel).
+                 For 1:1 chats the button stays disabled —
+                 per-peer settings aren't a feature yet. -->
+            <button class="icon-btn" id="btn-group-settings" title="群设置" disabled>
+              <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2"><circle cx="12" cy="5" r="1.5"/><circle cx="12" cy="12" r="1.5"/><circle cx="12" cy="19" r="1.5"/></svg>
+            </button>
             <!-- "more" (⋮) button removed v1.1 — its only
                  action was "clear chat history", which
                  the user downprioritized. The history
@@ -512,6 +523,25 @@ function mount() {
         </div>
       </div>
     </div>
+    <!-- Group settings panel (v1.1.1, 2026-06-29). Right-side
+         drawer, opened by the ⋯ button in the chat header
+         when a group is selected. WeChat-style: 群名 + 群
+         公告 / 备注 + 成员列表. Editable fields are gated
+         to the creator (mirrors the Go-side SetGroupName /
+         SetGroupRemark which already reject non-creator
+         edits). -->
+    <aside class="drawer group-settings-drawer" id="group-settings-drawer" aria-hidden="true">
+      <div class="drawer-header">
+        <div class="drawer-title">群设置</div>
+        <button class="icon-btn" id="btn-group-settings-close" title="关闭">
+          <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M18 6L6 18"/><path d="M6 6l12 12"/></svg>
+        </button>
+      </div>
+      <div class="group-settings-body" id="group-settings-body">
+        <!-- populated by openGroupSettings(): name field,
+             remark textarea, member list, etc. -->
+      </div>
+    </aside>
     <div class="toast" id="toast"></div>
   `;
 }
@@ -674,6 +704,12 @@ function renderChatHeader() {
   // v1.1: btn-more removed — history lives in composer
   // toolbar now (📜 button + drawer).
   const attachBtn = document.getElementById('btn-attach') as HTMLButtonElement;
+  // v1.1.1 (2026-06-29): group settings (⋯) button.
+  // Enabled only when the selected conversation is a
+  // group. For 1:1 it stays disabled — no per-peer
+  // settings panel exists yet (out of scope for this
+  // iteration).
+  const groupSetBtn = document.getElementById('btn-group-settings') as HTMLButtonElement;
   const input = document.getElementById('composer-input') as HTMLTextAreaElement;
   const send = document.getElementById('composer-send') as HTMLButtonElement;
 
@@ -689,6 +725,13 @@ function renderChatHeader() {
     // member channels handled internally by the Go side).
     pingBtn.disabled = true;
     dialBtn.disabled = true;
+    // v1.1.1: enable group settings when we're in a
+    // group conversation. WeChat-style ⋯ → 群设置
+    // panel. Disabled for "g_<id> not in state.groups"
+    // edge cases (e.g. a roster update arrives that we
+    // haven't refreshed yet) — the click handler below
+    // re-checks state.groups before opening.
+    groupSetBtn.disabled = false;
     // Composer: enabled only when self=true. Receiving
     // a message in a group we're not a member of
     // shouldn't be writable from the GUI; we'd have to
@@ -712,6 +755,7 @@ function renderChatHeader() {
     attachBtn.disabled = true;
     input.disabled = true;
     send.disabled = true;
+    groupSetBtn.disabled = true;
     input.placeholder = '先选一个 peer…';
     return;
   }
@@ -734,6 +778,9 @@ function renderChatHeader() {
   attachBtn.disabled = false;
   input.disabled = false;
   send.disabled = false;
+  // v1.1.1: group settings (⋯) button is for groups only.
+  // 1:1 chats don't have a settings panel yet.
+  groupSetBtn.disabled = true;
   input.placeholder = `发到 ${peerDisplay(p)}…（Enter 发送，Shift+Enter 换行）`;
 }
 
@@ -1469,6 +1516,13 @@ async function onGroupEvent(ev: any) {
   if (state.selectedId === ev.GroupID) {
     renderChatHeader();
   }
+  // v1.1.1 (2026-06-29): if the settings panel for this
+  // group is currently open, refresh its in-place content
+  // so roster changes (a new joiner arriving via the
+  // TypeGroupRosterUpdate envelope) are reflected
+  // immediately. Cheap (one ListGroupMembers RPC + a
+  // re-render).
+  refreshGroupSettingsIfOpen();
 }
 
 async function promptMyAlias() {
@@ -1505,6 +1559,248 @@ async function promptDial() {
     const r = await DialAddr(p.Addrs[0]);
     if (r) toast(`连接: ${r}`);
   }
+}
+
+// ----- group settings panel (v1.1.1, 2026-06-29) -----
+//
+// WeChat-style right-side drawer. Opened by the ⋯ button
+// in the chat header when a group is selected. Three
+// sections:
+//   1. 群名称 — input + save. Editable only by the creator
+//      (Go-side enforces this; we hide the save button
+//      for non-creators but show the read-only value).
+//   2. 群备注 / 公告 — textarea + save. Same creator-only
+//      edit rule.
+//   3. 成员列表 — table of alias + 在线 dot + peerID prefix.
+//      Self row marked "我". Creator marked "群主".
+//
+// The creator check uses GroupInfo's `members[]` array:
+// we look up our own peerID (state.selfId) and see whether
+// any member has the is_creator flag set AND that member
+// is our self. v1.1.1: creator identification relies on
+// the creator field returned by GetGroup/ListGroups,
+// which is the canonical creator peerID. If our peerID
+// matches, we're the creator.
+//
+// Note: state.GroupInfo doesn't expose an is_creator flag
+// directly — it's in pkg/group.Members but the Wails
+// GroupInfo flattens it to "members[]" (string slice).
+// So we cross-reference with the more detailed
+// ListGroupMembers (which DOES expose IsCreator per row).
+
+interface GroupMemberDetail {
+  peer_id: string;
+  alias: string;
+  joined_at: string;
+  is_creator: boolean;
+  self: boolean;
+}
+
+interface GroupSettingsState {
+  renderedID: string;
+  groupName: string;
+  remark: string;
+  members: GroupMemberDetail[];
+  isCreator: boolean;
+}
+
+let groupSettingsCache: GroupSettingsState | null = null;
+
+async function openGroupSettings(): Promise<void> {
+  if (!state.selectedId || !isGroupId(state.selectedId)) return;
+  const renderedID = state.selectedId;
+  // Pull both GroupInfo (for the editable name / remark)
+  // and ListGroupMembers (for the per-row detail). The
+  // GroupInfo's `creator` field tells us whether we own
+  // the edit rights; ListGroupMembers tells us which
+  // members are currently online.
+  const g = state.groups.find(x => x.group_id === renderedID);
+  if (!g) {
+    toast('群信息已过期，正在刷新…');
+    await loadGroups();
+    return;
+  }
+  let detailRes;
+  try {
+    detailRes = (await ListGroupMembers(renderedID)) as { members: GroupMemberDetail[]; err: string };
+  } catch (e) {
+    toast(`读取群成员失败: ${e}`);
+    return;
+  }
+  if (detailRes.err) {
+    toast(`读取群成员失败: ${detailRes.err}`);
+    return;
+  }
+  const selfHex = state.selfId || '';
+  const isCreator = selfHex !== '' && g.creator === selfHex;
+  groupSettingsCache = {
+    renderedID,
+    groupName: g.group_name || '',
+    remark: (g as any).remark || '',
+    members: detailRes.members || [],
+    isCreator,
+  };
+  renderGroupSettingsPanel();
+  toggleGroupSettingsDrawer(true);
+}
+
+function closeGroupSettings(): void {
+  toggleGroupSettingsDrawer(false);
+}
+
+function toggleGroupSettingsDrawer(open: boolean): void {
+  const drawer = document.getElementById('group-settings-drawer');
+  if (!drawer) return;
+  drawer.classList.toggle('open', open);
+  drawer.setAttribute('aria-hidden', open ? 'false' : 'true');
+}
+
+function renderGroupSettingsPanel(): void {
+  const body = document.getElementById('group-settings-body');
+  if (!body || !groupSettingsCache) return;
+  const { groupName, remark, members, isCreator } = groupSettingsCache;
+  // Sort: creator first, then self, then by joined_at
+  // ascending. Falls back to the on-disk order if a row
+  // is missing joined_at (shouldn't happen post-v1.1).
+  const sortedMembers = [...members].sort((a, b) => {
+    if (a.is_creator && !b.is_creator) return -1;
+    if (!a.is_creator && b.is_creator) return 1;
+    if (a.self && !b.self) return -1;
+    if (!a.self && b.self) return 1;
+    const ta = new Date(a.joined_at).getTime();
+    const tb = new Date(b.joined_at).getTime();
+    return ta - tb;
+  });
+  const memberRowsHtml = sortedMembers.map(m => {
+    // Online status: the chat panel's state.peers list is
+    // the source of truth (it's what the sidebar uses for
+    // peer dots). Cross-reference by PeerID.
+    const peerInfo = state.peers.find(p => p.PeerID === m.peer_id);
+    const isOnline = !!peerInfo?.Online;
+    const display = m.alias || (peerInfo ? peerDisplay(peerInfo) : '') || shortId(m.peer_id);
+    const tags: string[] = [];
+    if (m.is_creator) tags.push('群主');
+    if (m.self) tags.push('我');
+    const tagHtml = tags.length
+      ? `<span class="member-tags">${tags.map(t => `<span class="member-tag">${escapeHtml(t)}</span>`).join('')}</span>`
+      : '';
+    return `
+      <div class="member-row">
+        <span class="member-dot ${isOnline ? 'online' : 'offline'}"></span>
+        <div class="member-info">
+          <div class="member-name">${escapeHtml(display)}${tagHtml}</div>
+          <div class="member-meta">${escapeHtml(shortId(m.peer_id))}</div>
+        </div>
+      </div>
+    `;
+  }).join('');
+  const editBlockerNote = isCreator
+    ? ''
+    : `<div class="settings-hint">仅群主可修改名称和备注。</div>`;
+  body.innerHTML = `
+    <div class="settings-section">
+      <label class="settings-label" for="gs-name">群名称</label>
+      <div class="settings-row">
+        <input type="text" id="gs-name" maxlength="30" value="${escapeHtml(groupName)}" ${isCreator ? '' : 'disabled'} />
+        ${isCreator ? '<button class="modal-btn primary" id="gs-name-save">保存</button>' : ''}
+      </div>
+    </div>
+    <div class="settings-section">
+      <label class="settings-label" for="gs-remark">群备注 / 公告</label>
+      <textarea id="gs-remark" maxlength="500" rows="3" placeholder="选填；比如本周五晚聚餐" ${isCreator ? '' : 'disabled'}>${escapeHtml(remark)}</textarea>
+      ${isCreator ? '<div class="settings-row"><button class="modal-btn primary" id="gs-remark-save">保存</button></div>' : ''}
+    </div>
+    ${editBlockerNote}
+    <div class="settings-section">
+      <div class="settings-label">成员（${members.length}）</div>
+      <div class="member-list">${memberRowsHtml || '<div class="settings-empty">还没有成员</div>'}</div>
+    </div>
+  `;
+  if (isCreator) {
+    document.getElementById('gs-name-save')?.addEventListener('click', () => void saveGroupName());
+    document.getElementById('gs-remark-save')?.addEventListener('click', () => void saveGroupRemark());
+  }
+}
+
+async function saveGroupName(): Promise<void> {
+  if (!groupSettingsCache || !groupSettingsCache.isCreator) return;
+  const input = document.getElementById('gs-name') as HTMLInputElement | null;
+  if (!input) return;
+  const newName = input.value.trim();
+  if (!newName) {
+    toast('群名称不能为空');
+    return;
+  }
+  if (newName === groupSettingsCache.groupName) {
+    toast('群名称未变化');
+    return;
+  }
+  try {
+    const r = (await SetGroupName(groupSettingsCache.renderedID, newName)) as {
+      group_info: node.GroupInfo;
+      err: string;
+    };
+    if (r.err) {
+      toast(`保存失败: ${r.err}`);
+      return;
+    }
+    groupSettingsCache.groupName = newName;
+    // Refresh sidebar / chat header so the new name lands
+    // everywhere without waiting for the next event.
+    await loadGroups();
+    renderGroupList();
+    renderChatHeader();
+    toast('群名称已保存');
+  } catch (e) {
+    toast(`保存失败: ${e}`);
+  }
+}
+
+async function saveGroupRemark(): Promise<void> {
+  if (!groupSettingsCache || !groupSettingsCache.isCreator) return;
+  const ta = document.getElementById('gs-remark') as HTMLTextAreaElement | null;
+  if (!ta) return;
+  const newRemark = ta.value;
+  if (newRemark === groupSettingsCache.remark) {
+    toast('群备注未变化');
+    return;
+  }
+  try {
+    const r = (await SetGroupRemark(groupSettingsCache.renderedID, newRemark)) as {
+      group_info: node.GroupInfo;
+      err: string;
+    };
+    if (r.err) {
+      toast(`保存失败: ${r.err}`);
+      return;
+    }
+    groupSettingsCache.remark = newRemark;
+    await loadGroups();
+    toast('群备注已保存');
+  } catch (e) {
+    toast(`保存失败: ${e}`);
+  }
+}
+
+// refreshGroupSettingsIfOpen refreshes the panel content
+// in-place when the roster updates (a new joiner arrived,
+// the group name synced from the creator, etc.) so the
+// user sees live data without closing + reopening the
+// drawer. Called from onGroupEvent + after a creator
+// SetGroupName / SetGroupRemark completes. v1.1.1
+// (2026-06-29).
+function refreshGroupSettingsIfOpen(): void {
+  if (!groupSettingsCache) return;
+  const drawer = document.getElementById('group-settings-drawer');
+  if (!drawer || !drawer.classList.contains('open')) return;
+  // Re-fetch the underlying state and re-render.
+  const id = groupSettingsCache.renderedID;
+  // Fire-and-forget; failures toast but don't block.
+  void openGroupSettings().then(() => {
+    // openGroupSettings re-reads; if the user already
+    // closed the drawer between calls, just bail.
+    if (!groupSettingsCache || groupSettingsCache.renderedID !== id) return;
+  });
 }
 
 // v1.1 (2026-06-27): promptMore is REMOVED. The "more"
@@ -2107,6 +2403,10 @@ function wireEvents() {
   });
   document.getElementById('btn-dial')!.addEventListener('click', () => promptDial());
   document.getElementById('btn-history')!.addEventListener('click', () => toggleHistoryDrawer());
+  // v1.1.1 (2026-06-29): group settings (⋯) button →
+  // open the WeChat-style right-side panel.
+  document.getElementById('btn-group-settings')!.addEventListener('click', () => void openGroupSettings());
+  document.getElementById('btn-group-settings-close')!.addEventListener('click', () => closeGroupSettings());
 
   // Sidebar self header: click to set your own alias.
   // This is the only path the user has to set their

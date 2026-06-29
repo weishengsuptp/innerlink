@@ -483,6 +483,18 @@ func (n *Node) CreatorOnAccept(env protocol.Envelope, fromPeerID []byte) error {
 		return fmt.Errorf("node: CreatorOnAccept save: %w", err)
 	}
 	log.Printf("[GROUP ] %s accepted invite to %s; roster updated", accepterHex, ap.GroupID)
+	// v1.1.1 (2026-06-29): broadcast the updated roster to
+	// every other member so they refresh their local
+	// members.json. Without this, non-creator members only
+	// learn about new joiners when the next group message
+	// arrives (and even then, only the from-line shows the
+	// sender — their own members.json stays stale, which
+	// surfaces as "group shows N members on this peer but
+	// N+1 on the creator"). Best-effort: a failed broadcast
+	// to one peer doesn't roll back the accept — that peer
+	// just stays stale until the next roster-changing event
+	// (or they re-fetch via a future API).
+	n.broadcastRosterUpdate(m, accepterHex)
 	// TODO: distribute SenderKey for accepter here. For
 	// now we broadcast plain (channel-encrypted) group
 	// messages, so no SenderKey handshake is required.
@@ -1000,4 +1012,327 @@ func peerBytesToHex(b []byte) string {
 		return fmt.Sprintf("bad-peer-id-%dB", len(b))
 	}
 	return hex.EncodeToString(b)
+}
+
+// rosterPayload is the JSON shape of a TypeGroupRosterUpdate
+// envelope's Payload. We send the entire current Members
+// (group_id, group_name, members) so the receiver can
+// replace its local members.json wholesale. v1.1.1
+// (2026-06-29).
+type rosterPayload struct {
+	GroupID   string         `json:"group_id"`
+	GroupName string         `json:"group_name"`
+	Members   []group.Member `json:"members"`
+	Remark    string         `json:"remark,omitempty"`
+}
+
+// metaPayload is the JSON shape of a TypeGroupMetaUpdate
+// envelope's Payload. Carries just the editable fields
+// (name, remark). Receivers update their local
+// members.json in place. v1.1.1 (2026-06-29).
+type metaPayload struct {
+	GroupID   string `json:"group_id"`
+	GroupName string `json:"group_name"`
+	Remark    string `json:"remark,omitempty"`
+}
+
+// broadcastRosterUpdate sends the current roster to every
+// existing member (except `excludePeerID`, which is the
+// joiner that just got added and already has the new state
+// from AcceptGroupInvite). Best-effort: a failed send to
+// one peer doesn't fail the whole broadcast — that peer
+// just stays stale until the next roster-changing event.
+// v1.1.1 (2026-06-29).
+func (n *Node) broadcastRosterUpdate(m *group.Members, excludePeerID string) {
+	if n.channels == nil {
+		return
+	}
+	rendered := m.GroupID
+	rawID, err := group.ParseGroupID(rendered)
+	if err != nil {
+		log.Printf("[WARN  ] broadcastRosterUpdate: bad group_id %q: %v", rendered, err)
+		return
+	}
+	payload, err := json.Marshal(rosterPayload{
+		GroupID:   m.GroupID,
+		GroupName: m.GroupName,
+		Members:   m.Members,
+		Remark:    m.Remark,
+	})
+	if err != nil {
+		log.Printf("[WARN  ] broadcastRosterUpdate: marshal: %v", err)
+		return
+	}
+	delivered := 0
+	for _, mem := range m.Members {
+		if mem.PeerID == excludePeerID {
+			continue
+		}
+		if n.id != nil && mem.PeerID == n.id.PeerIDHex() {
+			continue
+		}
+		pid, err := hexToBytes(mem.PeerID)
+		if err != nil {
+			continue
+		}
+		st := n.channels.get(pid)
+		if st == nil {
+			// Peer offline — drop this copy. They'll pick
+			// up the new state when they next reconnect
+			// (a future re-sync API, or via the next
+			// membership event after they rejoin).
+			continue
+		}
+		env := protocol.Envelope{
+			Type:    protocol.TypeGroupRosterUpdate,
+			Payload: payload,
+			GroupID: rawID,
+		}
+		if err := st.ch.Send(n.ctx, env); err != nil {
+			log.Printf("[WARN  ] broadcastRosterUpdate to %s: %v", mem.PeerID, err)
+			continue
+		}
+		delivered++
+	}
+	log.Printf("[GROUP ] roster update broadcast to %d/%d members (exclude=%s)",
+		delivered, len(m.Members)-1, excludePeerID)
+}
+
+// broadcastMetaUpdate sends an updated name + remark to
+// every member (except self). Best-effort like
+// broadcastRosterUpdate. v1.1.1 (2026-06-29).
+func (n *Node) broadcastMetaUpdate(m *group.Members) {
+	if n.channels == nil {
+		return
+	}
+	rendered := m.GroupID
+	rawID, err := group.ParseGroupID(rendered)
+	if err != nil {
+		log.Printf("[WARN  ] broadcastMetaUpdate: bad group_id %q: %v", rendered, err)
+		return
+	}
+	payload, err := json.Marshal(metaPayload{
+		GroupID:   m.GroupID,
+		GroupName: m.GroupName,
+		Remark:    m.Remark,
+	})
+	if err != nil {
+		log.Printf("[WARN  ] broadcastMetaUpdate: marshal: %v", err)
+		return
+	}
+	delivered := 0
+	for _, mem := range m.Members {
+		if n.id != nil && mem.PeerID == n.id.PeerIDHex() {
+			continue
+		}
+		pid, err := hexToBytes(mem.PeerID)
+		if err != nil {
+			continue
+		}
+		st := n.channels.get(pid)
+		if st == nil {
+			continue
+		}
+		env := protocol.Envelope{
+			Type:    protocol.TypeGroupMetaUpdate,
+			Payload: payload,
+			GroupID: rawID,
+		}
+		if err := st.ch.Send(n.ctx, env); err != nil {
+			log.Printf("[WARN  ] broadcastMetaUpdate to %s: %v", mem.PeerID, err)
+			continue
+		}
+		delivered++
+	}
+	log.Printf("[GROUP ] meta update broadcast to %d members", delivered)
+}
+
+// ApplyRosterUpdate is the dispatcher-side handler for
+// TypeGroupRosterUpdate. We treat the inbound roster as
+// authoritative (the sender is the creator / roster-sync
+// authority) and replace our local members.json with it.
+// Note: we do NOT verify a signature here — the sender
+// already auths via the encrypted channel (every channel
+// has 1:1 SM4 keys from the handshake). A malicious
+// creator could push a false roster, but that's the same
+// threat as the creator being malicious in any other way
+// (they can also broadcast false group messages), and
+// the trust model in v1.1 is "trust the creator".
+// v1.1.1 (2026-06-29).
+func (n *Node) ApplyRosterUpdate(env protocol.Envelope, fromPeerID []byte) error {
+	var rp rosterPayload
+	if err := json.Unmarshal(env.Payload, &rp); err != nil {
+		return fmt.Errorf("node: ApplyRosterUpdate unmarshal: %w", err)
+	}
+	rawID, err := group.ParseGroupID(rp.GroupID)
+	if err != nil {
+		return fmt.Errorf("node: ApplyRosterUpdate bad GroupID: %w", err)
+	}
+	// We may not have a local members.json yet if the
+	// roster update arrives before our AcceptGroupInvite
+	// has finished its initial save. That's OK: write
+	// the inbound roster as the canonical local state.
+	m := &group.Members{
+		GroupID:   rp.GroupID,
+		GroupName: rp.GroupName,
+		Creator:   "",
+		// CreatedAt unknown on the receiver (sender
+		// doesn't echo it). Leave zero — UI doesn't
+		// surface it for non-creator members anyway.
+		CreatedAt: time.Time{},
+		Members:   rp.Members,
+		Remark:    rp.Remark,
+	}
+	if err := m.Save(n.dataDir(), rawID); err != nil {
+		return fmt.Errorf("node: ApplyRosterUpdate save: %w", err)
+	}
+	log.Printf("[GROUP ] roster synced from %s: %d members", peerBytesToHex(fromPeerID), len(rp.Members))
+	return nil
+}
+
+// ApplyMetaUpdate is the dispatcher-side handler for
+// TypeGroupMetaUpdate. Updates the editable name + remark
+// in our local members.json. v1.1.1 (2026-06-29).
+func (n *Node) ApplyMetaUpdate(env protocol.Envelope, fromPeerID []byte) error {
+	var mp metaPayload
+	if err := json.Unmarshal(env.Payload, &mp); err != nil {
+		return fmt.Errorf("node: ApplyMetaUpdate unmarshal: %w", err)
+	}
+	rawID, err := group.ParseGroupID(mp.GroupID)
+	if err != nil {
+		return fmt.Errorf("node: ApplyMetaUpdate bad GroupID: %w", err)
+	}
+	m, err := group.LoadMembers(n.dataDir(), rawID)
+	if err != nil {
+		// No local roster yet — can't apply. Caller
+		// can re-fetch via ListGroups/GetGroup later.
+		return fmt.Errorf("node: ApplyMetaUpdate load: %w", err)
+	}
+	if mp.GroupName != "" {
+		m.GroupName = mp.GroupName
+	}
+	m.Remark = mp.Remark
+	if err := m.Save(n.dataDir(), rawID); err != nil {
+		return fmt.Errorf("node: ApplyMetaUpdate save: %w", err)
+	}
+	log.Printf("[GROUP ] meta synced from %s: name=%q remark_len=%d",
+		peerBytesToHex(fromPeerID), m.GroupName, len(m.Remark))
+	return nil
+}
+
+// SetGroupName updates a group's display name and broadcasts
+// the change to every other member. Returns the new GroupInfo
+// on success. Caller must be the creator (v1.1.1 doesn't yet
+// have a per-member rename-permission model — only the
+// creator can change the name). v1.1.1 (2026-06-29).
+func (n *Node) SetGroupName(renderedID, name string) (*GroupInfo, error) {
+	if n.id == nil {
+		return nil, errors.New("node: not started")
+	}
+	name = strings_TrimSpace(name)
+	if name == "" {
+		return nil, errors.New("node: SetGroupName: name is empty")
+	}
+	if len(name) > 30 {
+		return nil, errors.New("node: SetGroupName: name too long (max 30 chars)")
+	}
+	rawID, err := group.ParseGroupID(renderedID)
+	if err != nil {
+		return nil, fmt.Errorf("node: SetGroupName bad GroupID: %w", err)
+	}
+	m, err := group.LoadMembers(n.dataDir(), rawID)
+	if err != nil {
+		return nil, fmt.Errorf("node: SetGroupName load: %w", err)
+	}
+	selfHex := n.id.PeerIDHex()
+	if m.Creator != selfHex {
+		return nil, errors.New("node: SetGroupName: only the creator can rename the group")
+	}
+	m.GroupName = name
+	if err := m.Save(n.dataDir(), rawID); err != nil {
+		return nil, fmt.Errorf("node: SetGroupName save: %w", err)
+	}
+	n.broadcastMetaUpdate(m)
+	log.Printf("[GROUP ] name updated to %q on %s", name, renderedID)
+	return n.toGroupInfo(m, rawID, true), nil
+}
+
+// SetGroupRemark updates a group's editable remark / notice
+// and broadcasts it to every other member. Same permissions
+// as SetGroupName (creator-only for v1.1.1). v1.1.1 (2026-06-29).
+func (n *Node) SetGroupRemark(renderedID, remark string) (*GroupInfo, error) {
+	if n.id == nil {
+		return nil, errors.New("node: not started")
+	}
+	if len(remark) > 500 {
+		return nil, errors.New("node: SetGroupRemark: remark too long (max 500 chars)")
+	}
+	rawID, err := group.ParseGroupID(renderedID)
+	if err != nil {
+		return nil, fmt.Errorf("node: SetGroupRemark bad GroupID: %w", err)
+	}
+	m, err := group.LoadMembers(n.dataDir(), rawID)
+	if err != nil {
+		return nil, fmt.Errorf("node: SetGroupRemark load: %w", err)
+	}
+	selfHex := n.id.PeerIDHex()
+	if m.Creator != selfHex {
+		return nil, errors.New("node: SetGroupRemark: only the creator can change the remark")
+	}
+	m.Remark = remark
+	if err := m.Save(n.dataDir(), rawID); err != nil {
+		return nil, fmt.Errorf("node: SetGroupRemark save: %w", err)
+	}
+	n.broadcastMetaUpdate(m)
+	log.Printf("[GROUP ] remark updated (%d chars) on %s", len(remark), renderedID)
+	return n.toGroupInfo(m, rawID, true), nil
+}
+
+// ListGroupMembers returns the full per-member detail (alias,
+// joined_at, is_creator) for a group. Used by the settings
+// panel to render the member list. Reads from local
+// members.json (which is kept in sync via TypeGroupRosterUpdate
+// for non-creator peers). v1.1.1 (2026-06-29).
+func (n *Node) ListGroupMembers(renderedID string) ([]GroupMemberDetail, error) {
+	rawID, err := group.ParseGroupID(renderedID)
+	if err != nil {
+		return nil, fmt.Errorf("node: ListGroupMembers bad GroupID: %w", err)
+	}
+	m, err := group.LoadMembers(n.dataDir(), rawID)
+	if err != nil {
+		return nil, fmt.Errorf("node: ListGroupMembers load: %w", err)
+	}
+	out := make([]GroupMemberDetail, 0, len(m.Members))
+	for _, mem := range m.Members {
+		// Best-effort alias lookup: try the roster (for
+		// currently-discovered peers); fall back to the
+		// alias baked into members.json at accept time
+		// (often empty for the creator). The frontend
+		// also cross-references state.peers so this is
+		// just a hint.
+		alias := mem.Alias
+		if n.rosterStore != nil && alias == "" {
+			if entry, err := n.rosterStore.Get(mem.PeerID); err == nil {
+				alias = entry.Alias
+			}
+		}
+		out = append(out, GroupMemberDetail{
+			PeerID:    mem.PeerID,
+			Alias:     alias,
+			JoinedAt:  mem.JoinedAt,
+			IsCreator: mem.IsCreator,
+			Self:      n.id != nil && mem.PeerID == n.id.PeerIDHex(),
+		})
+	}
+	return out, nil
+}
+
+// GroupMemberDetail is one row in the settings panel's
+// member list. Exposed to the Wails frontend.
+type GroupMemberDetail struct {
+	PeerID    string    `json:"peer_id"`
+	Alias     string    `json:"alias"`
+	JoinedAt  time.Time `json:"joined_at"`
+	IsCreator bool      `json:"is_creator"`
+	Self      bool      `json:"self"`
 }

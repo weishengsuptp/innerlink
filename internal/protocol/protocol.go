@@ -158,6 +158,29 @@ const (
 	// Payload: {group_id (rendered), reason (optional)}.
 	TypeGroupInviteDecline MsgType = "group-decline"
 
+	// TypeGroupRosterUpdate is sent 1:1 by a group's creator
+	// (or any future roster-sync authority) to every other
+	// member whenever the membership changes — typically
+	// after CreatorOnAccept adds a new joiner. Payload is
+	// the full roster (JSON-encoded pkg/group.Members
+	// snapshot) so the receiver can replace its local
+	// members.json wholesale. Without this, non-creator
+	// members only learn about new joiners when the next
+	// group message arrives (they see the from-line in
+	// chat.enc but their own members.json stays stale,
+	// which surfaces as "group shows 2 members on this
+	// peer, 3 on the creator"). v1.1.1 (2026-06-29).
+	TypeGroupRosterUpdate MsgType = "group-roster"
+
+	// TypeGroupMetaUpdate is sent 1:1 by a group's creator
+	// (or any future meta-sync authority) to every other
+	// member whenever editable group metadata changes —
+	// name, remark / notice. Payload carries the updated
+	// name + remark. Each receiver updates their local
+	// members.json (and re-renders the sidebar / settings
+	// panel). v1.1.1 (2026-06-29).
+	TypeGroupMetaUpdate MsgType = "group-meta"
+
 	// -- Scan history (v0.5.3) --
 
 	// TypeScanHistory carries the list of /24
