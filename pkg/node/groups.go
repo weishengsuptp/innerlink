@@ -495,6 +495,20 @@ func (n *Node) CreatorOnAccept(env protocol.Envelope, fromPeerID []byte) error {
 	// just stays stale until the next roster-changing event
 	// (or they re-fetch via a future API).
 	n.broadcastRosterUpdate(m, accepterHex)
+	// v1.1.1 (2026-06-29): also tell the creator's own
+	// GUI to re-read the roster — the broadcast above
+	// doesn't include self (self already has the latest
+	// from the local Save), so without this explicit
+	// GroupUpdated, the creator's sidebar would freeze
+	// at "1 成员" forever (the snapshot at CreateGroup
+	// time). The frontend reloads ListGroups on every
+	// GroupUpdated, which fixes both the sidebar count
+	// AND the settings panel's member list.
+	n.publishGroupEvent(GroupEvent{
+		Type:      GroupUpdated,
+		GroupID:   m.GroupID,
+		GroupName: m.GroupName,
+	})
 	// TODO: distribute SenderKey for accepter here. For
 	// now we broadcast plain (channel-encrypted) group
 	// messages, so no SenderKey handshake is required.
@@ -1187,6 +1201,15 @@ func (n *Node) ApplyRosterUpdate(env protocol.Envelope, fromPeerID []byte) error
 		return fmt.Errorf("node: ApplyRosterUpdate save: %w", err)
 	}
 	log.Printf("[GROUP ] roster synced from %s: %d members", peerBytesToHex(fromPeerID), len(rp.Members))
+	// v1.1.1 (2026-06-29): tell the local frontend the
+	// roster changed so the sidebar's "<N> 成员" count
+	// and the settings panel's member list refresh
+	// without the user closing + reopening anything.
+	n.publishGroupEvent(GroupEvent{
+		Type:      GroupUpdated,
+		GroupID:   m.GroupID,
+		GroupName: m.GroupName,
+	})
 	return nil
 }
 
@@ -1217,6 +1240,14 @@ func (n *Node) ApplyMetaUpdate(env protocol.Envelope, fromPeerID []byte) error {
 	}
 	log.Printf("[GROUP ] meta synced from %s: name=%q remark_len=%d",
 		peerBytesToHex(fromPeerID), m.GroupName, len(m.Remark))
+	// v1.1.1 (2026-06-29): same as ApplyRosterUpdate —
+	// let the local frontend know the metadata changed
+	// so the sidebar name + settings panel refresh.
+	n.publishGroupEvent(GroupEvent{
+		Type:      GroupUpdated,
+		GroupID:   m.GroupID,
+		GroupName: m.GroupName,
+	})
 	return nil
 }
 
@@ -1253,6 +1284,17 @@ func (n *Node) SetGroupName(renderedID, name string) (*GroupInfo, error) {
 		return nil, fmt.Errorf("node: SetGroupName save: %w", err)
 	}
 	n.broadcastMetaUpdate(m)
+	// v1.1.1 (2026-06-29): also notify the LOCAL frontend
+	// (the creator's own GUI) so the sidebar name + chat
+	// header update without waiting for the next external
+	// event. broadcastMetaUpdate doesn't include self for
+	// the same reason broadcastRosterUpdate doesn't — self
+	// already has the latest via the local Save above.
+	n.publishGroupEvent(GroupEvent{
+		Type:      GroupUpdated,
+		GroupID:   m.GroupID,
+		GroupName: m.GroupName,
+	})
 	log.Printf("[GROUP ] name updated to %q on %s", name, renderedID)
 	return n.toGroupInfo(m, rawID, true), nil
 }
@@ -1284,6 +1326,15 @@ func (n *Node) SetGroupRemark(renderedID, remark string) (*GroupInfo, error) {
 		return nil, fmt.Errorf("node: SetGroupRemark save: %w", err)
 	}
 	n.broadcastMetaUpdate(m)
+	// v1.1.1 (2026-06-29): same as SetGroupName — fire
+	// GroupUpdated locally so the creator's own GUI
+	// refreshes the settings panel + sidebar without
+	// waiting for the broadcast envelope to round-trip.
+	n.publishGroupEvent(GroupEvent{
+		Type:      GroupUpdated,
+		GroupID:   m.GroupID,
+		GroupName: m.GroupName,
+	})
 	log.Printf("[GROUP ] remark updated (%d chars) on %s", len(remark), renderedID)
 	return n.toGroupInfo(m, rawID, true), nil
 }
