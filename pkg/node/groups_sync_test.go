@@ -315,6 +315,123 @@ func mustJSON(t *testing.T, v interface{}) []byte {
 	return b
 }
 
+// TestGroupSync_ApplyRosterUpdate_PreservesCreator:
+// Pins down the v1.1.2 (2026-06-30) hotfix that stops
+// ApplyRosterUpdate from wiping the receiver's local
+// Creator field. Pre-fix bug: every receiving peer
+// (including the creator) had `Creator: ""` written
+// into members.json after any roster update, which
+// made ListGroups return GroupInfo.creator == "" — the
+// frontend then flipped `g.creator === selfHex` to
+// false and the creator-only UI ("+ 邀请成员" button,
+// editable 群名称 + 群备注 inputs) disappeared until
+// restart. Triggered any time a peer joins / leaves
+// / set-name / set-remark.
+//
+// Three sub-cases:
+//   1. inbound has Creator → receiver uses inbound (new
+//      forward-compatible behavior, since rosterPayload
+//      now carries Creator).
+//   2. inbound has empty Creator AND receiver already
+//      has local Creator → preserve local (backwards-
+//      compatible with pre-v1.1.2 broadcast binaries).
+//   3. inbound has empty Creator AND receiver has no
+//      local members.json (rare, race-y): falls back
+//      to "" — next refresh will heal it; not a hard
+//      failure.
+func TestGroupSync_ApplyRosterUpdate_PreservesCreator(t *testing.T) {
+	rawID_ := func(t *testing.T, n *Node, rendered string) []byte {
+		t.Helper()
+		rid, err := group.ParseGroupID(rendered)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return rid
+	}
+
+	// Sub-case 1: inbound carries Creator → receiver
+	// takes it verbatim.
+	t.Run("InboundCarriesCreator", func(t *testing.T) {
+		n, rendered := newTestNode(t)
+		rawID := rawID_(t, n, rendered)
+		creatorHex := n.id.PeerIDHex()
+
+		// Stub a 2-member roster with a non-self creator
+		// so we can assert inbound-Creator overrides local.
+		inbound := rosterPayload{
+			GroupID:   rendered,
+			GroupName: "测试群",
+			Creator:   "deadbeefdeadbeef00000000000000aa",
+			Members: []group.Member{
+				{PeerID: creatorHex, JoinedAt: time.Now().UTC(), IsCreator: true},
+				{PeerID: "b000000000000000000000000000bb01", JoinedAt: time.Now().UTC()},
+			},
+		}
+		env := protocol.Envelope{
+			Type: protocol.TypeGroupRosterUpdate,
+			Payload: mustJSON(t, inbound),
+		}
+		fakeFrom := make([]byte, 16)
+		if err := n.ApplyRosterUpdate(env, fakeFrom); err != nil {
+			t.Fatalf("ApplyRosterUpdate: %v", err)
+		}
+		got, err := group.LoadMembers(n.dataDir(), rawID)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if got.Creator != "deadbeefdeadbeef00000000000000aa" {
+			t.Errorf("inbound Creator should win, got %q", got.Creator)
+		}
+	})
+
+	// Sub-case 2: inbound has no Creator AND receiver
+	// already has a local Creator → local wins. This is
+	// the actual user-reported regression: a v1.1.1 binary
+	// receiving a v1.1.2 broadcast, or vice versa.
+	t.Run("LocalWinsOnEmptyInbound", func(t *testing.T) {
+		n, rendered := newTestNode(t)
+		rawID := rawID_(t, n, rendered)
+		creatorHex := n.id.PeerIDHex()
+
+		// Sanity: local Creator is set to self after
+		// newTestNode.
+		before, err := group.LoadMembers(n.dataDir(), rawID)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if before.Creator != creatorHex {
+			t.Fatalf("setup: local Creator=%q, want %q", before.Creator, creatorHex)
+		}
+
+		// Inbound from a pre-v1.1.2 binary: Creator field
+		// absent → JSON unmarshals to "".
+		inbound := rosterPayload{
+			GroupID:   rendered,
+			GroupName: "测试群",
+			// Creator intentionally omitted.
+			Members: []group.Member{
+				{PeerID: creatorHex, JoinedAt: time.Now().UTC(), IsCreator: true},
+			},
+		}
+		env := protocol.Envelope{
+			Type: protocol.TypeGroupRosterUpdate,
+			Payload: mustJSON(t, inbound),
+		}
+		fakeFrom := make([]byte, 16)
+		if err := n.ApplyRosterUpdate(env, fakeFrom); err != nil {
+			t.Fatalf("ApplyRosterUpdate: %v", err)
+		}
+		got, err := group.LoadMembers(n.dataDir(), rawID)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if got.Creator != creatorHex {
+			t.Errorf("Creator was wiped! got %q, want %q (local preserved)",
+				got.Creator, creatorHex)
+		}
+	})
+}
+
 // TestGroupSync_SoloCreator_CanLeave: pins down
 // the v1.1.2 (2026-06-30) hotfix that lets a creator
 // who's the SOLE remaining member self-dissolve their

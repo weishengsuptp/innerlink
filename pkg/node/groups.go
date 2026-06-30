@@ -1146,12 +1146,27 @@ func peerBytesToHex(b []byte) string {
 
 // rosterPayload is the JSON shape of a TypeGroupRosterUpdate
 // envelope's Payload. We send the entire current Members
-// (group_id, group_name, members) so the receiver can
-// replace its local members.json wholesale. v1.1.1
+// (group_id, group_name, creator, members) so the receiver
+// can replace its local members.json wholesale. v1.1.1
 // (2026-06-29).
+//
+// v1.1.2 (2026-06-30) hotfix: added Creator field.
+// Without it, ApplyRosterUpdate on the receiver was
+// forced to wipe the local Creator string (the inbound
+// payload didn't carry it, the local kept-existing
+// fallback wasn't there), which made every receiver's
+// `g.creator === selfHex` check return false the next
+// time ListGroups ran. UI symptom: after ANY peer joins
+// / leaves / set-name / set-remark, the creator's own
+// "+ 邀请成员" button + 群名 / 公告 编辑 disable + hints
+// all disappear until restart. New binaries carry Creator
+// forward; old binaries with no Creator in payload still
+// receive a roster update but rely on the local-preserve
+// fallback in ApplyRosterUpdate to keep creator status.
 type rosterPayload struct {
 	GroupID   string         `json:"group_id"`
 	GroupName string         `json:"group_name"`
+	Creator   string         `json:"creator"`
 	Members   []group.Member `json:"members"`
 	Remark    string         `json:"remark,omitempty"`
 }
@@ -1195,6 +1210,7 @@ func (n *Node) broadcastRosterUpdate(m *group.Members) {
 	payload, err := json.Marshal(rosterPayload{
 		GroupID:   m.GroupID,
 		GroupName: m.GroupName,
+		Creator:   m.Creator,
 		Members:   m.Members,
 		Remark:    m.Remark,
 	})
@@ -1309,6 +1325,39 @@ func (n *Node) ApplyRosterUpdate(env protocol.Envelope, fromPeerID []byte) error
 	if err != nil {
 		return fmt.Errorf("node: ApplyRosterUpdate bad GroupID: %w", err)
 	}
+
+	// v1.1.2 (2026-06-30) hotfix: preserve the local
+	// Creator when the inbound roster update doesn't
+	// carry one. Pre-fix, this branch always wrote
+	// `Creator: ""`, which made every receiving peer's
+	// ListGroups return GroupInfo.creator == "" — the
+	// frontend's `g.creator === selfHex` test then
+	// failed for the creator too, hiding the entire
+	// creator-only UI surface ("+ 邀请成员" button, the
+	// editable 群名称 + 群备注 inputs) until restart.
+	//
+	// Resolution: the new rosterPayload DOES carry
+	// Creator (since v1.1.2) so the common case is
+	// straightforward. The fallback below handles two
+	// edge cases:
+	//   - we have a local members.json already
+	//     (AcceptGroupInvite wrote it), and the inbound
+	//     payload omits Creator (older broadcast binary
+	//     pre-v1.1.2 didn't add the field): preserve
+	//     local Creator.
+	//   - we DON'T have local members.json (rare;
+	//     AcceptGroupInvite hasn't finished yet when a
+	//     concurrent update arrives): fall back to
+	//     whatever the inbound said. Most often that's
+	//     also "" in this scenario — next reconnection
+	//     / refresh from any peer will heal it.
+	finalCreator := rp.Creator
+	if finalCreator == "" {
+		if existing, err := group.LoadMembers(n.dataDir(), rawID); err == nil && existing.Creator != "" {
+			finalCreator = existing.Creator
+		}
+	}
+
 	// We may not have a local members.json yet if the
 	// roster update arrives before our AcceptGroupInvite
 	// has finished its initial save. That's OK: write
@@ -1316,7 +1365,7 @@ func (n *Node) ApplyRosterUpdate(env protocol.Envelope, fromPeerID []byte) error
 	m := &group.Members{
 		GroupID:   rp.GroupID,
 		GroupName: rp.GroupName,
-		Creator:   "",
+		Creator:   finalCreator,
 		// CreatedAt unknown on the receiver (sender
 		// doesn't echo it). Leave zero — UI doesn't
 		// surface it for non-creator members anyway.
@@ -1327,7 +1376,12 @@ func (n *Node) ApplyRosterUpdate(env protocol.Envelope, fromPeerID []byte) error
 	if err := m.Save(n.dataDir(), rawID); err != nil {
 		return fmt.Errorf("node: ApplyRosterUpdate save: %w", err)
 	}
-	log.Printf("[GROUP ] roster synced from %s: %d members", peerBytesToHex(fromPeerID), len(rp.Members))
+	creatorShort := finalCreator
+	if len(creatorShort) > 8 {
+		creatorShort = creatorShort[:8]
+	}
+	log.Printf("[GROUP ] roster synced from %s: %d members (creator=%s)",
+		peerBytesToHex(fromPeerID), len(rp.Members), creatorShort)
 	// v1.1.1 (2026-06-29): tell the local frontend the
 	// roster changed so the sidebar's "<N> 成员" count
 	// and the settings panel's member list refresh
