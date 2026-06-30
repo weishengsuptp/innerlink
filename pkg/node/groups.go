@@ -659,10 +659,25 @@ func (n *Node) HistoryGroup(renderedID string) ([]Message, error) {
 
 // LeaveGroup removes self from the group's roster and
 // deletes the local directory (chat.enc + members.json).
-// Other members see the leave via... a future TypeGroupLeave
-// envelope; for v1.1 we just drop locally and the next
-// message we send will implicitly re-add (TODO: send leave
-// envelope).
+// Every REMAINING member receives the new roster via
+// broadcastRosterUpdate; their ApplyRosterUpdate handler
+// rebuilds their local members.json without self and
+// publishes GroupUpdated so the sidebar's "<N> 成员"
+// count drops. v1.1.2 (2026-06-30): the prior implementation
+// only dropped self locally and skipped the broadcast —
+// "3 在线" then stayed stuck on every remaining member's
+// sidebar until they restarted. The matching fix on the
+// receiver side is ApplyRosterUpdate, which only needs the
+// post-leave roster to do its job (no separate leave
+// envelope type — roster diff is enough).
+//
+// Offline-receiver caveat: if a remaining member has no
+// active channel at leave time, broadcastRosterUpdate
+// best-effort drops them (same as SetGroupName/Remark —
+// see notes in broadcastRosterUpdate). They'll re-sync on
+// next reconnect via a future TypeGroupRosterSync-pull
+// API (v1.1.x TODO). This is not new in 1.1.2 — the same
+// caveat applies to the accept path CreatorOnAccept.
 func (n *Node) LeaveGroup(renderedID string) error {
 	rawID, err := group.ParseGroupID(renderedID)
 	if err != nil {
@@ -692,7 +707,10 @@ func (n *Node) LeaveGroup(renderedID string) error {
 		return errors.New("node: LeaveGroup: RemoveMember returned false")
 	}
 	// If the group is empty after our removal, delete it.
-	// Otherwise save the updated roster.
+	// Otherwise save the updated roster and broadcast the
+	// new roster to remaining members (v1.1.2 hotfix —
+	// before this, remaining peers kept a stale "<N> 成员
+	// / <N> 在线" until restart).
 	if len(m.Members) == 0 {
 		return n.chatStore.DeleteGroup(renderedID)
 	}
@@ -705,7 +723,16 @@ func (n *Node) LeaveGroup(renderedID string) error {
 	if err := n.chatStore.DeleteGroup(renderedID); err != nil {
 		return err
 	}
-	log.Printf("[GROUP ] left group=%s (local cleanup done)", renderedID)
+	log.Printf("[GROUP ] left group=%s (local cleanup done, broadcasting roster to %d remaining)",
+		renderedID, len(m.Members))
+	// v1.1.2 (2026-06-30): the v1.1.1 fix landed broadcastRosterUpdate
+	// on CreatorOnAccept but forgot this path. Mirror it: tell
+	// the remaining peers so their members.json gets rebuilt
+	// without us. broadcastRosterUpdate skips self internally
+	// and best-effort drops offline peers (same semantics as
+	// the accept path — see agent memory entry on roster
+	// write-broadcast exclusions).
+	n.broadcastRosterUpdate(m)
 	// v1.1 (2026-06-28): tell the GUI the group is gone
 	// so it stops showing it in the sidebar. The frontend
 	// also clears any selectedId that pointed at this

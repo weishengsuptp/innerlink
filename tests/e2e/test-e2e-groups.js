@@ -325,6 +325,125 @@ at(18000, async () => {
     'G6: sender-side body landed in own log (chat.enc written + publishMessage emitted)');
 }, 'creator-solo send (no broadcast recipients)');
 
+// G7: best-effort leave-group sync. Pre-fix bug (v1.1.2
+// 2026-06-30): LeaveGroup removed self from the local
+// members.json but never broadcast a roster update to
+// remaining members. Result: A and C's `group show`
+// stayed at 3 members forever even though B had clearly
+// left. Post-fix: LeaveGroup calls broadcastRosterUpdate
+// after the local Save, so ApplyRosterUpdate on A and C
+// rebuilds their members.json without B and publishes
+// GroupUpdated for the sidebar — counts drop to 2 / 2.
+//
+// Uses the original `createdGroupID` (the 3-peer "去11"
+// group from G1/G2) so we have a populated roster to
+// tear down.
+at(22000, async () => {
+  console.log('\n=== G7: B leaves the group, remaining peers sync ===');
+
+  // Sanity baseline: all three should currently see 3.
+  // (lastGroupShowOutput returns the LATEST line that
+  // matches, so this is a defensive re-check before we
+  // trigger the leave — surfaces ordering issues early.)
+  send('A', `group show ${createdGroupID}`);
+  send('B', `group show ${createdGroupID}`);
+  send('C', `group show ${createdGroupID}`);
+  await sleep(400);
+  const pre = {
+    A: lastGroupShowOutput('A', createdGroupID),
+    B: lastGroupShowOutput('B', createdGroupID),
+    C: lastGroupShowOutput('C', createdGroupID),
+  };
+  console.log(`  pre-leave members: A=${pre.A?.count} B=${pre.B?.count} C=${pre.C?.count}`);
+  if (pre.A?.count !== 3 || pre.B?.count !== 3 || pre.C?.count !== 3) {
+    assert(false, `G7 precondition: expected all 3 peers at 3 members before leave; ` +
+      `got A=${pre.A?.count} B=${pre.B?.count} C=${pre.C?.count}. Earlier test may have torn state down.`);
+    return;
+  }
+
+  // B leaves. cmdGroupLeave calls nd.LeaveGroup which now
+  // (post-fix) fires broadcastRosterUpdate to A and C.
+  send('B', `group leave ${createdGroupID}`);
+  await sleep(2000);
+
+  // Print fresh `group show` lines so lastGroupShowOutput
+  // finds the post-leave ones (not the pre-leave ones).
+  send('A', `group show ${createdGroupID}`);
+  send('C', `group show ${createdGroupID}`);
+  await sleep(500);
+
+  const aPost = lastGroupShowOutput('A', createdGroupID);
+  const cPost = lastGroupShowOutput('C', createdGroupID);
+  console.log(`  post-leave members: A=${aPost?.count} C=${cPost?.count} (B should be gone)`);
+  assert(aPost?.count === 2, `G7: A post-leave members = ${aPost?.count}, want 2. ` +
+    `Pre-fix bug: A would stay at 3 because LeaveGroup never broadcast — sidebar ` +
+    `stuck at "3 成员 · 3 在线" until restart.`);
+  assert(cPost?.count === 2, `G7: C post-leave members = ${cPost?.count}, want 2. ` +
+    `Pre-fix bug: C would stay at 3 for the same reason.`);
+
+  // B should also show "left ..." in its log (cmdGroupLeave
+  // echoes "[GROUP ] left <gid> (local cleanup done)") and
+  // the new Node log line "left group=... (local cleanup
+  // done, broadcasting roster to N remaining)" from the
+  // post-fix LeaveGroup.
+  const bLog = fs.readFileSync(path.join(ROOT, 'b.log'), 'utf8');
+  assert(/\[GROUP \] left /g.test(bLog),
+    'G7: B log shows "[GROUP ] left ..." from cmdGroupLeave');
+  assert(/broadcasting roster to \d+ remaining/.test(bLog),
+    'G7: B log shows post-fix LeaveGroup log line ("broadcasting roster to N remaining") — ' +
+    'if this is missing, the broadcast was never wired into LeaveGroup');
+
+  // And B should not see the group anymore (chat.enc deleted
+  // → ListGroups filters it out). We use `group list` and
+  // look for absence of the gid.
+  send('B', 'group list');
+  await sleep(400);
+  const bLogAfter = fs.readFileSync(path.join(ROOT, 'b.log'), 'utf8');
+  // Find the gid printed by the most recent list (cmdGroupList
+  // prints one line per group). After leave there should be
+  // at most 1 group (the g6test group from G6 — possibly).
+  // The simplest assertion: the gid does NOT appear in the
+  // last "GROUP list" section. We just check that B's log
+  // doesn't have a fresh group-list line that mentions the
+  // createdGroupID after the "left ..." line.
+  const lines = bLogAfter.split(/\r?\n/);
+  const leftIdx = lines.findIndex(l => /\[GROUP \] left /g.test(l));
+  const linesAfterLeft = leftIdx >= 0 ? lines.slice(leftIdx) : [];
+  const stillShows = linesAfterLeft.some(l =>
+    l.includes(createdGroupID) && /group list/i.test(l) && /members=/.test(l));
+  assert(!stillShows,
+    'G7: B does not show left group anymore in its sidebar (chat.enc gone → ListGroups filters it out)');
+}, 'G7: leave-group sync (multi-peer roster cleanup)');
+
+// G8: after a member leaves, the remaining peer can keep
+// sending and the leaver doesn't receive a ghost message.
+// C sends `post-leave-payload` to the now-2-member group;
+// A receives it (always has channel to C); B does NOT
+// receive it (B deleted its local chat.enc and has no
+// subscription anymore).
+//
+// Why this matters: a common bug shape is "removing self
+// from the group but still receiving messages" because
+// the per-peer dispatcher subscribes via chat.enc existence.
+// Since B deleted chat.enc on leave, the broadcast loop's
+// `n.channels.get(B)` would still find the existing TCP
+// channel — verify the SendGroupMessage code path also
+// gates by members.json (which B already lost), NOT by
+// active TCP channel.
+at(24500, async () => {
+  console.log('\n=== G8: sender to post-leave group does not reach the leaver ===');
+  send('C', `group send ${createdGroupID} g8-post-leave`);
+  await sleep(1500);
+
+  const aLog = fs.readFileSync(path.join(ROOT, 'a.log'), 'utf8');
+  const bLog = fs.readFileSync(path.join(ROOT, 'b.log'), 'utf8');
+
+  assert(/\[MSG  \] in  <[^>]+> g8-post-leave/.test(aLog),
+    'G8: A DID receive g8-post-leave (A still a member)');
+  assert(!/g8-post-leave/.test(bLog),
+    'G8: B did NOT receive g8-post-leave (B left, no longer on roster)');
+}, 'G8: leaver is dropped from the post-leave broadcast list');
+
 at(26000, async () => {
   console.log('\n=== FINAL ===');
   if (failures > 0) {
