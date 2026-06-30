@@ -290,7 +290,42 @@ at(17000, async () => {
     'B DID receive g4-second after the dial completed (best-effort dial worked)');
 }, 'best-effort VM-to-VM dial');
 
-at(20000, async () => {
+// G6: creator-solo send. Build a fresh group, A sends
+// immediately as the only member. Pins down "一建群就
+// 发消息不通" — the question is whether the sender's own
+// chat.enc + history + publishMessage path works when
+// m.Members == [selfHex]. If the in-memory publish fires,
+// frontend should display the message instantly. We assert
+// the log + the HistoryGroup subcommand renders the body.
+at(18000, async () => {
+  console.log('\n=== G6: creator-solo send ===');
+  // Make a new group dedicated to this test so we don't
+  // muddle with the 3-peer "去11" group above.
+  send('A', 'group create g6test');
+  await sleep(500);
+  const aLogEarly = fs.readFileSync(path.join(ROOT, 'a.log'), 'utf8');
+  const m = aLogEarly.match(/created\s+(g_[0-9a-f]{64})/g);
+  // Take the LATEST created line (this run's G6 group).
+  const gidLine = m ? m[m.length - 1] : null;
+  if (!gidLine) {
+    assert(false, 'G6: could not parse created group id');
+    return;
+  }
+  const gid = gidLine.split(/\s+/)[1];
+  // Solo send.
+  send('A', `group send ${gid} g6-creator-solo-payload`);
+  await sleep(800);
+  send('A', `group history ${gid}`);
+  await sleep(500);
+
+  const aLog = fs.readFileSync(path.join(ROOT, 'a.log'), 'utf8');
+  const sentLine = aLog.match(new RegExp(`\\[GROUP \\] sent to ${gid}: 0\\/0 delivered`));
+  assert(sentLine !== null, 'G6: SendGroupMessage ran solo without erroring out');
+  assert(/g6-creator-solo-payload/.test(aLog),
+    'G6: sender-side body landed in own log (chat.enc written + publishMessage emitted)');
+}, 'creator-solo send (no broadcast recipients)');
+
+at(26000, async () => {
   console.log('\n=== FINAL ===');
   if (failures > 0) {
     console.log(`\u274C ${failures} assertion(s) FAILED`);
