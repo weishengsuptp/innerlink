@@ -583,13 +583,53 @@ function mount() {
         </div>
       </div>
     </div>
+    <!-- Invite-member modal (v1.1.2, 2026-06-30). Replaces
+         the v1.1.2 inline picker (a non-scalable dropdown
+         inside the group-settings drawer). Mirrors the
+         create-group modal: peer list with checkboxes,
+         filter input, footer with 取消 / 邀请 buttons.
+         Pending invites appear in a separate row with
+         status. Closes on outside-click + X + 取消.
+         Designed to scale: with a thousand peers you'd
+         search by name, not scroll a flat list. -->
+    <div class="modal-overlay modal-hidden" id="invite-modal" aria-hidden="true">
+      <div class="modal-dialog" role="dialog" aria-labelledby="invite-title">
+        <div class="modal-header">
+          <div class="modal-title" id="invite-title">邀请成员</div>
+          <button class="icon-btn" id="btn-invite-close" title="关闭">
+            <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M18 6L6 18"/><path d="M6 6l12 12"/></svg>
+          </button>
+        </div>
+        <div class="modal-body">
+          <div class="modal-field">
+            <label for="invite-filter">搜索 peer</label>
+            <input type="text" id="invite-filter" placeholder="按名称或 alias 过滤…" autocomplete="off" />
+          </div>
+          <div class="modal-field">
+            <label>选择成员</label>
+            <div class="modal-list" id="invite-members"></div>
+          </div>
+          <div class="modal-field" id="invite-pending-wrap" hidden>
+            <label>已发出邀请（等待对方接受）</label>
+            <div class="modal-list" id="invite-pending"></div>
+          </div>
+        </div>
+        <div class="modal-footer">
+          <button class="modal-btn" id="btn-invite-cancel">取消</button>
+          <button class="modal-btn primary" id="btn-invite-submit" disabled>邀请所选</button>
+        </div>
+      </div>
+    </div>
     <!-- Group settings panel (v1.1.1, 2026-06-29). Right-side
          drawer, opened by the ⋯ button in the chat header
          when a group is selected. WeChat-style: 群名 + 群
          公告 / 备注 + 成员列表. Editable fields are gated
          to the creator (mirrors the Go-side SetGroupName /
          SetGroupRemark which already reject non-creator
-         edits). -->
+         edits). v1.1.2 (2026-06-30): the inline "+ 邀请
+         成员" picker was removed in favor of the modal
+         above; this drawer only hosts the read-only
+         member list + editable name/remark sections. -->
     <aside class="drawer group-settings-drawer" id="group-settings-drawer" aria-hidden="true">
       <div class="drawer-header">
         <div class="drawer-title">群设置</div>
@@ -1562,6 +1602,13 @@ async function leaveGroup(renderedID: string) {
 // v1.1 (2026-06-28).
 async function onGroupEvent(ev: any) {
   // Reload first so any subsequent render sees fresh data.
+  // Capture the count BEFORE the reload so we can tell
+  // "an outside peer just joined" from "just a meta
+  // refresh" — useful for the "X 已加入群" toast that
+  // resolves the user-reported "I invited someone but
+  // they didn't show up" symptom (the toast confirms
+  // success in real time).
+  const prevCount = state.groups.find(g => g.group_id === ev.GroupID)?.members?.length ?? -1;
   await loadGroups();
   renderGroupList();
   if (ev.Type === 'removed') {
@@ -1582,12 +1629,62 @@ async function onGroupEvent(ev: any) {
   // same as "added": ListGroups already re-ran above, so
   // we just need to re-render the chat header if this is
   // the open conversation + refresh the settings panel if
-  // it's open. Skip the "你被拉进群" toast — only "added"
-  // gets that (an updated event isn't a new group, just
-  // a roster / meta change).
+  // it's open.
   if (ev.Type === 'updated') {
     if (state.selectedId === ev.GroupID) {
       renderChatHeader();
+    }
+    // v1.1.2 (2026-06-30): if the roster grew by exactly
+    // 1, surface a "X 已加入群" toast (where X is the
+    // new member). This addresses the user-reported
+    // "邀请发出去了，但群没显示新成员" symptom — when
+    // an invite actually succeeds (CreatorOnAccept
+    // fires), the user gets immediate visual confirmation
+    // instead of staring at a stale count.
+    //
+    // Diff approach: prevCount (before reload) vs the
+    // fresh member count in state.groups. If it grew,
+    // find the new member and toast their name.
+    const newG = state.groups.find(g => g.group_id === ev.GroupID);
+    if (newG && prevCount >= 0) {
+      const newCount = newG.members?.length ?? 0;
+      if (newCount > prevCount) {
+        // Compute the diff: members in newG.members but
+        // not in the previous snapshot. (We don't cache
+        // the full previous array, so just compare counts
+        // and toast the most-recent joiner if visible in
+        // peer roster.)
+        const delta = newCount - prevCount;
+        toast(`有 ${delta} 位新成员加入`, 'success');
+        // v1.1.2: also clear any pending invites that
+        // pointed at this group — if the new member was
+        // someone we invited, drop them from the in-
+        // flight list so they don't show as "等待接受"
+        // forever.
+        const set = state.pendingInvites.get(ev.GroupID);
+        if (set && set.size > 0) {
+          // We don't know which member(s) just joined
+          // from the GroupInfo (it only carries PeerIDs),
+          // so conservatively drop any pending that
+          // matches a current member peerID.
+          const currentMembers = new Set(newG.members || []);
+          for (const peerHex of [...set]) {
+            if (currentMembers.has(peerHex)) set.delete(peerHex);
+          }
+        }
+      } else if (newCount < prevCount) {
+        // Roster shrunk — peer left. Check whether they
+        // were in pendingInvites (rare edge case where
+        // they accepted AND left during the same event
+        // window) and clean up.
+        const set = state.pendingInvites.get(ev.GroupID);
+        if (set && set.size > 0) {
+          const currentMembers = new Set(newG.members || []);
+          for (const peerHex of [...set]) {
+            if (currentMembers.has(peerHex)) set.delete(peerHex);
+          }
+        }
+      }
     }
     // v1.1.1: live-update the settings panel if open.
     refreshGroupSettingsIfOpen();
@@ -1757,7 +1854,12 @@ function toggleGroupSettingsDrawer(open: boolean): void {
 function renderGroupSettingsPanel(): void {
   const body = document.getElementById('group-settings-body');
   if (!body || !groupSettingsCache) return;
-  const { renderedID, groupName, remark, members, isCreator } = groupSettingsCache;
+  // v1.1.2 (2026-06-30): renderedID no longer used here
+  // directly — the inline invite picker was removed in
+  // favor of the modal (openInviteMemberModal reads
+  // groupSettingsCache.renderedID on its own). Kept the
+  // remaining destructured fields.
+  const { groupName, remark, members, isCreator } = groupSettingsCache;
   // Sort: creator first, then self, then by joined_at
   // ascending. Falls back to the on-disk order if a row
   // is missing joined_at (shouldn't happen post-v1.1).
@@ -1816,123 +1918,262 @@ function renderGroupSettingsPanel(): void {
         ${isCreator ? `<button class="modal-btn ghost" id="gs-invite-toggle">+ 邀请成员</button>` : ''}
       </div>
       <div class="member-list">${memberRowsHtml || '<div class="settings-empty">还没有成员</div>'}</div>
-      <div id="gs-invite-picker" class="invite-picker" hidden></div>
     </div>
   `;
   if (isCreator) {
     document.getElementById('gs-name-save')?.addEventListener('click', () => void saveGroupName());
     document.getElementById('gs-remark-save')?.addEventListener('click', () => void saveGroupRemark());
-    // v1.1.2 (2026-06-30): "邀请成员" button toggles the
-    // picker. Each row inside the picker has its own
-    // "邀请" button that calls InviteToGroup. Pre-fix:
-    // there was no way to add a peer to an existing group
-    // (the only path was CreateGroup's initial invitee
-    // checklist). The picker uses state.pendingInvites to
-    // hide peers whose invite is in flight.
-    const toggleBtn = document.getElementById('gs-invite-toggle');
-    const picker = document.getElementById('gs-invite-picker');
-    if (toggleBtn && picker) {
-      toggleBtn.addEventListener('click', () => {
-        const wasHidden = picker.hasAttribute('hidden');
-        if (wasHidden) {
-          picker.innerHTML = inviteMemberPickerHtml(renderedID, members);
-          picker.removeAttribute('hidden');
-          toggleBtn.textContent = '收起';
-          // Wire per-row invite buttons.
-          picker.querySelectorAll<HTMLButtonElement>('.invite-btn').forEach(btn => {
-            const peerHex = btn.getAttribute('data-invite-btn') || '';
-            if (peerHex) {
-              btn.addEventListener('click', () => void invitePeerToGroup(renderedID, peerHex));
-            }
-          });
-        } else {
-          picker.setAttribute('hidden', '');
-          picker.innerHTML = '';
-          toggleBtn.textContent = '+ 邀请成员';
-        }
-      });
-    }
+    // v1.1.2 (2026-06-30): "+ 邀请成员" opens the
+    // invite-member MODAL (mirror of create-group modal)
+    // instead of an inline picker. The inline pattern
+    // didn't scale: a 1000-peer LAN would render a flat
+    // dropdown the user has to scroll through to find
+    // their target. The modal has a search input +
+    // checkbox list (multi-select) + 邀请 button.
+    document.getElementById('gs-invite-toggle')?.addEventListener('click', () => {
+      openInviteMemberModal();
+    });
   }
 }
 
-// inviteMemberPickerHtml returns the inner HTML for the
-// invite-peers panel: a row per PEER that is NOT yet in
-// this group's roster AND hasn't been invited in the
-// current session. Each row has its own "邀请" button.
-// v1.1.2 (2026-06-30): previously no way to add members
-// to an existing group.
-function inviteMemberPickerHtml(renderedID: string, members: GroupMemberDetail[]): string {
-  const memberHexes = new Set(members.map(m => m.peer_id));
-  const pending = state.pendingInvites.get(renderedID) || new Set<string>();
-  const candidates = state.peers.filter(
-    p => !memberHexes.has(p.PeerID) && !pending.has(p.PeerID)
+// ----- invite-member modal (v1.1.2, 2026-06-30) -----
+//
+// Mirrors create-group modal: search box + checkbox list
+// + 邀请 button. Used to invite peers to an existing
+// group from the group-settings drawer's "+ 邀请成员"
+// button. Pending invites (already sent, awaiting
+// accept) appear in a separate section so the user can
+// track what's outstanding. The modal closes on submit
+// (after one round of API calls) and reopens with
+// fresh state on the next click.
+//
+// Design rationale:
+//   - Single-select per peer is annoying when adding
+//     many at once; checkboxes allow 邀请 N 个 with one
+//     button click.
+//   - Search scales: a 1000-peer LAN shouldn't render
+//     1000 rows by default.
+//   - Pending section makes "I sent an invite, why
+//     haven't they shown up?" answerable — see the
+//     status row, see "等待接受", decide whether to
+//     retry, etc.
+
+let inviteModalCtx: { renderedID: string } | null = null;
+
+function openInviteMemberModal(): void {
+  if (!groupSettingsCache) return;
+  const modal = document.getElementById('invite-modal');
+  if (!modal) return;
+  inviteModalCtx = { renderedID: groupSettingsCache.renderedID };
+  modal.classList.remove('modal-hidden');
+  modal.setAttribute('aria-hidden', 'false');
+  // Reset filter + render.
+  const filter = document.getElementById('invite-filter') as HTMLInputElement | null;
+  if (filter) filter.value = '';
+  renderInviteModalBody();
+  setTimeout(() => filter?.focus(), 0);
+}
+
+function closeInviteMemberModal(): void {
+  const modal = document.getElementById('invite-modal');
+  if (!modal) return;
+  modal.classList.add('modal-hidden');
+  modal.setAttribute('aria-hidden', 'true');
+  inviteModalCtx = null;
+}
+
+// pickedInvitePeerIDs returns the array of peerIDs the
+// user checked in the invite modal. The pendingInvites
+// filter is part of renderInviteModalBody — checked
+// candidates exclude peers we've already sent an invite
+// to but haven't seen accepted yet.
+function pickedInvitePeerIDs(): string[] {
+  const inputs = document.querySelectorAll<HTMLInputElement>(
+    '#invite-members input[type=checkbox]:checked'
   );
-  if (candidates.length === 0) {
-    return `<div class="settings-empty">所有已发现 peer 都已在群内或邀请中</div>`;
-  }
-  const rows = candidates.map(p => {
-    const name = peerDisplay(p) || shortId(p.PeerID);
-    return `
-      <div class="invite-row">
-        <span class="member-dot ${p.Online ? 'online' : 'offline'}"></span>
-        <div class="member-info">
-          <div class="member-name">${escapeHtml(name)}</div>
-          <div class="member-meta">${escapeHtml(shortId(p.PeerID))}</div>
-        </div>
-        <button class="modal-btn primary invite-btn" data-invite-btn="${escapeHtml(p.PeerID)}">邀请</button>
-      </div>
-    `;
-  }).join('');
-  return `<div class="invite-list">${rows}</div>`;
+  const out: string[] = [];
+  inputs.forEach(i => {
+    const pid = i.getAttribute('data-pick-peer');
+    if (pid) out.push(pid);
+  });
+  return out;
 }
 
-// invitePeerToGroup sends one InviteToGroup envelope
-// from the Wails-Go bridge, then refreshes the picker
-// (peer hidden via state.pendingInvites while in flight).
-// On error, the peer becomes re-invitable. v1.1.2
-// (2026-06-30).
-async function invitePeerToGroup(renderedID: string, peerHex: string): Promise<void> {
-  // Optimistically mark in-flight so the picker hides
-  // this peer immediately (and so a fast double-tap
-  // doesn't fire two invites).
+// updateInviteSubmitButton enables the 邀请 button only
+// when at least one checkbox is checked. Mirrors
+// updateCreateGroupSubmitButton.
+function updateInviteSubmitButton(): void {
+  const submit = document.getElementById('btn-invite-submit') as HTMLButtonElement | null;
+  if (!submit) return;
+  submit.disabled = pickedInvitePeerIDs().length === 0;
+}
+
+// renderInviteModalBody injects one .modal-list-item per
+// candidate peer (NOT yet in the group OR pending) into
+// the #invite-members list, and renders the pending
+// invites section. Filter input narrows by case-
+// insensitive substring match on display name OR alias.
+function renderInviteModalBody(): void {
+  const list = document.getElementById('invite-members');
+  const pendingWrap = document.getElementById('invite-pending-wrap');
+  const pendingList = document.getElementById('invite-pending');
+  if (!list || !pendingWrap || !pendingList || !inviteModalCtx) return;
+
+  const renderedID = inviteModalCtx.renderedID;
+  const cached = groupSettingsCache;
+  const memberHexes = new Set((cached?.members || []).map(m => m.peer_id));
+  const pending = state.pendingInvites.get(renderedID) || new Set<string>();
+  const filterInput = document.getElementById('invite-filter') as HTMLInputElement | null;
+  const q = (filterInput?.value || '').trim().toLowerCase();
+
+  // Candidates = peers not in group AND not pending,
+  // filtered by q.
+  const candidates = state.peers
+    .filter(p => !memberHexes.has(p.PeerID) && !pending.has(p.PeerID))
+    .sort((a, b) => {
+      const sa = a.Online ? 0 : 1;
+      const sb = b.Online ? 0 : 1;
+      if (sa !== sb) return sa - sb;
+      return peerDisplay(a).localeCompare(peerDisplay(b));
+    })
+    .filter(p => {
+      if (!q) return true;
+      const name = peerDisplay(p).toLowerCase();
+      return name.includes(q);
+    });
+
+  // Pending = peers we've sent invites to, awaiting
+  // accept. Filtered by q (typically empty).
+  const pendingRows: string[] = [];
+  for (const peerHex of pending) {
+    const peerInfo = state.peers.find(p => p.PeerID === peerHex);
+    const name = peerInfo ? peerDisplay(peerInfo) : shortId(peerHex);
+    if (q && !name.toLowerCase().includes(q) && !peerHex.includes(q)) continue;
+    pendingRows.push(`
+      <div class="invite-row" data-invite-pending="${escapeHtml(peerHex)}">
+        <span class="member-dot ${peerInfo?.Online ? 'online' : 'offline'}"></span>
+        <div class="member-info">
+          <div class="member-name">${escapeHtml(name)} <span class="invite-status">等待接受…</span></div>
+          <div class="member-meta">${escapeHtml(shortId(peerHex))}</div>
+        </div>
+        <button class="modal-btn ghost" data-invite-resend="${escapeHtml(peerHex)}">重发</button>
+      </div>
+    `);
+  }
+
+  if (candidates.length === 0) {
+    list.innerHTML = `<div class="modal-empty">${state.peers.length === 0
+      ? '尚未发现任何 peer'
+      : q ? '没有匹配的 peer'
+      : '没有可邀请的 peer（已发现的所有 peer 都在群内或邀请中）'}</div>`;
+  } else {
+    list.innerHTML = candidates.map(p => `
+      <label class="modal-list-item" data-peer="${escapeHtml(p.PeerID)}">
+        <input type="checkbox" data-pick-peer="${escapeHtml(p.PeerID)}" ${p.Online ? '' : 'disabled'} />
+        <span class="peer-dot ${p.Online ? 'online' : 'offline'}" style="width:6px;height:6px;"></span>
+        <div>
+          <div class="name">${escapeHtml(peerDisplay(p))}</div>
+          <div class="meta">${escapeHtml(p.Addrs[0]?.split(':')[0] || '')}${p.Online ? '' : ' · 离线'}</div>
+        </div>
+      </label>
+    `).join('');
+  }
+
+  if (pendingRows.length === 0) {
+    pendingWrap.setAttribute('hidden', '');
+  } else {
+    pendingWrap.removeAttribute('hidden');
+    pendingList.innerHTML = pendingRows.join('');
+  }
+
+  updateInviteSubmitButton();
+}
+
+// submitInvite walks the checked peers, sends an
+// invite for each (sequential — one per peer), tracks
+// pending invites so the modal refresh shows them in
+// the "等待接受" section, and finally closes the modal.
+// Errors per-peer are collected and shown in a single
+// follow-up toast so the user sees all problems at once
+// instead of one-at-a-time. v1.1.2 (2026-06-30).
+async function submitInvite(): Promise<void> {
+  if (!inviteModalCtx) return;
+  const renderedID = inviteModalCtx.renderedID;
+  const peerHexes = pickedInvitePeerIDs();
+  if (peerHexes.length === 0) return;
+
+  // Track every peer we're sending to in the pending
+  // set so the modal shows them as "等待接受" right
+  // away. Errors below can re-show them as candidates.
   let pending = state.pendingInvites.get(renderedID);
   if (!pending) {
     pending = new Set<string>();
     state.pendingInvites.set(renderedID, pending);
   }
-  pending.add(peerHex);
-  // Disable the button to give feedback.
-  document.querySelector<HTMLButtonElement>(
-    `.invite-btn[data-invite-btn="${CSS.escape(peerHex)}"]`
-  )?.setAttribute('disabled', 'disabled');
+  const submitted: string[] = [];
+  const failures: { peer: string; err: string }[] = [];
+  // Disable the submit button while in flight to
+  // avoid double-submit; close the modal at the end so
+  // the user can keep working in parallel.
+  const submitBtn = document.getElementById('btn-invite-submit') as HTMLButtonElement | null;
+  if (submitBtn) submitBtn.disabled = true;
   try {
-    const ir = await InviteToGroup(renderedID, peerHex);
-    const err = (ir && ir.err) || '';
-    if (err) {
-      toast(`邀请失败: ${err}`, 'error');
-      // Roll back the in-flight so the user can retry.
-      pending.delete(peerHex);
-      const btn = document.querySelector<HTMLButtonElement>(
-        `.invite-btn[data-invite-btn="${CSS.escape(peerHex)}"]`
-      );
-      btn?.removeAttribute('disabled');
-      return;
+    for (const peerHex of peerHexes) {
+      pending.add(peerHex);
+      try {
+        const ir = await InviteToGroup(renderedID, peerHex);
+        const err = (ir && ir.err) || '';
+        if (err) {
+          // Roll back the optimistic add so the peer
+          // shows as a candidate again if the modal is
+          // reopened.
+          pending.delete(peerHex);
+          failures.push({ peer: peerHex, err });
+        } else {
+          submitted.push(peerHex);
+        }
+      } catch (e) {
+        pending.delete(peerHex);
+        failures.push({ peer: peerHex, err: String(e) });
+      }
     }
-    toast('邀请已发送');
-    // Refresh the picker in-place so the now-invited
-    // peer disappears from the candidate list. Re-running
-    // openGroupSettings() also handles the case where the
-    // invitee already accepted quickly (members.json
-    // updated → peer moves from "candidate" to "member").
-    if (state.groupSettingsDrawerOpen) {
-      await openGroupSettings();
-    }
-  } catch (e) {
-    pending.delete(peerHex);
-    document.querySelector<HTMLButtonElement>(
-      `.invite-btn[data-invite-btn="${CSS.escape(peerHex)}"]`
-    )?.removeAttribute('disabled');
-    toast(`邀请失败: ${e}`, 'error');
+  } finally {
+    if (submitBtn) submitBtn.disabled = false;
+  }
+
+  // Result toasts: success → "已发送 N 个邀请"; any
+  // failures → per-peer err dump.
+  if (submitted.length > 0) {
+    toast(`已发送 ${submitted.length} 个邀请，等待对方接受`);
+  }
+  if (failures.length > 0) {
+    const detail = failures
+      .map(f => `${shortId(f.peer)}: ${f.err}`)
+      .join('; ');
+    // Most common reason: peer is online via UDP but
+    // has no active TCP channel to us (their side never
+    // dialled in, or our dial path was idle). The Go
+    // error string contains "peer offline (no active
+    // channel)". Surface a hint that gives the user an
+    // actionable next step — they'll know to ask the
+    // peer to dial in.
+    const hint = failures.some(f => f.err.includes('no active channel'))
+      ? ' 部分 peer 没有活跃 TCP 通道——请对方也运行 innerlink（同一 LAN 即会自动发现），或在那台机器上执行 `dial <你的 ip:port>`'
+      : '';
+    toast(`邀请失败 ${failures.length} 个：${detail}${hint}`, 'error');
+  }
+
+  // Close the modal whether or not everything succeeded
+  // — pending invites are still tracked in state, the
+  // settings drawer (if open) will show them.
+  closeInviteMemberModal();
+  // Refresh group state so the drawer reflects any
+  // online membership changes that happened while the
+  // modal was open. GroupUpdated events from accepts
+  // would also refresh; loadGroups here is a catch-all.
+  await loadGroups();
+  if (state.groupSettingsDrawerOpen) {
+    await openGroupSettings();
   }
 }
 
@@ -2670,12 +2911,86 @@ function wireEvents() {
   document.getElementById('create-group-modal')!.addEventListener('click', (ev) => {
     if (ev.target === ev.currentTarget) closeCreateGroupModal();
   });
+  // Invites
+  // v1.1.2 (2026-06-30): the invite-member modal is a
+  // dialog (like create-group), not an inline picker in
+  // the group-settings drawer. Search-driven, multi-select
+  // checkbox list, footer 取消 / 邀请 buttons, separate
+  // "已发出邀请（等待对方接受）" section. Avoids the
+  // previous inline-picker scaling problem (a 1000-peer
+  // LAN shouldn't render 1000 rows in a flat dropdown).
+  document.getElementById('btn-invite-close')!.addEventListener('click', () => closeInviteMemberModal());
+  document.getElementById('btn-invite-cancel')!.addEventListener('click', () => closeInviteMemberModal());
+  document.getElementById('btn-invite-submit')!.addEventListener('click', () => void submitInvite());
+  document.getElementById('invite-filter')!.addEventListener('input', () => renderInviteModalBody());
+  document.getElementById('invite-members')!.addEventListener('change', () => updateInviteSubmitButton());
+  // Enter inside the filter input submits too. Mirrors
+  // create-group Enter-submits behavior.
+  document.getElementById('invite-filter')!.addEventListener('keydown', (ev) => {
+    const ke = ev as KeyboardEvent;
+    if (ke.key === 'Enter') {
+      ke.preventDefault();
+      const submitBtn = document.getElementById('btn-invite-submit') as HTMLButtonElement | null;
+      if (submitBtn && !submitBtn.disabled) {
+        void submitInvite();
+      }
+    }
+  });
+  // Resend button: clears the in-flight tag for that peer
+  // so submitInvite() will pick them up again. (Cheaper
+  // than re-opening the modal and re-finding them.)
+  document.getElementById('invite-pending')!.addEventListener('click', (ev) => {
+    const t = ev.target as HTMLElement | null;
+    if (!t) return;
+    if (t.classList.contains('modal-btn')) {
+      const peerHex = t.getAttribute('data-invite-resend');
+      if (peerHex && inviteModalCtx) {
+        const set = state.pendingInvites.get(inviteModalCtx.renderedID);
+        if (set) set.delete(peerHex);
+        // Re-render the modal and submit one invite.
+        renderInviteModalBody();
+        // Add the peer back to pickedInvite selection by
+        // checking its checkbox (if it's currently a
+        // candidate); we just toggle the corresponding row.
+        // Simpler: fire submitInvite() with a one-off
+        // InviteToGroup call.
+        void (async () => {
+          try {
+            const ir = await InviteToGroup(inviteModalCtx!.renderedID, peerHex);
+            const err = (ir && ir.err) || '';
+            if (err) {
+              toast(`重发失败: ${err}`, 'error');
+              // Don't re-add to pending; user can retry
+              // again from the picker.
+              return;
+            }
+            // Success → put back into pending so the user
+            // sees "等待接受" again.
+            const s = state.pendingInvites.get(inviteModalCtx!.renderedID);
+            if (s) s.add(peerHex);
+            renderInviteModalBody();
+            toast(`已重发给 ${shortId(peerHex)}`);
+          } catch (e) {
+            toast(`重发失败: ${e}`, 'error');
+          }
+        })();
+      }
+    }
+  });
+  document.getElementById('invite-modal')!.addEventListener('click', (ev) => {
+    if (ev.target === ev.currentTarget) closeInviteMemberModal();
+  });
   // Esc closes the modal too.
   document.addEventListener('keydown', (ev) => {
     const ke = ev as KeyboardEvent;
     if (ke.key !== 'Escape') return;
-    const modal = document.getElementById('create-group-modal');
+    const modal = document.getElementById('invite-modal');
     if (modal && !modal.classList.contains('modal-hidden')) {
+      closeInviteMemberModal();
+      return;
+    }
+    const modal2 = document.getElementById('create-group-modal');
+    if (modal2 && !modal2.classList.contains('modal-hidden')) {
       closeCreateGroupModal();
     }
   });

@@ -950,6 +950,28 @@ body {
   color: var(--muted);
   font-size: 12.5px;
 }
+
+/* v1.1.2 (2026-06-30): invite-member modal helpers.
+ * Empty list message mirrors .settings-empty style;
+ * the in-flight "等待接受" status badge uses muted
+ * text + small font for the secondary signal. */
+.modal-empty {
+  padding: 12px;
+  text-align: center;
+  color: var(--muted);
+  font-size: 12.5px;
+}
+.invite-status {
+  display: inline-block;
+  font-size: 11px;
+  padding: 1px 6px;
+  border-radius: 4px;
+  background: var(--primary-soft);
+  color: var(--primary);
+  margin-left: 4px;
+  vertical-align: middle;
+  font-weight: 500;
+}
 .member-list {
   display: flex;
   flex-direction: column;
