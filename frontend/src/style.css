@@ -994,3 +994,57 @@ body {
   color: var(--muted);
   font-family: var(--mono);
 }
+
+/* v1.1.2 (2026-06-30): invite-member panel inside the
+ * group-settings drawer (creator-only). Toggled via
+ * "+ 邀请成员" button. Lists peers not yet in the
+ * roster; each row has its own "邀请" button that
+ * calls InviteToGroup. */
+.settings-label-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  margin-bottom: 8px;
+  gap: 8px;
+}
+.settings-label-row .settings-label {
+  margin-bottom: 0;
+}
+.modal-btn.ghost {
+  background: var(--primary-soft);
+  color: var(--primary);
+  border: 1px solid transparent;
+  padding: 4px 10px;
+  font-size: 12px;
+  border-radius: 6px;
+  cursor: pointer;
+}
+.modal-btn.ghost:hover { background: var(--primary); color: #fff; }
+.invite-picker {
+  margin-top: 10px;
+  padding: 8px 0 0;
+  border-top: 1px dashed var(--border);
+}
+.invite-picker[hidden] { display: none; }
+.invite-list {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+.invite-row {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 8px 4px;
+  border-bottom: 1px solid var(--border);
+}
+.invite-row:last-child { border-bottom: none; }
+.invite-btn {
+  flex-shrink: 0;
+  padding: 4px 12px;
+  font-size: 12px;
+}
+.invite-btn[disabled] { opacity: 0.5; cursor: not-allowed; }
+/* .settings-empty rules above (line 947) apply to the
+ * empty-state messages in both the member list and the
+ * invite picker — no override needed. */

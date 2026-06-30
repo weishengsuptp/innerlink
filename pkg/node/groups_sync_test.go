@@ -315,6 +315,75 @@ func mustJSON(t *testing.T, v interface{}) []byte {
 	return b
 }
 
+// TestGroupSync_SoloCreator_CanLeave: pins down
+// the v1.1.2 (2026-06-30) hotfix that lets a creator
+// who's the SOLE remaining member self-dissolve their
+// group. Pre-fix bug: LeaveGroup called RemoveMember,
+// which protects the creator in pkg/group/members.go
+// (line 154-159) — so RemoveMember returned false and
+// LeaveGroup errored with "node: LeaveGroup: RemoveMember
+// returned false". The empty-members "delete group"
+// branch below it was unreachable when self is the only
+// AND the creator.
+//
+// After the fix:
+//   - LeaveGroup returns nil
+//   - The local members.json is gone (DeleteGroup path)
+//   - The local chat.enc is gone
+//   - A GroupRemoved event fires so the frontend's
+//     sidebar refresh takes the group away
+//   - The error message does not leak back to the user
+func TestGroupSync_SoloCreator_CanLeave(t *testing.T) {
+	n, rendered := newTestNode(t)
+
+	ch := n.SubscribeGroups()
+	// Drain startup GroupAdded so it doesn't satisfy the
+	// GroupRemoved assertion below.
+	drainGroupEvent(t, ch, func(e GroupEvent) bool {
+		return e.Type == GroupAdded && e.GroupID == rendered
+	}, 1*time.Second)
+
+	// Sanity: members.json exists, exactly 1 member (self).
+	rawID, err := group.ParseGroupID(rendered)
+	if err != nil {
+		t.Fatal(err)
+	}
+	before, err := group.LoadMembers(n.dataDir(), rawID)
+	if err != nil {
+		t.Fatalf("LoadMembers before LeaveGroup: %v", err)
+	}
+	if len(before.Members) != 1 {
+		t.Fatalf("setup: pre-leave members=%d, want 1", len(before.Members))
+	}
+	if before.Creator != n.id.PeerIDHex() {
+		t.Fatalf("setup: creator mismatch")
+	}
+
+	// Act: solo creator leaves.
+	if err := n.LeaveGroup(rendered); err != nil {
+		t.Fatalf("solo creator LeaveGroup: got error %v, want nil", err)
+	}
+
+	// Assert: members.json no longer exists on disk.
+	if _, err := group.LoadMembers(n.dataDir(), rawID); !os.IsNotExist(err) {
+		t.Errorf("post-leave LoadMembers err=%v, want os.ErrNotExist", err)
+	}
+
+	// Assert: GroupRemoved event fires.
+	ev := drainGroupEvent(t, ch, func(e GroupEvent) bool {
+		return e.Type == GroupRemoved && e.GroupID == rendered
+	}, 1*time.Second)
+	if ev.GroupName != "测试群" {
+		t.Errorf("GroupRemoved event name=%q, want %q", ev.GroupName, "测试群")
+	}
+
+	// Assert: a second LeaveGroup call errors (not a member
+	// anymore) — proves the group is really gone locally.
+	if err := n.LeaveGroup(rendered); err == nil {
+		t.Errorf("second LeaveGroup returned nil; want not-a-member error")
+	}
+}
+
 // guard against stale tempdir files silently breaking
 // the test setup (Windows file-locking is occasionally
 // flaky — bail loud instead of weird "t.TempDir not

@@ -444,7 +444,62 @@ at(24500, async () => {
     'G8: B did NOT receive g8-post-leave (B left, no longer on roster)');
 }, 'G8: leaver is dropped from the post-leave broadcast list');
 
+// G9: solo creator self-dissolve. Pins down v1.1.2
+// (2026-06-30) hotfix. Pre-fix bug: a creator who's the
+// SOLE remaining member could NOT leave because
+// pkg/group/members.go RemoveMember protects the
+// creator from being removed. LeaveGroup errored with
+// "RemoveMember returned false" and chat.enc was left
+// in place. Post-fix: explicit solo-creator branch
+// that calls deleteGroupDirsLocal (which removes BOTH
+// chat.enc AND members.json) and publishes GroupRemoved.
+//
+// Use a fresh group dedicated to G9 so it doesn't share
+// state with G7/G8 (which already torn down the original
+// 3-peer group). G8 starts at T+24500 with ~1500ms of
+// sleeps; scheduling G9 at T+26000 lets G8 finish first.
 at(26000, async () => {
+  console.log('\n=== G9: solo creator self-dissolve ===');
+  // Spin up a brand-new group on A, no invites.
+  send('A', 'group create g9-solo');
+  await sleep(400);
+  const aLogEarly = fs.readFileSync(path.join(ROOT, 'a.log'), 'utf8');
+  const matches = aLogEarly.match(/created\s+(g_[0-9a-f]{64})/g);
+  // Take the LAST created line (G9's group).
+  if (!matches) {
+    assert(false, 'G9: could not parse created group id');
+    return;
+  }
+  const gid = matches[matches.length - 1].split(/\s+/)[1];
+  console.log(`  G9 group id: ${gid}`);
+  // Sanity: A has 1 member on this group.
+  send('A', `group show ${gid}`);
+  await sleep(300);
+  const pre = lastGroupShowOutput('A', gid);
+  assert(pre?.count === 1, `G9: pre-leave A's members = ${pre?.count}, want 1`);
+  // A leaves. Before the fix this errored with
+  // "RemoveMember returned false" and left chat.enc.
+  send('A', `group leave ${gid}`);
+  await sleep(800);
+  // After the fix: members.json + chat.enc both gone, so
+  // `group list` filters this gid out (chat.enc gone).
+  send('A', 'group list');
+  await sleep(400);
+  const aLog = fs.readFileSync(path.join(ROOT, 'a.log'), 'utf8');
+  assert(/solo creator self-dissolved/.test(aLog),
+    'G9: A log shows "solo creator self-dissolved" — post-fix branch wired in');
+  // The group should be invisible to ListGroups now (chat.enc gone).
+  // lastGroupShowOutput scans for a "members=N" line; if gid is no
+  // longer on disk we should NOT find one for gid after the leave.
+  const linesAfterLeave = aLog.split(/\r?\n/);
+  const leaveIdx = linesAfterLeave.findIndex(l => /solo creator self-dissolved/.test(l));
+  const after = leaveIdx >= 0 ? linesAfterLeave.slice(leaveIdx) : [];
+  const stillShows = after.some(l => l.includes(gid) && /members=\d+/.test(l));
+  assert(!stillShows,
+    'G9: gid no longer surfaces in A\'s `group show` (chat.enc gone → ListGroups filters it)');
+}, 'G9: solo creator self-dissolve (v1.1.2 LeaveGroup hotfix)');
+
+at(28000, async () => {
   console.log('\n=== FINAL ===');
   if (failures > 0) {
     console.log(`\u274C ${failures} assertion(s) FAILED`);
