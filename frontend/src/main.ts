@@ -119,6 +119,22 @@ interface UIState {
   // re-trigger renderHistoryList so the user sees new
   // messages arrive live. v1.1 (2026-06-27).
   historyDrawerOpen: boolean;
+  // groupSettingsDrawerOpen: is the right-side group
+  // settings (⋯ button → 群设置) drawer currently visible?
+  // v1.1.2 (2026-06-30): tracked explicitly so an
+  // outside-click handler can mirror the history drawer
+  // pattern (close on click anywhere outside, not only on
+  // the X button).
+  groupSettingsDrawerOpen: boolean;
+  // pendingInvites: per-group set of peer hexes that the
+  // user clicked "邀请" on but for which we haven't seen a
+  // roster update yet (the invitee hasn't accepted).
+  // Hides those peers from the invite picker so the user
+  // doesn't double-tap. Cleared automatically when the
+  // roster refreshes (CreatorOnAccept adds the joiner to
+  // members.json → the peer is no longer a "candidate"
+  // anyway). v1.1.2 (2026-06-30).
+  pendingInvites: Map<string, Set<string>>;
 }
 
 interface FileBubbleState {
@@ -145,6 +161,8 @@ const state: UIState = {
   groupUnread: new Map(),
   fileBubbles: new Map(),
   historyDrawerOpen: false,
+  groupSettingsDrawerOpen: false,
+  pendingInvites: new Map(),
 };
 
 // isGroupId reports whether the conversation key is a
@@ -1727,12 +1745,19 @@ function toggleGroupSettingsDrawer(open: boolean): void {
   if (!drawer) return;
   drawer.classList.toggle('open', open);
   drawer.setAttribute('aria-hidden', open ? 'false' : 'true');
+  // Mirror into the UIState flag so the outside-click
+  // handler (registered below) knows whether to fire.
+  // v1.1.2 (2026-06-30): was previously only a class
+  // swap on the DOM, which meant clicking outside the
+  // drawer did nothing — users had to use the X button
+  // to dismiss.
+  state.groupSettingsDrawerOpen = open;
 }
 
 function renderGroupSettingsPanel(): void {
   const body = document.getElementById('group-settings-body');
   if (!body || !groupSettingsCache) return;
-  const { groupName, remark, members, isCreator } = groupSettingsCache;
+  const { renderedID, groupName, remark, members, isCreator } = groupSettingsCache;
   // Sort: creator first, then self, then by joined_at
   // ascending. Falls back to the on-disk order if a row
   // is missing joined_at (shouldn't happen post-v1.1).
@@ -1786,13 +1811,128 @@ function renderGroupSettingsPanel(): void {
     </div>
     ${editBlockerNote}
     <div class="settings-section">
-      <div class="settings-label">成员（${members.length}）</div>
+      <div class="settings-label-row">
+        <span class="settings-label">成员（${members.length}）</span>
+        ${isCreator ? `<button class="modal-btn ghost" id="gs-invite-toggle">+ 邀请成员</button>` : ''}
+      </div>
       <div class="member-list">${memberRowsHtml || '<div class="settings-empty">还没有成员</div>'}</div>
+      <div id="gs-invite-picker" class="invite-picker" hidden></div>
     </div>
   `;
   if (isCreator) {
     document.getElementById('gs-name-save')?.addEventListener('click', () => void saveGroupName());
     document.getElementById('gs-remark-save')?.addEventListener('click', () => void saveGroupRemark());
+    // v1.1.2 (2026-06-30): "邀请成员" button toggles the
+    // picker. Each row inside the picker has its own
+    // "邀请" button that calls InviteToGroup. Pre-fix:
+    // there was no way to add a peer to an existing group
+    // (the only path was CreateGroup's initial invitee
+    // checklist). The picker uses state.pendingInvites to
+    // hide peers whose invite is in flight.
+    const toggleBtn = document.getElementById('gs-invite-toggle');
+    const picker = document.getElementById('gs-invite-picker');
+    if (toggleBtn && picker) {
+      toggleBtn.addEventListener('click', () => {
+        const wasHidden = picker.hasAttribute('hidden');
+        if (wasHidden) {
+          picker.innerHTML = inviteMemberPickerHtml(renderedID, members);
+          picker.removeAttribute('hidden');
+          toggleBtn.textContent = '收起';
+          // Wire per-row invite buttons.
+          picker.querySelectorAll<HTMLButtonElement>('.invite-btn').forEach(btn => {
+            const peerHex = btn.getAttribute('data-invite-btn') || '';
+            if (peerHex) {
+              btn.addEventListener('click', () => void invitePeerToGroup(renderedID, peerHex));
+            }
+          });
+        } else {
+          picker.setAttribute('hidden', '');
+          picker.innerHTML = '';
+          toggleBtn.textContent = '+ 邀请成员';
+        }
+      });
+    }
+  }
+}
+
+// inviteMemberPickerHtml returns the inner HTML for the
+// invite-peers panel: a row per PEER that is NOT yet in
+// this group's roster AND hasn't been invited in the
+// current session. Each row has its own "邀请" button.
+// v1.1.2 (2026-06-30): previously no way to add members
+// to an existing group.
+function inviteMemberPickerHtml(renderedID: string, members: GroupMemberDetail[]): string {
+  const memberHexes = new Set(members.map(m => m.peer_id));
+  const pending = state.pendingInvites.get(renderedID) || new Set<string>();
+  const candidates = state.peers.filter(
+    p => !memberHexes.has(p.PeerID) && !pending.has(p.PeerID)
+  );
+  if (candidates.length === 0) {
+    return `<div class="settings-empty">所有已发现 peer 都已在群内或邀请中</div>`;
+  }
+  const rows = candidates.map(p => {
+    const name = peerDisplay(p) || shortId(p.PeerID);
+    return `
+      <div class="invite-row">
+        <span class="member-dot ${p.Online ? 'online' : 'offline'}"></span>
+        <div class="member-info">
+          <div class="member-name">${escapeHtml(name)}</div>
+          <div class="member-meta">${escapeHtml(shortId(p.PeerID))}</div>
+        </div>
+        <button class="modal-btn primary invite-btn" data-invite-btn="${escapeHtml(p.PeerID)}">邀请</button>
+      </div>
+    `;
+  }).join('');
+  return `<div class="invite-list">${rows}</div>`;
+}
+
+// invitePeerToGroup sends one InviteToGroup envelope
+// from the Wails-Go bridge, then refreshes the picker
+// (peer hidden via state.pendingInvites while in flight).
+// On error, the peer becomes re-invitable. v1.1.2
+// (2026-06-30).
+async function invitePeerToGroup(renderedID: string, peerHex: string): Promise<void> {
+  // Optimistically mark in-flight so the picker hides
+  // this peer immediately (and so a fast double-tap
+  // doesn't fire two invites).
+  let pending = state.pendingInvites.get(renderedID);
+  if (!pending) {
+    pending = new Set<string>();
+    state.pendingInvites.set(renderedID, pending);
+  }
+  pending.add(peerHex);
+  // Disable the button to give feedback.
+  document.querySelector<HTMLButtonElement>(
+    `.invite-btn[data-invite-btn="${CSS.escape(peerHex)}"]`
+  )?.setAttribute('disabled', 'disabled');
+  try {
+    const ir = await InviteToGroup(renderedID, peerHex);
+    const err = (ir && ir.err) || '';
+    if (err) {
+      toast(`邀请失败: ${err}`, 'error');
+      // Roll back the in-flight so the user can retry.
+      pending.delete(peerHex);
+      const btn = document.querySelector<HTMLButtonElement>(
+        `.invite-btn[data-invite-btn="${CSS.escape(peerHex)}"]`
+      );
+      btn?.removeAttribute('disabled');
+      return;
+    }
+    toast('邀请已发送');
+    // Refresh the picker in-place so the now-invited
+    // peer disappears from the candidate list. Re-running
+    // openGroupSettings() also handles the case where the
+    // invitee already accepted quickly (members.json
+    // updated → peer moves from "candidate" to "member").
+    if (state.groupSettingsDrawerOpen) {
+      await openGroupSettings();
+    }
+  } catch (e) {
+    pending.delete(peerHex);
+    document.querySelector<HTMLButtonElement>(
+      `.invite-btn[data-invite-btn="${CSS.escape(peerHex)}"]`
+    )?.removeAttribute('disabled');
+    toast(`邀请失败: ${e}`, 'error');
   }
 }
 
@@ -2757,6 +2897,14 @@ function wireEvents() {
   document.addEventListener('keydown', (ev) => {
     if (ev.key === 'Escape') {
       hideFileContextMenu();
+      // v1.1.2 (2026-06-30): Esc also closes the
+      // group-settings drawer (mirrors the history drawer
+      // behavior — both right-side overlays share the
+      // same dismiss convention).
+      if (state.groupSettingsDrawerOpen) {
+        closeGroupSettings();
+        return;
+      }
       if (state.historyDrawerOpen) {
         void toggleHistoryDrawer();
       }
@@ -2793,6 +2941,27 @@ function wireEvents() {
     // Anything else (chat area, sidebar, peer list, …)
     // closes the drawer.
     void toggleHistoryDrawer();
+  });
+
+  // Outside-click closes the group-settings drawer
+  // (⋮ button → 群设置). v1.1.2 (2026-06-30): the prior
+  // implementation only closed via the X button — users
+  // had to dismiss the drawer manually, which felt
+  // inconsistent with the history drawer's behavior and
+  // got in the way of clicking on chat content. Mirrors
+  // the history drawer pattern above.
+  document.addEventListener('click', (ev) => {
+    if (!state.groupSettingsDrawerOpen) return;
+    const t = ev.target as HTMLElement | null;
+    if (!t) return;
+    // Click inside the drawer (header / body / buttons) —
+    // leave it alone.
+    if (t.closest('#group-settings-drawer')) return;
+    // Click on the toggle button (⋯) — its own listener
+    // opens the drawer; an outside-click here would race
+    // with it.
+    if (t.closest('#btn-group-settings')) return;
+    closeGroupSettings();
   });
 
   // Live event streams from Go.

@@ -657,6 +657,32 @@ func (n *Node) HistoryGroup(renderedID string) ([]Message, error) {
 	return out, nil
 }
 
+// deleteGroupDirsLocal removes BOTH the chat.enc + sender-keys
+// directory (via chatStore.DeleteGroup, which targets
+// <chatStore.SaveDir()>/groups/<gid> = <saveDir>/chat/groups/<gid>)
+// AND the members.json directory (n.dataDir()/groups/<gid>,
+// a different root because chatStore opens saveDir under an
+// extra "chat/" layer). The chat package's DeleteGroup only
+// touches the chat side — without this helper LeaveGroup
+// left members.json behind on the leaver's disk, which made
+// a second LeaveGroup see self still listed (it appeared to
+// "succeed" forever) and left stale disk state for future
+// CreateGroup that happened to land on the same GroupID.
+//
+// v1.1.2 (2026-06-30) — pinned down by the user-reported
+// "solo creator can't leave group" bug: chatStore.DeleteGroup
+// alone was insufficient.
+func (n *Node) deleteGroupDirsLocal(renderedID string) error {
+	membersDir := filepath.Join(n.dataDir(), storage.GroupDirName, renderedID)
+	if err := os.RemoveAll(membersDir); err != nil {
+		return fmt.Errorf("node: remove members dir %s: %w", membersDir, err)
+	}
+	if err := n.chatStore.DeleteGroup(renderedID); err != nil {
+		return fmt.Errorf("node: chatStore.DeleteGroup: %w", err)
+	}
+	return nil
+}
+
 // LeaveGroup removes self from the group's roster and
 // deletes the local directory (chat.enc + members.json).
 // Every REMAINING member receives the new roster via
@@ -670,6 +696,24 @@ func (n *Node) HistoryGroup(renderedID string) ([]Message, error) {
 // receiver side is ApplyRosterUpdate, which only needs the
 // post-leave roster to do its job (no separate leave
 // envelope type — roster diff is enough).
+//
+// Three creator-leave branches:
+//   - creator + ≥1 other member → REJECT (orphan on the
+//     creator's side; the proper path is a future
+//     DissolveGroup broadcast — v1.1.x TODO).
+//   - creator + alone (only self in roster) → SELF-DISSOLVE
+//     (delete chat.enc + members.json, publish
+//     GroupRemoved). This branch exists because
+//     Members.RemoveMember protects the creator from being
+//     removed (a defensive guard against accidental group
+//     orphaning), so without this special-case the empty-
+//     members delete branch below is unreachable for solo
+//     creators and LeaveGroup errors out with
+//     "RemoveMember returned false" — the user-reported
+//     "solo creator can't leave" bug. v1.1.2 (2026-06-30)
+//     hotfix.
+//   - non-creator → standard RemoveMember + broadcast
+//     roster to remaining peers.
 //
 // Offline-receiver caveat: if a remaining member has no
 // active channel at leave time, broadcastRosterUpdate
@@ -691,6 +735,7 @@ func (n *Node) LeaveGroup(renderedID string) error {
 	if !m.Contains(selfHex) {
 		return errors.New("node: LeaveGroup: not a member")
 	}
+	// Creator-leave branches (see function doc).
 	// v1.1 (2026-06-28, hotfix): allow the creator to leave
 	// when they're the SOLE remaining member — this is
 	// effectively a self-dissolve (the empty-members branch
@@ -700,9 +745,30 @@ func (n *Node) LeaveGroup(renderedID string) error {
 	// creator entries in everyone else's roster. The proper
 	// path for "I'm done with this group and want everyone
 	// out" is a DissolveGroup broadcast (v1.1.x TODO).
-	if m.Creator == selfHex && len(m.Members) > 1 {
-		return errors.New("node: LeaveGroup: 群主无法直接退出，请等待其他成员先退出或解散群聊（v1.1.x TODO DissolveGroup）")
+	if m.Creator == selfHex {
+		if len(m.Members) > 1 {
+			return errors.New("node: LeaveGroup: 群主无法直接退出，请等待其他成员先退出或解散群聊（v1.1.x TODO DissolveGroup）")
+		}
+		// v1.1.2 (2026-06-30) hotfix: solo creator self-dissolve.
+		// Members.RemoveMember protects the creator from being
+		// removed (so an accidental RemoveMember(self) call can't
+		// orphan the group), which means the empty-members
+		// branch below is unreachable when self is the only
+		// member AND the creator. Without this explicit path,
+		// the user gets the cryptic "RemoveMember returned false"
+		// error and the group can't be left at all.
+		if err := n.deleteGroupDirsLocal(renderedID); err != nil {
+			return err
+		}
+		log.Printf("[GROUP ] solo creator self-dissolved group=%s", renderedID)
+		n.publishGroupEvent(GroupEvent{
+			Type:      GroupRemoved,
+			GroupID:   renderedID,
+			GroupName: m.GroupName,
+		})
+		return nil
 	}
+	// Non-creator path.
 	if !m.RemoveMember(selfHex) {
 		return errors.New("node: LeaveGroup: RemoveMember returned false")
 	}
@@ -711,8 +777,14 @@ func (n *Node) LeaveGroup(renderedID string) error {
 	// new roster to remaining members (v1.1.2 hotfix —
 	// before this, remaining peers kept a stale "<N> 成员
 	// / <N> 在线" until restart).
+	//
+	// v1.1.2: chatStore.DeleteGroup alone only removes
+	// chat.enc; members.json sits under a different root
+	// (see deleteGroupDirsLocal). Use the helper so the
+	// second LeaveGroup actually sees "not a member" instead
+	// of looping through this branch forever.
 	if len(m.Members) == 0 {
-		return n.chatStore.DeleteGroup(renderedID)
+		return n.deleteGroupDirsLocal(renderedID)
 	}
 	if err := m.Save(n.dataDir(), rawID); err != nil {
 		return err
