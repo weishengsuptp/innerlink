@@ -120,7 +120,33 @@ func (s *Store) HistoryGroup(renderedGroupID string) ([]*Record, error) {
 // members.json + sender-keys/). Used when leaving a group or
 // when a creator dissolves one. Returns nil if the directory
 // didn't exist (idempotent).
+//
+// v1.1.3 (2026-06-30) hotfix: also evict the cached groupFile
+// from s.groupFiles. Pre-fix, DeleteGroup only removed the
+// on-disk directory; the next AppendGroup call landed on the
+// cached handle and jumped straight to writeFrame, whose
+// os.OpenFile(..., O_CREATE|O_APPEND, ...) created chat.enc
+// but NOT its parent directory (O_CREATE only handles the
+// file, not missing parents). The reopen errored with
+// "The system cannot find the path specified", the cache
+// entry stayed stale, and every subsequent AppendGroup for
+// the same group ID also failed. Net effect: a peer who
+// left and was re-invited never had chat.enc re-seeded, so
+// ListGroups kept filtering the group out of their sidebar
+// (user-visible: "退群后再受邀，本地侧不显示群"). Evicting
+// here forces openGroupFile's MkdirAll + fresh-handle path
+// to run on the next AppendGroup, so re-join recovers
+// cleanly.
 func (s *Store) DeleteGroup(renderedGroupID string) error {
+	// Evict FIRST so a concurrent AppendGroup that arrives
+	// after our os.RemoveAll but races on groupMu can't find
+	// the stale entry. groupMu guards both the map insert
+	// in openGroupFile AND this delete; paired locks stay
+	// consistent.
+	s.groupMu.Lock()
+	delete(s.groupFiles, renderedGroupID)
+	s.groupMu.Unlock()
+
 	dir := filepath.Join(s.SaveDir(), GroupDirName, renderedGroupID)
 	err := os.RemoveAll(dir)
 	if err != nil {
@@ -166,12 +192,26 @@ func (s *Store) openGroupFile(renderedGroupID string) (*groupFile, error) {
 	if s.groupFiles == nil {
 		s.groupFiles = make(map[string]*groupFile)
 	}
-	if gf, ok := s.groupFiles[renderedGroupID]; ok {
-		return gf, nil
-	}
 	dir := filepath.Join(s.SaveDir(), GroupDirName, renderedGroupID)
+	// v1.1.3 (2026-06-30) hotfix: run MkdirAll UNCONDITIONALLY
+	// before returning the cached handle. Pre-fix, the cache
+	// hit skipped this and writeFrame's O_CREATE failed when
+	// the parent dir was missing (e.g. after DeleteGroup
+	// wiped the dir but somehow the entry stayed — happens
+	// for binaries running before v1.1.3 that already have
+	// stale entries from earlier DeleteGroup calls).
+	// MkdirAll is a cheap no-op when the dir already exists,
+	// so doing it on every call costs nothing in the normal
+	// path; it makes openGroupFile robust against any future
+	// or legacy cache-vs-disk skew. Combined with DeleteGroup
+	// evicting the entry on v1.1.3+, fresh runs are always
+	// correct; legacy running processes get auto-recovered
+	// on the next AppendGroup without needing a restart.
 	if err := os.MkdirAll(dir, 0o700); err != nil {
 		return nil, fmt.Errorf("storage: mkdir %s: %w", dir, err)
+	}
+	if gf, ok := s.groupFiles[renderedGroupID]; ok {
+		return gf, nil
 	}
 	gf := &groupFile{
 		path: groupFilePath(s.SaveDir(), renderedGroupID),
