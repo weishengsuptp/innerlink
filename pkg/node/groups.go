@@ -1255,6 +1255,90 @@ func (n *Node) broadcastRosterUpdate(m *group.Members) {
 		delivered, len(m.Members)-1)
 }
 
+// syncRostersToPeer pushes fresh TypeGroupRosterUpdate
+// envelopes for every local group that includes peerHex
+// in its roster. Best-effort / silent skip when peerHex
+// is offline or in 0 groups.
+//
+// v1.1.2 (2026-06-30) hotfix — addresses the user-reported
+// "stale member list after peer comes back online" symptom:
+//
+//   - Round 1: a peer is added to a group while peers A
+//     and B are online. CreatorOnAccept broadcasts the
+//     roster to both — they sync.
+//   - Then B restarts their innerlink.exe. B's channels map
+//     is empty. A's `n.channels.get(B)` is populated when
+//     B's TCP handshake completes (line ~676 of node.go).
+//   - But there's NO roster push from A's perspective — A's
+//     local hasn't changed, so no broadcast fires.
+//   - Result: B's local members.json is whatever it was at
+//     B's last refresh point — could be stale (only
+//     [creator, self]) even though it's now a member of a
+//     3-person group.
+//
+// syncRostersToPeer closes that gap: as soon as the new
+// channel is up, walk all groups where peerHex is a
+// member, push fresh rosters over this channel. The
+// peer's ApplyRosterUpdate rebuilds their local
+// members.json and publishes GroupUpdated locally so the
+// sidebar count re-aligns.
+//
+// We deliberately skip groups where peerHex is NOT a
+// member — that would create a phantom members.json on
+// their disk via ApplyRosterUpdate's "always Save"
+// behavior, surfacing the group in their sidebar even
+// though they were never invited. The check is
+// `m.Contains(peerHex)` so this skips non-members
+// silently.
+func (n *Node) syncRostersToPeer(peerHex string, ch *protocol.Channel) {
+	if n.id == nil || n.chatStore == nil || len(peerHex) == 0 || ch == nil {
+		return
+	}
+	renderedIDs, err := n.chatStore.ListGroups()
+	if err != nil {
+		log.Printf("[WARN ] syncRostersToPeer(%s): list groups: %v", peerHex, err)
+		return
+	}
+	sent := 0
+	for _, rendered := range renderedIDs {
+		rawID, err := group.ParseGroupID(rendered)
+		if err != nil {
+			continue
+		}
+		m, err := group.LoadMembers(n.dataDir(), rawID)
+		if err != nil {
+			continue
+		}
+		if !m.Contains(peerHex) {
+			continue
+		}
+		payload, err := json.Marshal(rosterPayload{
+			GroupID:   m.GroupID,
+			GroupName: m.GroupName,
+			Creator:   m.Creator,
+			Members:   m.Members,
+			Remark:    m.Remark,
+		})
+		if err != nil {
+			log.Printf("[WARN ] syncRostersToPeer(%s): marshal %s: %v", peerHex, rendered, err)
+			continue
+		}
+		env := protocol.Envelope{
+			Type:    protocol.TypeGroupRosterUpdate,
+			Payload: payload,
+			GroupID: rawID,
+		}
+		if err := ch.Send(n.ctx, env); err != nil {
+			log.Printf("[WARN ] syncRostersToPeer(%s): send %s: %v", peerHex, rendered, err)
+			continue
+		}
+		sent++
+	}
+	if sent > 0 {
+		log.Printf("[GROUP ] roster pre-sync to %s: %d group(s)", peerHex, sent)
+	}
+}
+
 // broadcastMetaUpdate sends an updated name + remark to
 // every member (except self). Best-effort like
 // broadcastRosterUpdate. v1.1.1 (2026-06-29).

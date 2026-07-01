@@ -691,6 +691,18 @@ func (n *Node) wrapChannel(conn *transport.Conn, sess *handshake.Session) {
 	n.sendRosterSync(ch)
 	// v0.5.3: also send our scan history.
 	n.sendScanHistory(ch)
+	// v1.1.2 (2026-06-30): push fresh TypeGroupRosterUpdate
+	// envelopes for every group this new peer is a member of.
+	// Pre-fix the only sync trigger was a roster-MUTATING
+	// event (join / leave / rename), so a peer who came back
+	// online after a long absence kept the stale pre-disconnect
+	// roster on their disk. UI symptom: "stale member count
+	// even though we all see each other + can chat" — chat
+	// flows because message dispatch doesn't gate on roster,
+	// but ListGroups returns the stale count. Now any peer
+	// whose channel comes up gets a healing push so its
+	// members.json re-aligns with the canonical truth on disk.
+	n.syncRostersToPeer(peerHexStr, ch)
 
 	n.wg.Add(1)
 	go func() {
