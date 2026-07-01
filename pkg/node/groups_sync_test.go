@@ -29,6 +29,7 @@ import (
 
 	"github.com/weishengsuptp/innerlink/internal/logx"
 	"github.com/weishengsuptp/innerlink/internal/protocol"
+	"github.com/weishengsuptp/innerlink/internal/storage"
 	"github.com/weishengsuptp/innerlink/pkg/group"
 )
 
@@ -499,6 +500,216 @@ func TestGroupSync_SoloCreator_CanLeave(t *testing.T) {
 	if err := n.LeaveGroup(rendered); err == nil {
 		t.Errorf("second LeaveGroup returned nil; want not-a-member error")
 	}
+}
+
+// TestGroupSync_LeaveThenRejoin_ReSeedsChatEnc pins down the
+// v1.1.3 regression (2026-06-30) reported by 潇男: a peer
+// who leaves a group and is then re-invited doesn't see the
+// group in their sidebar, even though the creator's roster
+// shows them as a member. Pre-fix hypothesis: AcceptGroupInvite
+// fails to re-seed chat.enc on the rejoiner's local after the
+// prior LeaveGroup wiped it (the chatStore keeps a cached
+// groupFile handle in its groupFiles map; DeleteGroup doesn't
+// evict the entry, so the next AppendGroup returns the cached
+// handle but the underlying path was removed — depending on
+// the cached vs. on-disk state, the chat.enc may not end up
+// visible to ListGroups).
+//
+// This test exercises the storage layer directly (no network,
+// no signature verify) and asserts that the leave→rejoin
+// sequence leaves chat.enc in the right state for ListGroups
+// to surface the group on the rejoiner's side. If this test
+// PASSES, the user's bug is upstream of storage (signature
+// verify / unmarshal / network delivery). If this test FAILS,
+// it's the chatFiles map caching bug and the fix is to evict
+// the entry on DeleteGroup OR force-recreate chat.enc in
+// AppendGroup's openGroupFile path.
+func TestGroupSync_LeaveThenRejoin_ReSeedsChatEnc(t *testing.T) {
+	n, rendered := newTestNode(t)
+	rawID, err := group.ParseGroupID(rendered)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Seed an "invitee" peer record so the local members.json
+	// has more than just the creator. This mirrors what
+	// AcceptGroupInvite does after a successful first accept.
+	const inviteeHex = "11112222333344445555666677778888"
+	{
+		m, err := group.LoadMembers(n.dataDir(), rawID)
+		if err != nil {
+			t.Fatalf("LoadMembers setup: %v", err)
+		}
+		if err := m.AddMember(group.Member{
+			PeerID:   inviteeHex,
+			JoinedAt: time.Now().UTC(),
+		}); err != nil {
+			t.Fatalf("setup AddMember: %v", err)
+		}
+		if err := m.Save(n.dataDir(), rawID); err != nil {
+			t.Fatalf("setup Save: %v", err)
+		}
+		// v1.1 (2026-06-29) hotfix seed: AcceptGroupInvite
+		// writes the "已加入群聊" system record to chat.enc so
+		// ListGroups (which filters by chat.enc existence in
+		// storage/group.go) surfaces this group on the
+		// rejoiner's sidebar. Mirror that here.
+		if err := n.chatStore.AppendGroup(rendered, &storage.Record{
+			Timestamp: time.Now().UTC(),
+			From:      inviteeHex,
+			To:        "",
+			Direction: "system",
+			Body:      "已加入群聊",
+			GroupID:   rendered,
+			MsgID:     "",
+		}); err != nil {
+			t.Fatalf("setup AppendGroup: %v", err)
+		}
+	}
+
+	// Sanity: ListGroups now returns 1 group (chat.enc exists).
+	pre, err := n.ListGroups()
+	if err != nil {
+		t.Fatalf("pre ListGroups: %v", err)
+	}
+	if len(pre) != 1 {
+		t.Fatalf("pre ListGroups count = %d, want 1", len(pre))
+	}
+
+	// ── Cycle 1: invitee leaves + then re-joins ────────────────
+	// 1a. Simulate the LeaveGroup cleanup for the invitee:
+	//     remove them from members.json + delete chat.enc.
+	//     This is exactly what LeaveGroup's non-creator branch
+	//     does when `len(m.Members) != 0` after self-removal.
+	{
+		m, err := group.LoadMembers(n.dataDir(), rawID)
+		if err != nil {
+			t.Fatalf("LoadMembers leave-cycle: %v", err)
+		}
+		if !m.RemoveMember(inviteeHex) {
+			t.Fatalf("RemoveMember(%s) returned false", inviteeHex)
+		}
+		if err := m.Save(n.dataDir(), rawID); err != nil {
+			t.Fatalf("Save leave-cycle: %v", err)
+		}
+		if err := n.chatStore.DeleteGroup(rendered); err != nil {
+			t.Fatalf("DeleteGroup leave-cycle: %v", err)
+		}
+	}
+	mid, err := n.ListGroups()
+	if err != nil {
+		t.Fatalf("mid ListGroups: %v", err)
+	}
+	if len(mid) != 0 {
+		t.Fatalf("post-leave ListGroups count = %d, want 0 (chat.enc filtered)", len(mid))
+	}
+
+	// 1b. Re-invite simulated. AcceptGroupInvite would:
+	//     - m.AddMember(self) — we use a fresh inviteeHex2 to
+	//       keep the test independent of any "self is creator"
+	//       branch bias
+	//     - m.Save
+	//     - chatStore.AppendGroup "已加入群聊" (THE BUG POINT)
+	const inviteeHex2 = "aaaaaaaaaabbbbbbbbcccccccccccc"
+	if err := func() error {
+		m, err := group.LoadMembers(n.dataDir(), rawID)
+		if err != nil {
+			return err
+		}
+		if err := m.AddMember(group.Member{
+			PeerID:   inviteeHex2,
+			JoinedAt: time.Now().UTC(),
+		}); err != nil {
+			return err
+		}
+		if err := m.Save(n.dataDir(), rawID); err != nil {
+			return err
+		}
+		// v1.1 hotfix seed. EXACTLY the line in
+		// AcceptGroupInvite that the user-reported bug
+		// "已退群再受邀看不到群" is hypothesised to break.
+		return n.chatStore.AppendGroup(rendered, &storage.Record{
+			Timestamp: time.Now().UTC(),
+			From:      inviteeHex2,
+			To:        "",
+			Direction: "system",
+			Body:      "已加入群聊",
+			GroupID:   rendered,
+			MsgID:     "",
+		})
+	}(); err != nil {
+		t.Fatalf("rejoin seam: %v", err)
+	}
+
+	// KEY ASSERTION: ListGroups returns 1 group after the
+	// rejoin. If this fails, the user's bug is in the
+	// chatStore (openGroupFile / DeleteGroup / groupFiles
+	// map caching) and the fix is to evict the cached
+	// groupFile on DeleteGroup. If it passes, the bug is
+	// somewhere else (AcceptGroupInvite's signature verify,
+	// network delivery, or pubkey lookup).
+	post, err := n.ListGroups()
+	if err != nil {
+		t.Fatalf("post-rejoin ListGroups: %v", err)
+	}
+	if len(post) != 1 {
+		// Diagnostic dump to show what's actually on disk.
+		chatDir := filepath.Join(n.dataDir(), "chat", "groups", rendered)
+		t.Logf("chatDir=%s", chatDir)
+		t.Logf("members.json exists: %v", fileExists(filepath.Join(n.dataDir(), "groups", rendered, "members.json")))
+		t.Logf("chat.enc exists: %v", fileExists(filepath.Join(chatDir, "chat.enc")))
+		t.Fatalf("post-rejoin ListGroups count = %d, want 1 (chat.enc must be visible to ListGroups)", len(post))
+	}
+
+	// Cycle 2 — leave + rejoin again, to make sure the seam
+	// is robust across multiple cycles (not just the first).
+	for i := 0; i < 2; i++ {
+		m, err := group.LoadMembers(n.dataDir(), rawID)
+		if err != nil {
+			t.Fatalf("cycle2 LoadMembers iter=%d: %v", i, err)
+		}
+		if !m.RemoveMember(inviteeHex2) {
+			t.Fatalf("cycle2 RemoveMember iter=%d returned false", i)
+		}
+		if err := m.Save(n.dataDir(), rawID); err != nil {
+			t.Fatalf("cycle2 Save iter=%d: %v", i, err)
+		}
+		if err := n.chatStore.DeleteGroup(rendered); err != nil {
+			t.Fatalf("cycle2 DeleteGroup iter=%d: %v", i, err)
+		}
+		if err := m.AddMember(group.Member{
+			PeerID:   inviteeHex2,
+			JoinedAt: time.Now().UTC(),
+		}); err != nil {
+			t.Fatalf("cycle2 AddMember iter=%d: %v", i, err)
+		}
+		if err := m.Save(n.dataDir(), rawID); err != nil {
+			t.Fatalf("cycle2 Save rejoin iter=%d: %v", i, err)
+		}
+		if err := n.chatStore.AppendGroup(rendered, &storage.Record{
+			Timestamp: time.Now().UTC(),
+			From:      inviteeHex2,
+			To:        "",
+			Direction: "system",
+			Body:      "已加入群聊",
+			GroupID:   rendered,
+			MsgID:     "",
+		}); err != nil {
+			t.Fatalf("cycle2 AppendGroup iter=%d: %v", i, err)
+		}
+		g, err := n.ListGroups()
+		if err != nil {
+			t.Fatalf("cycle2 ListGroups iter=%d: %v", i, err)
+		}
+		if len(g) != 1 {
+			t.Fatalf("cycle2 iter=%d ListGroups=%d, want 1", i, len(g))
+		}
+	}
+}
+
+func fileExists(path string) bool {
+	_, err := os.Stat(path)
+	return err == nil
 }
 
 // guard against stale tempdir files silently breaking
