@@ -86,6 +86,16 @@ func (n *Node) claimSelfIdentity() claimStats {
 		log.Printf("[SYNC ] claim: selfid store unavailable, skipping (this session can't auto-claim)")
 		return stats
 	}
+	// Always Save at the end. The fresh-install path
+	// records a selfid entry in New() but never gets to
+	// the work-doing code below; without this Save, the
+	// first-launch history entry would be lost when the
+	// process exits. v1.1.4 hotfix (2026-07-02).
+	defer func() {
+		if err := n.selfidStore.Save(); err != nil {
+			log.Printf("[WARN ] claim: self_history save: %v", err)
+		}
+	}()
 	oldPeerIDs := n.selfidStore.OldPeerIDs()
 	if len(oldPeerIDs) == 0 {
 		log.Printf("[SYNC ] claim: no prior identity, nothing to claim")
@@ -215,15 +225,15 @@ func (n *Node) claimSelfIdentity() claimStats {
 
 	// Persist everything we touched. Save is a no-op if
 	// the underlying store has no dirty entries; the
-	// effort is O(fileSize) regardless.
+	// effort is O(fileSize) regardless. selfidStore.Save
+	// runs in the defer at the top of this function (it
+	// covers the fresh-install case where we early-return
+	// above).
 	if err := n.aliasStore.Save(); err != nil {
 		log.Printf("[WARN ] claim: alias save: %v", err)
 	}
 	if err := n.rosterStore.Save(); err != nil {
 		log.Printf("[WARN ] claim: roster save: %v", err)
-	}
-	if err := n.selfidStore.Save(); err != nil {
-		log.Printf("[WARN ] claim: self_history save: %v", err)
 	}
 
 	log.Printf("[SYNC ] claim done: groups=%d members=%d creators=%d aliases=%d roster_reset=%v",

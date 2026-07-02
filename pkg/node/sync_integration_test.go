@@ -400,6 +400,14 @@ func TestSync_AuditRoster_DropsStaleTombstones(t *testing.T) {
 // matches its own) must not touch any state. Belt-and-
 // suspenders: claim returns 0 stats, no log lines
 // suggesting anything happened.
+//
+// v1.1.4 hotfix (2026-07-02): also asserts that the
+// selfid entry recorded by New() actually reaches disk.
+// Pre-fix, the fresh-install branch of claimSelfIdentity
+// early-returned without calling Save(); the recorded
+// entry was lost on shutdown. The hotfix adds a defer
+// Save() at the top of the function so every code path
+// (early-return or not) flushes the history.
 func TestSync_ClaimIsNoOpForFreshInstall(t *testing.T) {
 	d := freshDataDir(t)
 	// No seedSelfHistory — fresh install, no prior identity.
@@ -414,6 +422,24 @@ func TestSync_ClaimIsNoOpForFreshInstall(t *testing.T) {
 	if stats.membersReplaced != 0 || stats.creatorsReplaced != 0 ||
 		stats.aliasesRekeyed != 0 || stats.rosterMarked {
 		t.Errorf("claim on fresh install should be a no-op, got %+v", stats)
+	}
+	// Close to flush; then re-read the file from disk and
+	// confirm the fresh_install entry made it.
+	if err := n.Close(); err != nil {
+		t.Fatal(err)
+	}
+	// Re-open the file directly to bypass any in-memory
+	// caching the test's stale handle might have.
+	store, err := selfid.Open(filepath.Join(d, ".innerlink", "self_history.json"))
+	if err != nil {
+		t.Fatalf("self_history.json missing after fresh-install claim+close: %v", err)
+	}
+	latest, ok := store.Latest()
+	if !ok {
+		t.Fatal("self_history.json has no entries after fresh-install claim+close")
+	}
+	if latest.Trigger != selfid.TriggerFreshInstall {
+		t.Errorf("latest.Trigger = %q, want fresh_install", latest.Trigger)
 	}
 }
 
