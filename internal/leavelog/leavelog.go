@@ -200,6 +200,58 @@ func (s *Store) Contains(groupID string) bool {
 	return false
 }
 
+// Remove drops the entry for groupID from the log, if
+// present. Used by AcceptGroupInvite to revoke a
+// prior "I left this group" record when the peer is
+// re-accepting a fresh invite — the act of joining
+// again means the prior leave is moot and the
+// ApplyRosterUpdate skip-if-in-leavelog guard must
+// release the group for the post-accept roster push
+// to land. v1.1.4 (2026-07-02, second hotfix on top
+// of the original offline-replay fix).
+//
+// Idempotent: removing a groupID that isn't in the log
+// is a no-op (returns nil). This matters because
+// AcceptGroupInvite is called for both first-time
+// joins (leavelog empty) and re-joins (leavelog has
+// the prior leave entry).
+//
+// Save is NOT called here — the caller decides when
+// to flush, matching the rest of the package's
+// Record/Save separation. AcceptGroupInvite's caller
+// (the AcceptGroupInvite code path) calls
+// leavelog.Save() right after this to ensure the
+// removal is durable before the next handshake.
+func (s *Store) Remove(groupID string) error {
+	if groupID == "" {
+		return errors.New("leavelog: Remove: GroupID is empty")
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	found := false
+	filtered := s.entries[:0]
+	for _, e := range s.entries {
+		if e.GroupID == groupID {
+			found = true
+			continue
+		}
+		filtered = append(filtered, e)
+	}
+	if !found {
+		return nil
+	}
+	// Re-slice into a fresh allocation to avoid
+	// retaining a backing array that's still the
+	// full length of s.entries (with a tail of
+	// out-of-bounds slots that the next Record call
+	// would re-overwrite).
+	trimmed := make([]Entry, len(filtered))
+	copy(trimmed, filtered)
+	s.entries = trimmed
+	s.dirty = true
+	return nil
+}
+
 // Save writes the in-memory entries to disk using the
 // tmp+rename pattern (matches internal/selfid.Save,
 // internal/roster.Save, etc.). Concurrent calls

@@ -194,6 +194,76 @@ func TestContains(t *testing.T) {
 	}
 }
 
+// TestRemove pins down the re-join revocation path.
+// When a peer accepts a fresh invite to a group they
+// previously left, the leavelog entry must be cleared
+// so ApplyRosterUpdate's skip-if-in-leavelog guard
+// releases the post-accept roster push. The
+// user-reported 2026-07-02 21:08 bug was exactly this
+// regression: B left, was re-invited 25s later, the
+// local members.json got the new 1-member shape but
+// the post-accept 3-member roster push was skipped
+// because the leavelog still held the prior leave.
+func TestRemove(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "leaved_groups.json")
+	s, _ := Open(path)
+	s.Record(Entry{GroupID: "g_abc", LeftAt: time.Unix(1, 0).UTC()})
+	s.Record(Entry{GroupID: "g_xyz", LeftAt: time.Unix(2, 0).UTC()})
+	s.Save()
+
+	// Remove the middle one.
+	if err := s.Remove("g_abc"); err != nil {
+		t.Fatalf("Remove: %v", err)
+	}
+	if s.Contains("g_abc") {
+		t.Error("after Remove(g_abc), Contains still true")
+	}
+	if !s.Contains("g_xyz") {
+		t.Error("Remove of g_abc collateral-removed g_xyz")
+	}
+	if s.dirty == false {
+		// dirty should be true so Save flushes. We
+		// can't see private fields, but we can
+		// observe behavior: round-trip via Save
+		// should land the new state on disk.
+	}
+	if err := s.Save(); err != nil {
+		t.Fatalf("Save after Remove: %v", err)
+	}
+	// Re-Open, assert g_abc is gone, g_xyz remains.
+	s2, _ := Open(path)
+	if s2.Contains("g_abc") {
+		t.Error("re-Open still has g_abc on disk")
+	}
+	if !s2.Contains("g_xyz") {
+		t.Error("re-Open lost g_xyz")
+	}
+}
+
+// TestRemove_NotPresent is the idempotent path:
+// removing a groupID that's not in the log is a
+// no-op (returns nil). AcceptGroupInvite calls
+// Remove unconditionally; if the peer never left the
+// group (first-time join) the call must be safe.
+func TestRemove_NotPresent(t *testing.T) {
+	dir := t.TempDir()
+	s, _ := Open(filepath.Join(dir, "leaved_groups.json"))
+	if err := s.Remove("g_never_there"); err != nil {
+		t.Errorf("Remove of non-present groupID: got %v, want nil", err)
+	}
+}
+
+// TestRemove_EmptyGroupID pins down the caller-bug
+// check, matching Record's empty-input guard.
+func TestRemove_EmptyGroupID(t *testing.T) {
+	dir := t.TempDir()
+	s, _ := Open(filepath.Join(dir, "leaved_groups.json"))
+	if err := s.Remove(""); err == nil {
+		t.Error("Remove(empty) returned nil, want error")
+	}
+}
+
 // TestConcurrentRecord is a small smoke test for the
 // locking: Record from many goroutines, Save once, all
 // entries should land on disk.

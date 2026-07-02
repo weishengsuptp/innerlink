@@ -354,6 +354,31 @@ func (n *Node) AcceptGroupInvite(env protocol.Envelope, fromPeerID []byte) error
 	if err := m.Save(n.dataDir(), rawID); err != nil {
 		return fmt.Errorf("node: AcceptGroupInvite save: %w", err)
 	}
+	// v1.1.4 (2026-07-02, second hotfix): clear the
+	// leavelog entry for this group. The user-reported
+	// 21:08 bug was a re-accept-after-leave regression:
+	// B left g_aba923 at 21:05:33 (leavelog gets the
+	// entry), then was re-invited at 21:05:58. This
+	// AcceptGroupInvite wrote a fresh 1-member
+	// members.json correctly, but the post-accept
+	// 3-member roster push from the creator was
+	// silently skipped by ApplyRosterUpdate because
+	// the leavelog still held the prior leave. B's
+	// local stayed at 1 member while the rest of the
+	// group saw 3.
+	//
+	// The intent of "I left this group" is revoked
+	// the moment the peer re-accepts an invite. Drop
+	// the entry here + Save so the next handshake's
+	// syncLeaveNoticesToPeer doesn't re-broadcast a
+	// stale leave notice either.
+	if n.leavelog != nil {
+		if err := n.leavelog.Remove(inv.GroupID); err != nil {
+			log.Printf("[WARN ] leavelog: remove on re-accept %s: %v", inv.GroupID, err)
+		} else if err := n.leavelog.Save(); err != nil {
+			log.Printf("[WARN ] leavelog: save on re-accept %s: %v", inv.GroupID, err)
+		}
+	}
 	log.Printf("[GROUP ] accepted invite to %s (inviter=%s)", inv.GroupID, inviterHex)
 	// v1.1 (2026-06-29) hotfix: seed chat.enc so ListGroups
 	// (which filters by chat.enc existence in storage/group.go)

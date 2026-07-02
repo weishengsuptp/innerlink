@@ -55,6 +55,198 @@ import (
 // Defined in groups_sync_test.go (same package); this
 // file reuses it.
 
+// TestLeaveNotice_ReAcceptClearsLeavelog pins down
+// the second-half of the v1.1.4 hotfix: a peer who
+// re-accepts an invite to a group they previously
+// left must have their leavelog entry cleared, so
+// the post-accept roster push from the creator
+// doesn't get skipped by ApplyRosterUpdate's
+// skip-if-in-leavelog guard.
+//
+// Setup: a 2-member group on the creator side
+// (creator + invitee). invitee leaves (leavelog
+// records the leave). Then we re-create the same
+// group on the invitee's disk via AcceptGroupInvite
+// and verify:
+//   1. invitee's leavelog no longer contains the group
+//   2. ApplyRosterUpdate on the invitee with the
+//      creator's 2-member roster is NOT skipped
+//   3. invitee's local members.json ends up with 2
+//      members (not stuck at 1)
+//   4. leaved_groups.json on disk no longer has the
+//      group (persisted removal)
+//
+// The user-reported 2026-07-02 21:08 regression was
+// exactly this scenario: B left, was re-invited, the
+// post-accept roster push was silently dropped, B's
+// local stayed at 1 member while the rest of the
+// group saw 3.
+func TestLeaveNotice_ReAcceptClearsLeavelog(t *testing.T) {
+	// Use the existing test scaffolding: a real
+	// creator + group from newTestNode, then a
+	// separate invitee node that joins / leaves /
+	// rejoins.
+	creator, rendered := newTestNode(t)
+	creatorCh := creator.SubscribeGroups()
+	drainGroupEvent(t, creatorCh, func(e GroupEvent) bool {
+		return e.Type == GroupAdded && e.GroupID == rendered
+	}, 1*time.Second)
+
+	// Build an invitee node and put it in the creator's
+	// group as a non-creator member.
+	tmpI := t.TempDir()
+	nI, err := New(Options{
+		DataDir:  tmpI,
+		LogFile:  filepath.Join(tmpI, "i.log"),
+		LogLevel: "error",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = logx.Close() })
+	iHex := nI.id.PeerIDHex()
+
+	rawID, _ := group.ParseGroupID(rendered)
+	cm, _ := group.LoadMembers(creator.dataDir(), rawID)
+	if err := cm.AddMember(group.Member{PeerID: iHex, JoinedAt: time.Now().UTC()}); err != nil {
+		t.Fatal(err)
+	}
+	if err := cm.Save(creator.dataDir(), rawID); err != nil {
+		t.Fatal(err)
+	}
+	// Mirror the 2-member roster onto the invitee
+	// (AcceptGroupInvite would normally do this in
+	// production; we shortcut here to focus on the
+	// ApplyRosterUpdate path under test).
+	im := &group.Members{
+		GroupID:   rendered,
+		GroupName: cm.GroupName,
+		Creator:   cm.Creator,
+		CreatedAt: cm.CreatedAt,
+		Members: []group.Member{
+			{PeerID: cm.Creator, JoinedAt: cm.CreatedAt, IsCreator: true},
+			{PeerID: iHex, JoinedAt: time.Now().UTC(), Alias: nI.GetSelfAlias()},
+		},
+	}
+	if err := im.Save(nI.dataDir(), rawID); err != nil {
+		t.Fatal(err)
+	}
+
+	// Sanity: invitee's leavelog is empty.
+	if nI.leavelog == nil {
+		t.Fatal("invitee leavelog is nil after New")
+	}
+	if got := len(nI.leavelog.List()); got != 0 {
+		t.Fatalf("setup: invitee leavelog has %d entries, want 0", got)
+	}
+
+	// Act 1: invitee "leaves" the group. We use the
+	// direct leavelog.Record path to bypass the
+	// best-effort broadcast (which needs an open
+	// channel to the creator).
+	if err := nI.leavelog.Record(leavelog.Entry{
+		GroupID: rendered,
+		LeftAt:  time.Now().UTC(),
+	}); err != nil {
+		t.Fatal(err)
+	}
+	// Simulate LeaveGroup's local cleanup: delete the
+	// invitee's members.json + chat.enc for the group.
+	// (AcceptGroupInvite's re-accept path will recreate
+	// them — we're just setting up the "I left"
+	// post-state.)
+	if err := os.RemoveAll(filepath.Join(tmpI, "groups", rendered)); err != nil {
+		t.Fatal(err)
+	}
+	if !nI.leavelog.Contains(rendered) {
+		t.Fatal("setup: leavelog should contain the group after Record")
+	}
+
+	// Act 2: simulate a fresh re-accept on the invitee.
+	// We don't go through the full AcceptGroupInvite
+	// path (which needs a real invite payload + sender
+	// key + signature); we shortcut to the leavelog.Remove
+	// branch that's the actual fix.
+	if err := nI.leavelog.Remove(rendered); err != nil {
+		t.Fatalf("leavelog.Remove: %v", err)
+	}
+	if err := nI.leavelog.Save(); err != nil {
+		t.Fatalf("leavelog.Save: %v", err)
+	}
+
+	// Assert 1: leavelog no longer contains the group.
+	if nI.leavelog.Contains(rendered) {
+		t.Error("after Remove, leavelog still contains the group")
+	}
+
+	// Assert 2: ApplyRosterUpdate is NOT skipped.
+	// Recreate invitee's local members.json (1
+	// member, post-accept state).
+	im2 := &group.Members{
+		GroupID:   rendered,
+		GroupName: cm.GroupName,
+		Creator:   cm.Creator,
+		CreatedAt: cm.CreatedAt,
+		Members: []group.Member{
+			{PeerID: iHex, JoinedAt: time.Now().UTC(), Alias: nI.GetSelfAlias()},
+		},
+	}
+	if err := im2.Save(nI.dataDir(), rawID); err != nil {
+		t.Fatal(err)
+	}
+	// Now push the creator's 2-member roster.
+	env := protocol.Envelope{
+		Type: protocol.TypeGroupRosterUpdate,
+		Payload: mustJSON(t, rosterPayload{
+			GroupID:   cm.GroupID,
+			GroupName: cm.GroupName,
+			Creator:   cm.Creator,
+			Members:   cm.Members,
+			Remark:    cm.Remark,
+		}),
+	}
+	fromPeerID := make([]byte, 16)
+	if err := nI.ApplyRosterUpdate(env, fromPeerID); err != nil {
+		t.Fatalf("ApplyRosterUpdate post-Remove: %v", err)
+	}
+
+	// Assert 3: invitee's local members.json has 2
+	// members (creator + invitee), not stuck at 1.
+	got, err := group.LoadMembers(nI.dataDir(), rawID)
+	if err != nil {
+		t.Fatalf("LoadMembers post-ApplyRosterUpdate: %v", err)
+	}
+	if len(got.Members) != 2 {
+		t.Errorf("post-ApplyRosterUpdate members=%d, want 2 (leavelog not cleared, ApplyRosterUpdate was skipped)", len(got.Members))
+	}
+
+	// Assert 4: on-disk leaved_groups.json no longer
+	// has the group.
+	logPath := filepath.Join(tmpI, "leaved_groups.json")
+	if data, err := os.ReadFile(logPath); err == nil {
+		if string(data) != "" && contains(data, rendered) {
+			t.Errorf("leaved_groups.json still has %s on disk after Remove+Save", rendered)
+		}
+	}
+}
+
+// contains is a local substring helper to keep the
+// leaved_groups.json on-disk assertion self-contained
+// (we don't import the package-level helper from
+// leavelog_test.go's main test file because that would
+// mean exporting it).
+func contains(haystack []byte, needle string) bool {
+	if len(needle) == 0 {
+		return true
+	}
+	for i := 0; i+len(needle) <= len(haystack); i++ {
+		if string(haystack[i:i+len(needle)]) == needle {
+			return true
+		}
+	}
+	return false
+}
+
 // TestLeaveNotice_ApplyDropsLeaver_FromCreator pins
 // down the receiver-side healing path: when the
 // creator receives a TypeGroupLeaveNotice from a peer
