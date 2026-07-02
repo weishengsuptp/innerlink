@@ -2343,9 +2343,25 @@ function renderHistoryList() {
   const searchEl = document.getElementById('history-search') as HTMLInputElement | null;
   if (!body) return;
   const q = (searchEl?.value || '').trim().toLowerCase();
-  // Aggregate every message across every peer in state.
-  // Sort newest first (timestamps are RFC3339 strings;
-  // Date(...) is monotonic enough for a chat list).
+  // v1.1.4 (2026-07-02): the "history drawer" is now
+  // CONTEXT-AWARE, not a global search. When the user is
+  // viewing a group chat and clicks 历史消息, they expect
+  // that group's history — NOT a cross-conversation
+  // aggregate that mixes in 1:1 messages from other peers.
+  //
+  // Pre-fix (the bug 潇男 reported): renderHistoryList
+  // walked state.history for every known peer + group and
+  // emitted them all in one merged list. From a 1:1 chat
+  // that looks fine (you only have one peer's messages
+  // loaded anyway), but from a group chat it's surprising:
+  // group context shows up mixed with peer 1:1 messages
+  // that have nothing to do with the group.
+  //
+  // Post-fix: filter to state.selectedId only. The search
+  // box still searches WITHIN the current conversation's
+  // messages; if no conversation is selected, the drawer
+  // shows an empty-state hint instead of dumping every
+  // known chat into the user's face.
   type Row = { peer: string; peerName: string; msg: node.Message; convLabel: string };
   const rows: Row[] = [];
   // Compute the conversation label ONCE per pid (only used
@@ -2363,28 +2379,43 @@ function renderHistoryList() {
   // groups the conversation routing was drowning out the
   // actual sender identity (Alice's message and my message
   // both → "群 X"). Per-row peerName is correct for both.
-  for (const [pid, msgs] of state.history) {
-    if (!msgs) continue;
-    let convLabel: string;
-    if (isGroupId(pid)) {
-      const g = state.groups.find(gg => gg.group_id === pid);
-      convLabel = g ? `群 ${g.group_name}` : '(未知群)';
-    } else if (pid === state.selfId) {
-      convLabel = '我';
-    } else {
-      const peerInfo = state.peers.find(p => p.PeerID === pid);
-      convLabel = peerInfo ? peerDisplay(peerInfo) : shortId(pid);
+  //
+  // v1.1.4 (2026-07-02): now that we filter by
+  // state.selectedId, in practice every row's pid IS the
+  // selected conversation's pid, so the per-row
+  // convLabel is always the same value — we still compute
+  // it (for the search-match check + future-proofing if a
+  // global-search toggle comes back) but the user never
+  // sees it in the rendered output.
+  if (!state.selectedId) {
+    body.innerHTML = `<div class="history-empty">请先在左侧选择一个聊天, 再看历史消息</div>`;
+    return;
+  }
+  const pid = state.selectedId;
+  const msgs = state.history.get(pid);
+  if (!msgs) {
+    body.innerHTML = `<div class="history-empty">还没有聊天记录</div>`;
+    return;
+  }
+  let convLabel: string;
+  if (isGroupId(pid)) {
+    const g = state.groups.find(gg => gg.group_id === pid);
+    convLabel = g ? `群 ${g.group_name}` : '(未知群)';
+  } else if (pid === state.selfId) {
+    convLabel = '我';
+  } else {
+    const peerInfo = state.peers.find(p => p.PeerID === pid);
+    convLabel = peerInfo ? peerDisplay(peerInfo) : shortId(pid);
+  }
+  for (const m of msgs) {
+    const peerName = senderNameForRow(pid, m);
+    if (q) {
+      const bodyHit = (m.Body || '').toLowerCase().includes(q);
+      const peerHit = peerName.toLowerCase().includes(q);
+      const convHit = convLabel.toLowerCase().includes(q);
+      if (!bodyHit && !peerHit && !convHit) continue;
     }
-    for (const m of msgs) {
-      const peerName = senderNameForRow(pid, m);
-      if (q) {
-        const bodyHit = (m.Body || '').toLowerCase().includes(q);
-        const peerHit = peerName.toLowerCase().includes(q);
-        const convHit = convLabel.toLowerCase().includes(q);
-        if (!bodyHit && !peerHit && !convHit) continue;
-      }
-      rows.push({ peer: pid, peerName, msg: m, convLabel });
-    }
+    rows.push({ peer: pid, peerName, msg: m, convLabel });
   }
   rows.sort((a, b) => {
     const ta = a.msg.Timestamp ? new Date(a.msg.Timestamp).getTime() : 0;
