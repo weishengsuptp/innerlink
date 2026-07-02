@@ -85,7 +85,11 @@ func (r *channelRegistry) delete(peerID []byte) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	if st, ok := r.m[string(peerID)]; ok {
-		_ = st.ch.Close()
+		// See closeAll — test-only pubkey-only entries
+		// have nil ch.
+		if st.ch != nil {
+			_ = st.ch.Close()
+		}
 		delete(r.m, string(peerID))
 	}
 }
@@ -94,7 +98,13 @@ func (r *channelRegistry) closeAll() {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	for _, st := range r.m {
-		_ = st.ch.Close()
+		// st.ch may be nil for test-only entries that
+		// were seeded with RegisterPeerPublicKeyForTest
+		// (no real channel exists — just a pubkey cache
+		// entry). Skip close in that case.
+		if st.ch != nil {
+			_ = st.ch.Close()
+		}
 	}
 	r.m = nil
 }

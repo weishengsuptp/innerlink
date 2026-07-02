@@ -161,6 +161,22 @@ func (n *Node) CreateGroup(name string, memberPeerIDs []string) (*GroupInfo, err
 	return n.toGroupInfo(m, rawID, true), nil
 }
 
+// Memberships returns the rendered GroupID ("g_<hex>")
+// of every group this peer currently knows about, sorted
+// for stable comparison. Useful for tests and for the
+// frontend side-bar; production code mostly uses
+// ListGroups for the full GroupInfo view.
+func (n *Node) Memberships() ([]string, error) {
+	renderedIDs, err := n.chatStore.ListGroups()
+	if err != nil {
+		return nil, err
+	}
+	out := make([]string, len(renderedIDs))
+	copy(out, renderedIDs)
+	sort.Strings(out)
+	return out, nil
+}
+
 // ListGroups enumerates every group on disk and returns its
 // GroupInfo. Sorted by GroupID for stable display.
 func (n *Node) ListGroups() ([]*GroupInfo, error) {
@@ -219,40 +235,11 @@ var ErrGroupNotFound = errors.New("node: group not found")
 // sender (inviter) defaults to the local peerID; can be
 // overridden by tests.
 func (n *Node) InviteToGroup(rawGroupID []byte, inviteePeerID string) (*group.Invite, error) {
-	if n.id == nil {
-		return nil, errors.New("node: not started")
+	inv, err := n.BuildInvite(rawGroupID, inviteePeerID)
+	if err != nil {
+		return nil, err
 	}
 	rendered := group.RenderGroupID(rawGroupID)
-	m, err := group.LoadMembers(n.dataDir(), rawGroupID)
-	if err != nil {
-		return nil, fmt.Errorf("node: InviteToGroup load: %w", err)
-	}
-	if inviteePeerID == "" {
-		return nil, errors.New("node: InviteToGroup: invitee empty")
-	}
-	// The inviter MUST be a current member (we don't allow
-	// random peers to spam invites for groups they don't
-	// belong to).
-	selfHex := n.id.PeerIDHex()
-	if !m.Contains(selfHex) {
-		return nil, errors.New("node: InviteToGroup: inviter is not a member of this group")
-	}
-	if m.Contains(inviteePeerID) {
-		return nil, errors.New("node: InviteToGroup: invitee already a member")
-	}
-
-	inv := group.NewInvite(rawGroupID, m.GroupName, m.Creator, selfHex, time.Now().UTC())
-	// Sign with our device Identity. We can't call
-	// inv.Sign(*sm2.PrivateKey) directly because internal/identity
-	// doesn't expose the raw key — but Identity.Sign produces
-	// the same SM2-with-SM3 signature that pkg/group.Verify
-	// expects. We invoke the canonicalization exposed by
-	// pkg/group and copy the bytes.
-	sig, err := n.id.Sign(inv.Canonical())
-	if err != nil {
-		return nil, fmt.Errorf("node: InviteToGroup sign: %w", err)
-	}
-	inv.Signature = sig
 	payload, err := json.Marshal(inv)
 	if err != nil {
 		return nil, fmt.Errorf("node: InviteToGroup marshal: %w", err)
@@ -277,6 +264,52 @@ func (n *Node) InviteToGroup(rawGroupID []byte, inviteePeerID string) (*group.In
 		return nil, fmt.Errorf("node: InviteToGroup send: %w", err)
 	}
 	log.Printf("[GROUP ] invited %s to %s (nonce=%x)", inviteePeerID, rendered, inv.Nonce[:4])
+	return inv, nil
+}
+
+// BuildInvite constructs + signs the Invite envelope
+// without sending it. Used by the production InviteToGroup
+// (which then sends it) and by the integration test
+// harness (which delivers the invite in-process, bypassing
+// the channel lookup).
+//
+// Both inviter and invitee are validated as before. The
+// only thing this skips relative to InviteToGroup is the
+// network send.
+func (n *Node) BuildInvite(rawGroupID []byte, inviteePeerID string) (*group.Invite, error) {
+	if n.id == nil {
+		return nil, errors.New("node: not started")
+	}
+	m, err := group.LoadMembers(n.dataDir(), rawGroupID)
+	if err != nil {
+		return nil, fmt.Errorf("node: BuildInvite load: %w", err)
+	}
+	if inviteePeerID == "" {
+		return nil, errors.New("node: BuildInvite: invitee empty")
+	}
+	// The inviter MUST be a current member (we don't allow
+	// random peers to spam invites for groups they don't
+	// belong to).
+	selfHex := n.id.PeerIDHex()
+	if !m.Contains(selfHex) {
+		return nil, errors.New("node: BuildInvite: inviter is not a member of this group")
+	}
+	if m.Contains(inviteePeerID) {
+		return nil, errors.New("node: BuildInvite: invitee already a member")
+	}
+
+	inv := group.NewInvite(rawGroupID, m.GroupName, m.Creator, selfHex, time.Now().UTC())
+	// Sign with our device Identity. We can't call
+	// inv.Sign(*sm2.PrivateKey) directly because internal/identity
+	// doesn't expose the raw key — but Identity.Sign produces
+	// the same SM2-with-SM3 signature that pkg/group.Verify
+	// expects. We invoke the canonicalization exposed by
+	// pkg/group and copy the bytes.
+	sig, err := n.id.Sign(inv.Canonical())
+	if err != nil {
+		return nil, fmt.Errorf("node: BuildInvite sign: %w", err)
+	}
+	inv.Signature = sig
 	return inv, nil
 }
 
@@ -435,12 +468,13 @@ func (n *Node) sendAcceptResponse(inv group.Invite, inviterPeerID []byte) error 
 		return err
 	}
 	st := n.channels.get(inviterPeerID)
-	if st == nil {
-		// Inviter went offline between invite and accept.
-		// They can read our accept when they next connect
-		// (the channel.Send path returns error here — we
-		// log + skip; the inviter will see us as not-yet-
-		// joined in their next manual scan).
+	if st == nil || st.ch == nil {
+		// Inviter went offline between invite and accept,
+		// OR we're running under the integration test
+		// harness where channelState was seeded with
+		// pubkey-only (no real ch). Either way, drop the
+		// outbound accept — the harness will invoke
+		// CreatorOnAccept directly to advance state.
 		log.Printf("[WARN  ] sendAcceptResponse: inviter %x offline; accept dropped", inviterPeerID)
 		return nil
 	}
@@ -1288,11 +1322,17 @@ func (n *Node) broadcastRosterUpdate(m *group.Members) {
 			continue
 		}
 		st := n.channels.get(pid)
-		if st == nil {
+		if st == nil || st.ch == nil {
 			// Peer offline — drop this copy. They'll pick
 			// up the new state when they next reconnect
 			// (a future re-sync API, or via the next
 			// membership event after they rejoin).
+			//
+			// The st.ch == nil case is the integration
+			// test harness: peer pubkey was seeded but no
+			// real channel exists, so we drop the outbound
+			// broadcast and let the harness drive the
+			// receiver-side ApplyRosterUpdate directly.
 			continue
 		}
 		env := protocol.Envelope{

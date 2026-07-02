@@ -670,6 +670,46 @@ func (n *Node) SelfPeerID() string {
 	return n.id.PeerIDHex()
 }
 
+// SelfPublicKey returns our own SM2 public key (64 raw
+// bytes, no leading byte). Exposed for the integration
+// test harness so it can register peer pubkeys in
+// each test peer's channel state without going through
+// a real handshake.
+//
+// Production code should not need this — public keys
+// arrive via the handshake path's session metadata.
+// The harness needs it because there is no handshake
+// in-process.
+func (n *Node) SelfPublicKey() []byte {
+	return n.id.PublicKey()
+}
+
+// RegisterPeerPublicKeyForTest seeds this Node's
+// channel-state pubkey cache for peerHex, so that
+// lookupPeerPublicKey(peerHex) succeeds without an
+// actual channel. Intended only for the integration
+// test harness; production should let the handshake
+// populate this.
+//
+// The seeded pubkey is stored in a minimal channelState
+// with no ch / rcv — those are nil-guard-safe because
+// ApplyRosterUpdate / ApplyLeaveNotice paths don't
+// dereference them. The only code that touches them is
+// the outbound Sender path (SendText / SendGroupMessage)
+// which the harness doesn't exercise in scenarios
+// that don't need it.
+func (n *Node) RegisterPeerPublicKeyForTest(peerHex string, pubKey []byte) error {
+	pid, err := hexToBytes(peerHex)
+	if err != nil {
+		return fmt.Errorf("node: RegisterPeerPublicKeyForTest bad peerHex: %w", err)
+	}
+	n.channels.set(pid, &channelState{
+		peerID: pid,
+		pubKey: append([]byte(nil), pubKey...),
+	})
+	return nil
+}
+
 // --- internal orchestration (called by the dispatcher
 //     pumps and the public methods) ---
 
