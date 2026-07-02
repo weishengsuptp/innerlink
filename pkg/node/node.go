@@ -20,6 +20,7 @@ import (
 	"github.com/weishengsuptp/innerlink/internal/paths"
 	"github.com/weishengsuptp/innerlink/internal/protocol"
 	"github.com/weishengsuptp/innerlink/internal/roster"
+	"github.com/weishengsuptp/innerlink/internal/selfid"
 	"github.com/weishengsuptp/innerlink/internal/storage"
 	"github.com/weishengsuptp/innerlink/internal/transport"
 	"github.com/weishengsuptp/innerlink/pkg/group"
@@ -47,7 +48,18 @@ type Node struct {
 	chatStore   *storage.Store
 	aliasStore  *alias.Store
 	rosterStore *roster.Store
+	selfidStore *selfid.Store
 	selfAlias   *selfAliasStore
+
+	// v1.1.4 (2026-07-02): global data lock. Held by every
+	// operation that mutates on-disk persistent state
+	// (members.json, chat.enc, roster, aliases) so that
+	// concurrent paths — AcceptGroupInvite, LeaveGroup,
+	// self-claim, group-audit, SendGroupMessage — never
+	// interleave writes to the same file. RWMutex because
+	// the read paths (History, ListGroups) are common and
+	// the claim/audit are one-shot per Start.
+	dataMu sync.RWMutex
 
 	// Networking.
 	ann       *discovery.Announcer
@@ -165,6 +177,19 @@ func New(opts Options) (*Node, error) {
 		_ = aliasStore.Close()
 		return nil, fmt.Errorf("open roster: %w", err)
 	}
+	selfidStore, err := selfid.Open(filepath.Join(layout.DataDir, "self_history.json"))
+	if err != nil {
+		// v1.1.4 (2026-07-02): soft error per selfid.Open's
+		// contract. A corrupt history file is a recoverable
+		// condition — we lose one wipe-cycle's worth of claim
+		// (acceptable) and start up empty. Log loudly so the
+		// user sees it; don't refuse to start.
+		log.Printf("[WARN ] self_history: parse failed (%v) — proceeding with empty history (claim disabled this session)", err)
+		selfidStore, _ = selfid.Open(filepath.Join(layout.DataDir, "self_history.json.tmp")) //nolint:errcheck
+		if selfidStore == nil {
+			selfidStore = &selfid.Store{}
+		}
+	}
 	selfAliasStore, err := loadSelfAlias(filepath.Join(layout.DataDir, "alias.txt"))
 	if err != nil {
 		_ = chatStore.Close()
@@ -180,6 +205,7 @@ func New(opts Options) (*Node, error) {
 		chatStore:   chatStore,
 		aliasStore:  aliasStore,
 		rosterStore: rosterStore,
+		selfidStore: selfidStore,
 		selfAlias:   selfAliasStore,
 		channels:    newChannelRegistry(),
 		messageCh:    make(chan Message, 64),
@@ -194,6 +220,56 @@ func New(opts Options) (*Node, error) {
 		// was dropped on overflow (2026-06-27).
 		fileEventCh:  make(chan FileEvent, 256),
 		cancelFiles:  make(map[string]context.CancelFunc),
+	}
+
+	// v1.1.4 (2026-07-02): self-claim wiring at New time.
+	// If the just-loaded device identity's peerID differs
+	// from the LATEST entry in self_history, this is a
+	// wipe+reinstall (or first launch after the file was
+	// created). Record the migration so the next Start()
+	// can claim ownership of any group / alias / roster
+	// references still pointing at the old peerID.
+	//
+	// This is BEFORE the UDP/TCP goroutines start, so
+	// there's no race: claim won't fire while a peer
+	// message could land in the dispatcher. (The claim
+	// itself happens in Start(), but the bookkeeping
+	// entry needs to exist on disk by then.)
+	currentPeerID := id.PeerIDHex()
+	latest, hasLatest := selfidStore.Latest()
+	switch {
+	case !hasLatest:
+		// First launch ever. Fresh install. Record it
+		// with empty OldPeerID so the history is
+		// self-documenting.
+		log.Printf("[SYNC ] self_history: first launch, recording fresh_install peerID=%s", currentPeerID[:8])
+		if err := selfidStore.RecordMigration(selfid.Entry{
+			NewPeerID:  currentPeerID,
+			SwitchedAt: time.Now().UTC(),
+			Trigger:    selfid.TriggerFreshInstall,
+		}); err != nil {
+			log.Printf("[WARN ] self_history: record fresh install: %v", err)
+		}
+	case latest.NewPeerID != currentPeerID:
+		// Wipe+reinstall (or manual reset). Old peerID
+		// is latest.NewPeerID. The wipe doesn't change
+		// the stored latest entry — we always APPEND a
+		// new one, so the rolling window preserves the
+		// full chain for gossip dedup.
+		log.Printf("[SYNC ] self_history: peerID changed %s → %s (trigger=%s)", latest.NewPeerID[:8], currentPeerID[:8], latest.Trigger)
+		if err := selfidStore.RecordMigration(selfid.Entry{
+			OldPeerID:  latest.NewPeerID,
+			NewPeerID:  currentPeerID,
+			SwitchedAt: time.Now().UTC(),
+			Trigger:    selfid.TriggerWipeReinstall,
+		}); err != nil {
+			log.Printf("[WARN ] self_history: record wipe+reinstall: %v", err)
+		}
+		if err := selfidStore.Save(); err != nil {
+			log.Printf("[WARN ] self_history: save: %v", err)
+		}
+	default:
+		log.Printf("[SYNC ] self_history: same peerID as last launch, no migration needed")
 	}
 
 	// Self entry in the roster: always include ourselves
@@ -268,6 +344,15 @@ func (n *Node) Start(ctx context.Context) error {
 	n.history = history
 	n.historyMu.Unlock()
 	log.Printf("[INFO ] chat log: %d records loaded", len(history))
+
+	// v1.1.4 (2026-07-02) sync infrastructure: claim +
+	// audit BEFORE any goroutine that can race with
+	// persistent state. The dispatcher is started later
+	// in this function; this block runs synchronously,
+	// in the calling goroutine, so there's no concurrent
+	// mutation of groups/members.json or roster.json
+	// while claim + audit are working.
+	n.runStartupSync()
 
 	// 1) UDP announcer.
 	n.wg.Add(1)

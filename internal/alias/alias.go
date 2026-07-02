@@ -181,6 +181,48 @@ func (s *Store) Remove(peerID string) error {
 	return nil
 }
 
+// Rekey moves the alias entry from oldPeerID to newPeerID.
+// If oldPeerID has no entry, Rekey is a no-op. If newPeerID
+// already has an entry, the new alias (oldPeerID's name +
+// first_seen) wins — the old newPeerID entry is overwritten.
+//
+// v1.1.4 (2026-07-02): used by self-claim when the local
+// device.key rotates. The alias table is keyed by peerID;
+// without Rekey, a wipe+reinstall would lose the user's
+// manually-assigned name for themselves (and any other
+// alias they happened to set for their previous identity).
+//
+// Both peerIDs must validate. The function is atomic
+// w.r.t. the in-memory map: callers can do Rekey+Save and
+// never observe a state with "old gone, new not yet there".
+func (s *Store) Rekey(oldPeerID, newPeerID string) error {
+	if !validPeerID(oldPeerID) {
+		return ErrInvalidPeerID
+	}
+	if !validPeerID(newPeerID) {
+		return ErrInvalidPeerID
+	}
+	if oldPeerID == newPeerID {
+		return nil // nothing to do
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	old, ok := s.m[oldPeerID]
+	if !ok {
+		return nil // nothing to move
+	}
+	// Touch LastSeen to mark the move; the alias is now
+	// tied to the new identity.
+	old.LastSeen = time.Now().UTC()
+	// newPeerID wins on conflict. If a previous alias
+	// entry exists for newPeerID we drop it (the user
+	// re-claimed themselves; the new one is authoritative).
+	delete(s.m, oldPeerID)
+	s.m[newPeerID] = old
+	s.dirty = true
+	return nil
+}
+
 // Touch updates last_seen to now for peerID, leaving
 // the name alone. Called by the cmd layer whenever
 // it sees activity from a peer (announce, incoming

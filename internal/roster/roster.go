@@ -404,6 +404,64 @@ func (s *Store) ListActive() []Entry {
 	return out
 }
 
+// AuditStaleTombstones drops roster entries that are Reset=true
+// AND older than maxAge. Returns the list of dropped peerIDs so
+// the caller (Node.Start / a background ticker) can log them.
+//
+// Why this exists (v1.1.4, 2026-07-02):
+//
+//	Pre-fix: the roster only ever GAINED entries. A wipe +
+//	reinstall cycle creates a new device.key → new peerID; the
+//	old peerID gets reset=true via the dedup scan but the entry
+//	stays on disk forever. After 5 wipe cycles the roster is
+//	full of reset=true ghosts. They were filtered from the UI
+//	by ListActive() but they still showed up in:
+//
+//	  - on-disk roster.json (file size grows forever)
+//	  - syncRostersToPeer gossip payloads (wasted bytes)
+//	  - group members.json (which doesn't go through
+//	    ListActive and so kept showing the old peerIDs as
+//	    "live" group members)
+//
+// AuditStaleTombstones closes the loop: after enough time has
+// passed, a tombstone can't be "claimed back" by a re-install
+// (the rolling-window self_history only goes back 7 days) so
+// it's safe to delete entirely.
+//
+// maxAge: 24h is the production default. The constant lives
+// here so callers don't have to know it. Tests can pass a
+// shorter value to exercise the "should drop" branch
+// deterministically.
+func (s *Store) AuditStaleTombstones(maxAge time.Duration) []string {
+	cutoff := time.Now().UTC().Add(-maxAge)
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if len(s.m) == 0 {
+		return nil
+	}
+	dropped := make([]string, 0, 4)
+	for pid, e := range s.m {
+		if !e.Reset {
+			continue
+		}
+		// Reset entries with zero LastSeen: shouldn't happen
+		// (every entry is touched on add) but be defensive —
+		// they have no age signal so we KEEP them. Dropping
+		// them silently would be worse than letting them
+		// stick around.
+		if e.LastSeen.IsZero() {
+			continue
+		}
+		if e.LastSeen.After(cutoff) {
+			continue
+		}
+		dropped = append(dropped, pid)
+		delete(s.m, pid)
+		s.dirty = true
+	}
+	return dropped
+}
+
 // MarkReset sets Reset=true on the entry for peerID.
 // No-op if the entry doesn't exist or is already
 // reset. Idempotent (the whole point — "一次性,
