@@ -181,6 +181,34 @@ const (
 	// panel). v1.1.1 (2026-06-29).
 	TypeGroupMetaUpdate MsgType = "group-meta"
 
+	// TypeGroupLeaveNotice is sent 1:1 by a peer who has
+	// just left a group (or who has a persisted "I left
+	// this group" entry from a prior offline LeaveGroup)
+	// to the group's creator. Payload is JSON:
+	//   {group_id (rendered), leaver_id (32hex), left_at (RFC3339)}
+	// The creator removes leaver_id from their local
+	// members.json + broadcasts a new roster (the same
+	// path LeaveGroup's online branch takes for receivers).
+	//
+	// Background: prior to this, LeaveGroup's "broadcast
+	// new roster to remaining members" was best-effort
+	// and silently dropped offline peers. If the creator
+	// happened to be offline when a member left, the
+	// creator's local roster was never updated, and the
+	// group stayed "stuck" with the leaver listed — the
+	// user-reported "退群都没成功真出bug了" symptom of
+	// 2026-07-02.
+	//
+	// v1.1.4 (2026-07-02): LeaveGroup records the leave
+	// in a persistent leavelog (separate from the
+	// best-effort broadcast), and on every subsequent
+	// handshake the leaver replays the leave notice to
+	// whoever they connect to. The receiving creator
+	// handler is ApplyLeaveNotice in pkg/node. Idempotent:
+	// a creator who already removed the leaver is a
+	// no-op.
+	TypeGroupLeaveNotice MsgType = "group-leave-notice"
+
 	// -- Scan history (v0.5.3) --
 
 	// TypeScanHistory carries the list of /24
@@ -272,6 +300,30 @@ type RosterSync struct {
 // the same /24.
 type ScanHistory struct {
 	Scanned []string `json:"scanned"`
+}
+
+// LeaveNotice is the payload of TypeGroupLeaveNotice. Sent
+// 1:1 from a leaver to the group's creator so the creator
+// can drop the leaver from their local roster even if the
+// leaver's online broadcast was lost (peer was offline).
+//
+// v1.1.4 (2026-07-02): idempotent on the receiver — if
+// the leaver isn't in the local roster, ApplyLeaveNotice
+// is a no-op. If the leaver's notice arrives multiple
+// times (because the leaver replays it from a persistent
+// leavelog on every handshake until the creator is seen
+// online), the second+ time hits the "leaver not in
+// roster" no-op branch.
+//
+// LeaverID is the leaver's 32-char hex PeerID at the time
+// of the leave. We don't bother to update it across
+// future wipe+reinstalls (the leaver is gone from the
+// group; the creator doesn't care which PeerID they had
+// when they left).
+type LeaveNotice struct {
+	GroupID  string    `json:"group_id"`
+	LeaverID string    `json:"leaver_id"`
+	LeftAt   time.Time `json:"left_at"`
 }
 
 // Channel is a single encrypted message stream between two peers.

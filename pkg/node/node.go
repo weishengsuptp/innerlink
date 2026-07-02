@@ -16,6 +16,7 @@ import (
 	"github.com/weishengsuptp/innerlink/internal/filetransfer"
 	"github.com/weishengsuptp/innerlink/internal/handshake"
 	"github.com/weishengsuptp/innerlink/internal/identity"
+	"github.com/weishengsuptp/innerlink/internal/leavelog"
 	"github.com/weishengsuptp/innerlink/internal/logx"
 	"github.com/weishengsuptp/innerlink/internal/paths"
 	"github.com/weishengsuptp/innerlink/internal/protocol"
@@ -49,6 +50,7 @@ type Node struct {
 	aliasStore  *alias.Store
 	rosterStore *roster.Store
 	selfidStore *selfid.Store
+	leavelog    *leavelog.Store // v1.1.4 (2026-07-02): offline-replay log of groups self has left
 	selfAlias   *selfAliasStore
 
 	// v1.1.4 (2026-07-02): global data lock. Held by every
@@ -190,6 +192,20 @@ func New(opts Options) (*Node, error) {
 			selfidStore = &selfid.Store{}
 		}
 	}
+	// v1.1.4 (2026-07-02): persistent record of "groups I
+	// have left". Replayed as TypeGroupLeaveNotice on every
+	// subsequent handshake so the creator finally learns
+	// about a leave that happened while they were offline
+	// (the user-reported 2026-07-02 "退群都没成功真出bug了"
+	// bug). Soft-error semantics match selfid above.
+	leavelogStore, err := leavelog.Open(filepath.Join(layout.DataDir, "leaved_groups.json"))
+	if err != nil {
+		log.Printf("[WARN ] leavelog: parse failed (%v) — proceeding with empty log (offline-leave replay disabled this session)", err)
+		leavelogStore, _ = leavelog.Open(filepath.Join(layout.DataDir, "leaved_groups.json.tmp")) //nolint:errcheck
+		if leavelogStore == nil {
+			leavelogStore = &leavelog.Store{}
+		}
+	}
 	selfAliasStore, err := loadSelfAlias(filepath.Join(layout.DataDir, "alias.txt"))
 	if err != nil {
 		_ = chatStore.Close()
@@ -206,6 +222,7 @@ func New(opts Options) (*Node, error) {
 		aliasStore:  aliasStore,
 		rosterStore: rosterStore,
 		selfidStore: selfidStore,
+		leavelog:    leavelogStore,
 		selfAlias:   selfAliasStore,
 		channels:    newChannelRegistry(),
 		messageCh:    make(chan Message, 64),
@@ -510,6 +527,17 @@ func (n *Node) Close() error {
 	// canceled (defer conn.Close inside Run), so cancelling
 	// n.ctx above is enough to bring it down.
 	n.wg.Wait()
+
+	// v1.1.4 (2026-07-02): flush the leave log to disk on
+	// shutdown. LeaveGroup calls Record + Save eagerly so
+	// most rows are already persisted by the time we get
+	// here, but a Record call right before Close (no Save
+	// in between) would otherwise be lost.
+	if n.leavelog != nil {
+		if err := n.leavelog.Save(); err != nil {
+			log.Printf("[WARN ] leavelog: close-time save: %v", err)
+		}
+	}
 
 	if n.chatStore != nil {
 		if err := n.chatStore.Close(); err != nil {
@@ -824,6 +852,14 @@ func (n *Node) wrapChannel(conn *transport.Conn, sess *handshake.Session) {
 	// whose channel comes up gets a healing push so its
 	// members.json re-aligns with the canonical truth on disk.
 	n.syncRostersToPeer(peerHexStr, ch)
+	// v1.1.4 (2026-07-02): replay any persisted
+	// TypeGroupLeaveNotice entries to the new peer. If
+	// the new peer is a group creator who missed a prior
+	// LeaveGroup broadcast (we were offline at the time),
+	// this is the path that heals their local roster.
+	// See internal/leavelog package doc for the full
+	// offline-replay rationale.
+	n.syncLeaveNoticesToPeer(peerHexStr, ch)
 
 	n.wg.Add(1)
 	go func() {
@@ -1025,6 +1061,17 @@ func (n *Node) wrapChannel(conn *transport.Conn, sess *handshake.Session) {
 				if err := n.ApplyMetaUpdate(env, sess.RemotePeerID); err != nil {
 					log.Printf("[ERROR] ApplyMetaUpdate: %v", err)
 				}
+			case protocol.TypeGroupLeaveNotice:
+				// v1.1.4 (2026-07-02): peer-to-peer
+				// notification that the sender has left
+				// (or is replaying a persisted "I left
+				// this group" entry from a prior
+				// offline LeaveGroup). Idempotent on the
+				// receiver — see ApplyLeaveNotice.
+				log.Printf("[GROUP ] leave notice from %s", peerHexStr)
+				if err := n.ApplyLeaveNotice(env, sess.RemotePeerID); err != nil {
+					log.Printf("[ERROR] ApplyLeaveNotice: %v", err)
+				}
 			default:
 				// File traffic + anything else: hand off
 				// to the file receiver. Handle() is also
@@ -1082,6 +1129,177 @@ func (n *Node) broadcastRosterToAll(exclude []byte) {
 		}
 		n.sendRosterSync(st.ch)
 	}
+}
+
+// syncLeaveNoticesToPeer replays every entry in our
+// leavelog to peerHexStr as a TypeGroupLeaveNotice
+// envelope over the freshly established channel. v1.1.4
+// (2026-07-02) — see internal/leavelog package doc for
+// the offline-replay rationale.
+//
+// Called right after syncRostersToPeer in handleInbound
+// so that the peer we're connecting to gets our "I left
+// these groups" history at the same time as the rest
+// of the sync. The receiver's ApplyLeaveNotice is
+// idempotent (no-op when the leaver isn't in their
+// local roster), so a re-broadcast of a notice the peer
+// already processed does no harm and incurs one packet
+// per entry.
+//
+// Skipped when the leavelog is empty (the common case
+// for a peer that has never left a group).
+func (n *Node) syncLeaveNoticesToPeer(peerHex string, ch *protocol.Channel) {
+	if n.leavelog == nil || ch == nil || len(peerHex) == 0 {
+		return
+	}
+	entries := n.leavelog.List()
+	if len(entries) == 0 {
+		return
+	}
+	sent := 0
+	for _, e := range entries {
+		// We only send a notice if WE were the leaver
+		// (this is always true — the log is per-device,
+		// not per-group — but the comment is here so a
+		// future "I saw someone else leave" log
+		// structure doesn't surprise readers). The
+		// leaver_id field carries our own peerID; the
+		// receiver uses it to find the row in their
+		// members.json and RemoveMember(leaver_id).
+		notice := protocol.LeaveNotice{
+			GroupID:  e.GroupID,
+			LeaverID: n.id.PeerIDHex(),
+			LeftAt:   e.LeftAt,
+		}
+		payload, err := json.Marshal(notice)
+		if err != nil {
+			log.Printf("[WARN ] syncLeaveNoticesToPeer(%s): marshal %s: %v", peerHex, e.GroupID, err)
+			continue
+		}
+		env := protocol.Envelope{
+			Type:    protocol.TypeGroupLeaveNotice,
+			Payload: payload,
+		}
+		if err := ch.Send(n.ctx, env); err != nil {
+			log.Printf("[WARN ] syncLeaveNoticesToPeer(%s): send %s: %v", peerHex, e.GroupID, err)
+			continue
+		}
+		sent++
+	}
+	if sent > 0 {
+		log.Printf("[GROUP ] leave pre-sync to %s: %d notice(s)", peerHex, sent)
+	}
+}
+
+// ApplyLeaveNotice is the receiver-side handler for
+// TypeGroupLeaveNotice. Sent 1:1 from a peer who has
+// just left (or is replaying a persisted leave) to the
+// group's creator. v1.1.4 (2026-07-02).
+//
+// Idempotent contract:
+//   - We don't have a local members.json for GroupID →
+//     the group is gone on our side (either we never
+//     joined, or we already self-dissolved it). No-op.
+//   - The leaver isn't in our local roster → the
+//     "offline broadcast succeeded" branch already
+//     removed them. No-op.
+//   - The leaver IS in our local roster → RemoveMember
+//     + Save + (if empty after removal) delete the
+//     group + broadcast the new roster to the
+//     remaining members. The new roster may also be
+//     empty if we (the creator) were the only other
+//     member — in that case we self-dissolve.
+//
+// This is the offline-replay healing path: when peer A
+// calls LeaveGroup while the creator is offline, the
+// online best-effort broadcast fails. A persists the
+// leave in leavelog, and on the next handshake A
+// replays the notice. The creator's ApplyLeaveNotice
+// is what actually drops A from the local roster so
+// the creator's UI doesn't get stuck at "<N> 成员"
+// with A still listed.
+func (n *Node) ApplyLeaveNotice(env protocol.Envelope, fromPeerID []byte) error {
+	var ln protocol.LeaveNotice
+	if err := json.Unmarshal(env.Payload, &ln); err != nil {
+		return fmt.Errorf("node: ApplyLeaveNotice unmarshal: %w", err)
+	}
+	rawID, err := group.ParseGroupID(ln.GroupID)
+	if err != nil {
+		return fmt.Errorf("node: ApplyLeaveNotice bad GroupID: %w", err)
+	}
+	// 1. No local members.json → group is gone for us.
+	// This is the common case for non-creator members
+	// (a regular member receiving a leave notice was
+	//never in the group) and also covers "we already
+	//self-dissolved because we were the only remaining
+	//member". Either way: no-op.
+	m, err := group.LoadMembers(n.dataDir(), rawID)
+	if err != nil {
+		if os.IsNotExist(err) {
+			// Quiet path: this is the "replay hit a
+			// group we don't have" branch, which is
+			// expected for a non-creator who is the
+			// notice target. No log here — the
+			// caller already logged "leave notice
+			// from <peer>" at INFO level.
+			return nil
+		}
+		return fmt.Errorf("node: ApplyLeaveNotice load: %w", err)
+	}
+	// 2. Leaver not in our roster → already removed
+	// (probably via the online best-effort broadcast
+	// in a prior session). Idempotent no-op.
+	if !m.Contains(ln.LeaverID) {
+		return nil
+	}
+	// 3. Leaver is in our roster. Remove + (maybe
+	// dissolve) + broadcast.
+	if !m.RemoveMember(ln.LeaverID) {
+		// RemoveMember returns false when the leaver is
+		// the Creator. That can only happen if the
+		// leaver is somehow the same peer as the
+		// creator, which by definition can't be true
+		// (the creator never leaves their own group
+		// via LeaveGroup — the solo-creator branch
+		// self-dissolves instead). Defensive log +
+		// no-op.
+		log.Printf("[WARN ] ApplyLeaveNotice: RemoveMember(%s) returned false for group=%s; ignoring",
+			ln.LeaverID[:8], ln.GroupID[:8])
+		return nil
+	}
+	log.Printf("[GROUP ] leave notice applied: dropping %s from group=%s (now %d members)",
+		ln.LeaverID[:8], ln.GroupID[:8], len(m.Members))
+	// If we just emptied the roster, dissolve the group
+	// (mirrors LeaveGroup's own empty-members branch in
+	// pkg/node/groups.go).
+	if len(m.Members) == 0 {
+		// Use the same helper LeaveGroup uses so the
+		// local cleanup is identical (members.json +
+		// chat.enc wiped together).
+		if err := n.deleteGroupDirsLocal(m.GroupID); err != nil {
+			return fmt.Errorf("node: ApplyLeaveNotice dissolve: %w", err)
+		}
+		log.Printf("[GROUP ] leave notice dissolved empty group=%s", ln.GroupID[:8])
+		n.publishGroupEvent(GroupEvent{
+			Type:      GroupRemoved,
+			GroupID:   m.GroupID,
+			GroupName: m.GroupName,
+		})
+		return nil
+	}
+	if err := m.Save(n.dataDir(), rawID); err != nil {
+		return fmt.Errorf("node: ApplyLeaveNotice save: %w", err)
+	}
+	// Broadcast the new roster to remaining members
+	// (best-effort; offline members will catch up on
+	// reconnect via syncRostersToPeer).
+	n.broadcastRosterUpdate(m)
+	n.publishGroupEvent(GroupEvent{
+		Type:      GroupUpdated,
+		GroupID:   m.GroupID,
+		GroupName: m.GroupName,
+	})
+	return nil
 }
 
 // GetSelfAlias returns our broadcast display name (the

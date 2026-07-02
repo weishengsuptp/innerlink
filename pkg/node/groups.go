@@ -15,6 +15,7 @@ import (
 
 	ic "github.com/weishengsuptp/innerlink/internal/crypto"
 	"github.com/weishengsuptp/innerlink/internal/filetransfer"
+	"github.com/weishengsuptp/innerlink/internal/leavelog"
 	"github.com/weishengsuptp/innerlink/internal/protocol"
 	"github.com/weishengsuptp/innerlink/internal/storage"
 	"github.com/weishengsuptp/innerlink/pkg/group"
@@ -805,6 +806,35 @@ func (n *Node) LeaveGroup(renderedID string) error {
 	// the accept path — see agent memory entry on roster
 	// write-broadcast exclusions).
 	n.broadcastRosterUpdate(m)
+	// v1.1.4 (2026-07-02): persist the leave to the
+	// device-level leavelog so we can replay a
+	// TypeGroupLeaveNotice to the creator on a future
+	// handshake. The creator may have been offline at
+	// leave time (the broadcast above dropped their copy
+	// silently), and without this replay path the
+	// creator's local roster would stay stale forever.
+	// See internal/leavelog package doc for the full
+	// design rationale.
+	if n.leavelog != nil {
+		if err := n.leavelog.Record(leavelog.Entry{
+			GroupID: renderedID,
+			LeftAt:  time.Now().UTC(),
+		}); err != nil {
+			log.Printf("[WARN ] leavelog: record %s: %v", renderedID, err)
+		} else if err := n.leavelog.Save(); err != nil {
+			// Log but don't fail the LeaveGroup — the
+			// broadcast already did its best, and a
+			// missing leavelog entry just means a future
+			// restart won't replay (we'll catch the
+			// creator up via the next in-person
+			// conversation or via the user's manual
+			// fix). Better to leave the group cleanly
+			// than to surface an error to the GUI
+			// after the user has already seen the
+			// toast.
+			log.Printf("[WARN ] leavelog: save %s: %v", renderedID, err)
+		}
+	}
 	// v1.1 (2026-06-28): tell the GUI the group is gone
 	// so it stops showing it in the sidebar. The frontend
 	// also clears any selectedId that pointed at this
@@ -1408,6 +1438,41 @@ func (n *Node) ApplyRosterUpdate(env protocol.Envelope, fromPeerID []byte) error
 	rawID, err := group.ParseGroupID(rp.GroupID)
 	if err != nil {
 		return fmt.Errorf("node: ApplyRosterUpdate bad GroupID: %w", err)
+	}
+	// v1.1.4 (2026-07-02) hotfix: refuse to (re-)create
+	// a group on our disk that we've already left.
+	//
+	// Scenario the user hit (2026-07-02 19:45 bug):
+	//   1. A leaves g_xxx while creator C is offline.
+	//      A's best-effort broadcast fails. A persists
+	//      the leave in leavelog.
+	//   2. C comes back online. C still has the stale
+	//      3-member roster (A's leave was never delivered
+	//      to C).
+	//   3. A restarts. A's local groups/g_xxx/ is gone
+	//      (LeaveGroup wiped it). On handshake, C's
+	//      syncRostersToPeer pushes the 3-member roster
+	//      back to A.
+	//   4. Pre-fix, ApplyRosterUpdate blindly wrote
+	//      members.json to A's disk, effectively
+	//      un-leaving A against A's will. The user
+	//      reported "另外两个重新打开程序, 群是没有的"
+	//      but the log shows the group was being
+	//      silently re-pulled on every reconnect.
+	//
+	// The fix: if A's leavelog contains rp.GroupID,
+	// drop the inbound roster. A is explicitly NOT in
+	// this group anymore; re-creating its on-disk state
+	// would surface the group in A's sidebar against
+	// A's intent. The leavelog will keep the notice
+	// "stuck" until C applies it (ApplyLeaveNotice on
+	// the next handshake), at which point C's roster
+	// will no longer contain A and the conflict
+	// resolves naturally.
+	if n.leavelog != nil && n.leavelog.Contains(rp.GroupID) {
+		log.Printf("[GROUP ] roster update from %s skipped: group=%s is in our leavelog (we already left)",
+			peerBytesToHex(fromPeerID), rp.GroupID[:8])
+		return nil
 	}
 
 	// v1.1.2 (2026-06-30) hotfix: preserve the local
