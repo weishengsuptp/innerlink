@@ -103,7 +103,15 @@ func TestLeaveNotice_ReAcceptClearsLeavelog(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	t.Cleanup(func() { _ = logx.Close() })
+	// v1.1.4 (2026-07-02): release the DataDir
+	// lockfile so t.TempDir cleanup can wipe the
+	// tmp directory. logx.Close is also still
+	// needed for the same Windows file-handle
+	// reason it was before the lockfile change.
+	t.Cleanup(func() {
+		_ = nI.Close()
+		_ = logx.Close()
+	})
 	iHex := nI.id.PeerIDHex()
 
 	rawID, _ := group.ParseGroupID(rendered)
@@ -540,7 +548,14 @@ func TestLeaveNotice_LeaveGroupPersistsToLog(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	t.Cleanup(func() { _ = logx.Close() })
+	// v1.1.4 (2026-07-02): nA.Close() releases the
+	// DataDir lockfile so t.TempDir can wipe the
+	// tmp dir on Windows. See newTestNode for the
+	// reasoning.
+	t.Cleanup(func() {
+		_ = nA.Close()
+		_ = logx.Close()
+	})
 	aHex := nA.id.PeerIDHex()
 
 	// Create the group so we have a real rendered ID
@@ -647,7 +662,13 @@ func TestLeaveNotice_ApplyRosterUpdateSkipsLeavedGroup(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	t.Cleanup(func() { _ = logx.Close() })
+	// v1.1.4 (2026-07-02): release the DataDir
+	// lockfile so t.TempDir can wipe the tmp dir.
+	// See newTestNode's comment for the same logic.
+	t.Cleanup(func() {
+		_ = nA.Close()
+		_ = logx.Close()
+	})
 
 	// We need a group that's both on a creator's disk
 	// (somewhere) AND in A's leavelog. Easiest: use

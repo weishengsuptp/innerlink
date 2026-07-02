@@ -7,6 +7,7 @@ import (
 	"log"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -109,6 +110,23 @@ type Node struct {
 	// ch.Send / waitForReply call). v1.1 (2026-06-27).
 	cancelMu   sync.Mutex
 	cancelFiles map[string]context.CancelFunc
+
+	// v1.1.4 (2026-07-02) — exclusive DataDir lock. v1.1.4
+	// hotfix against the user-reported 21:20 symptom: two
+	// innerlink.exe processes pointing at the same DataDir
+	// (the "vmware dual-IP test setup") silently race on
+	// device.key / roster.json / members.json. The second
+	// process binds UDP 4747 and TCP 4748 fails, but
+	// node.Start would have returned the error BEFORE we
+	// made this lock — except that nothing checked the
+	// return until the GUI app crashed an entire message
+	// stream later. With this lock, New() fails fast at
+	// the top of the constructor with a clear "DataDir
+	// already in use by another innerlink" message, and
+	// the second process exits before touching any state
+	// files. See the function comment on the lockfile
+	// release in Close for the lifecycle contract.
+	lockFile *os.File
 }
 
 // New constructs a Node. It loads (or creates) the SM2
@@ -134,6 +152,62 @@ func New(opts Options) (*Node, error) {
 	if err := layout.Ensure(); err != nil {
 		return nil, fmt.Errorf("create state dirs: %w", err)
 	}
+	// v1.1.4 (2026-07-02): exclusive DataDir lockfile.
+	// O_CREATE|O_EXCL fails if the file already exists,
+	// which happens whenever another innerlink.exe is
+	// already running against this DataDir. We open the
+	// file (and KEEP the handle — closing it would
+	// release the lock on Windows where the OS-level
+	// exclusive bind is the source of truth) and stash
+	// it on the Node so Close can remove the file at
+	// shutdown. Without this guard, two processes
+	// silently race on device.key / roster.json /
+	// members.json and the second process ends up
+	// picking up whichever device.key the first one
+	// happened to flush most recently. The user-reported
+	// 21:20 "<vm-clone-host> shows up twice, peer B
+	// drops itself from the group" was exactly this:
+	// A and B were on the same physical box, same
+	// DataDir, and the second innerlink silently
+	// co-existed with the first.
+	lockPath := filepath.Join(layout.DataDir, "innerlink.lock")
+	lockFile, err := os.OpenFile(lockPath, os.O_CREATE|os.O_EXCL|os.O_RDWR, 0o600)
+	if err != nil {
+		if os.IsExist(err) {
+			return nil, fmt.Errorf("node: DataDir %q is already in use by another innerlink process (lockfile %s exists). "+
+				"This usually means two innerlink.exe instances are sharing the same DataDir — "+
+				"use --data-dir or set INNERLINK_DATA_DIR to give each one its own state directory, "+
+				"or close the other instance first", layout.DataDir, lockPath)
+		}
+		return nil, fmt.Errorf("node: lock DataDir %q: %w", layout.DataDir, err)
+	}
+	// Write our PID into the lockfile so a human looking
+	// at the file (e.g. via "type innerlink.lock" in
+	// cmd) can tell which process holds it. Best-effort
+	// — a write failure here isn't fatal because the
+	// OS-level exclusive bind is the actual lock; the
+	// PID is just a debugging convenience.
+	if pidStr := strconv.Itoa(os.Getpid()) + "\n"; true {
+		if _, werr := lockFile.WriteString(pidStr); werr != nil {
+			log.Printf("[WARN ] node: write lockfile pid: %v", werr)
+		}
+		_ = lockFile.Sync()
+	}
+	// Defer-releaser: any error return below this point
+	// must release the lockfile so the caller can retry
+	// (or the next process can start). The success path
+	// in Close also releases, so we check `lockFile !=
+	// nil` (Close nils it after closing).
+	defer func() {
+		if lockFile == nil {
+			return
+		}
+		lockPath := lockFile.Name()
+		_ = lockFile.Close()
+		if err := os.Remove(lockPath); err != nil && !os.IsNotExist(err) {
+			log.Printf("[WARN ] node: remove lockfile %s on error path: %v", lockPath, err)
+		}
+	}()
 	if err := logx.Setup(logx.Options{
 		Level:  logx.Level(opts.LogLevel),
 		File:   layout.LogFile,
@@ -224,6 +298,7 @@ func New(opts Options) (*Node, error) {
 		selfidStore: selfidStore,
 		leavelog:    leavelogStore,
 		selfAlias:   selfAliasStore,
+		lockFile:    lockFile,
 		channels:    newChannelRegistry(),
 		messageCh:    make(chan Message, 64),
 		peerEventCh:  make(chan PeerEvent, 64),
@@ -238,6 +313,11 @@ func New(opts Options) (*Node, error) {
 		fileEventCh:  make(chan FileEvent, 256),
 		cancelFiles:  make(map[string]context.CancelFunc),
 	}
+	// Transfer ownership: n.lockFile is now the source of
+	// truth. The local var points at the same file; nil
+	// it so the deferred releaser skips the success path
+	// (Close handles release instead — single owner).
+	lockFile = nil
 
 	// v1.1.4 (2026-07-02): self-claim wiring at New time.
 	// If the just-loaded device identity's peerID differs
@@ -519,6 +599,29 @@ func (n *Node) Close() error {
 	// flushes AFTER wg.Wait (so no goroutine is still
 	// mutating chat/roster/alias while we close them).
 	_ = logx.Close()
+	// v1.1.4 (2026-07-02): release the exclusive DataDir
+	// lockfile so the next innerlink process can start
+	// against this directory. The order matters: we close
+	// the logx handle first (so the log line below lands
+	// somewhere), then close the lock handle and remove
+	// the file. We do the file removal AFTER closing the
+	// handle because on Windows the OS-level exclusive
+	// bind is what enforces the lock — closing the handle
+	// first means a racing process could see "file gone"
+	// and try to OpenFile|O_EXCL before we Remove, getting
+	// EEXIST spuriously. Remove() first, then Close(), is
+	// also a valid order on Windows but is slightly more
+	// racy on POSIX where the inode is reused briefly. The
+	// current order (Close then Remove) is the same one
+	// cmd/innerlink's defer uses elsewhere.
+	if n.lockFile != nil {
+		lockPath := n.lockFile.Name()
+		_ = n.lockFile.Close()
+		if err := os.Remove(lockPath); err != nil && !os.IsNotExist(err) {
+			log.Printf("[WARN ] node: remove lockfile %s: %v", lockPath, err)
+		}
+		n.lockFile = nil
+	}
 	close(n.messageCh)
 	close(n.peerEventCh)
 	close(n.fileEventCh)

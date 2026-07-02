@@ -94,6 +94,37 @@ interface UIState {
   groups: node.GroupInfo[];
   selectedId: string | null;          // peer hex OR rendered group ID
   history: Map<string, node.Message[]>; // conversation key -> msgs
+  // v1.1.4 (2026-07-02) — per-conversation composer draft.
+  // The composer textarea at the bottom of the chat pane
+  // is a single global DOM node, but each conversation
+  // (peer or group) is independent. The previous behavior
+  // was a single shared textarea whose value persisted
+  // across selection changes — typing in peer's A chat
+  // and clicking peer B would show the same text in B's
+  // composer, and pressing Enter would send that text
+  // to B (not A). The user-reported 21:20 bug:
+  // "我在对话框里编辑了文字，我切换聊天，对话框的文字
+  //  既然还保持，可以在另一个聊天里，直接发送".
+  //
+  // The fix: drafts is a Map<selectedId, string> that
+  // stores each conversation's in-progress text. On
+  // selection change we save the current textarea value
+  // to drafts[oldSelectedId] and load drafts[newSelectedId]
+  // into the textarea. Sending a message clears the
+  // entry for the just-sent conversation so the same
+  // text doesn't resurrect when you re-select the chat.
+  drafts: Map<string, string>;
+  // draftsLoaded tracks whether we've already populated
+  // the textarea from drafts on the current selectedId.
+  // Without this, switching to chat X (loads X's draft)
+  // and then typing would update X's draft correctly,
+  // but switching to chat Y without any typing between
+  // would still re-render the textarea (no-op visually
+  // but no X draft either). It's a single boolean that
+  // we set true on every selectPeer/selectGroup, so the
+  // input listener doesn't have to worry about the
+  // "is this user-typed or program-loaded" distinction.
+  draftsLoaded: boolean;
   // nearBottom: are we within ~60px of the message list
   // bottom? Used by renderMessages to decide whether to
   // auto-stick to bottom on new incoming messages.
@@ -156,6 +187,8 @@ const state: UIState = {
   groups: [],
   selectedId: null,
   history: new Map(),
+  drafts: new Map(),
+  draftsLoaded: false,
   nearBottom: true,
   unreadCount: new Map(),
   groupUnread: new Map(),
@@ -1216,7 +1249,23 @@ function renderMessage(m: node.Message, peerId: string): string {
 
 // ----- actions -----
 async function selectPeer(peerId: string) {
+  // v1.1.4 (2026-07-02) — swap the per-conversation
+  // composer draft. Save whatever is currently in
+  // the textarea under the OLD selectedId, then load
+  // the draft for the NEW selectedId (or empty
+  // string if this is the first visit). This is the
+  // per-chat draft binding the user reported as
+  // missing: type in peer's A chat, click peer B,
+  // the text stays in A's draft (and comes back when
+  // you re-select A), and B's textarea starts empty
+  // (or shows whatever was in B's draft from before).
+  const input = document.getElementById('composer-input') as HTMLTextAreaElement;
+  if (state.selectedId !== null && state.draftsLoaded) {
+    state.drafts.set(state.selectedId, input.value);
+  }
+
   state.selectedId = peerId;
+  state.draftsLoaded = true;
   // Opening a conversation clears its unread badge.
   state.unreadCount.set(peerId, 0);
   try {
@@ -1230,7 +1279,9 @@ async function selectPeer(peerId: string) {
   renderChatList();
   renderChatHeader();
   renderMessages();
-  const input = document.getElementById('composer-input') as HTMLTextAreaElement;
+  // Load the draft for the new selection. If none
+  // exists (first visit) the textarea goes empty.
+  input.value = state.drafts.get(peerId) ?? '';
   input.focus();
 }
 
@@ -1238,7 +1289,16 @@ async function selectPeer(peerId: string) {
 // selectPeer but calls HistoryGroup (per-group chat.enc)
 // instead of History (per-peer chat.enc). v1.1 (2026-06-28).
 async function selectGroup(renderedID: string) {
+  // v1.1.4 (2026-07-02) — same per-conversation draft
+  // swap as selectPeer; see that function's comment
+  // for the rationale.
+  const input = document.getElementById('composer-input') as HTMLTextAreaElement;
+  if (state.selectedId !== null && state.draftsLoaded) {
+    state.drafts.set(state.selectedId, input.value);
+  }
+
   state.selectedId = renderedID;
+  state.draftsLoaded = true;
   // Group sidebar entry uses .group class, so we need to
   // re-render both lists (the active highlight lives in
   // different DOM nodes for the two sections).
@@ -1254,7 +1314,8 @@ async function selectGroup(renderedID: string) {
   renderGroupList();
   renderChatHeader();
   renderMessages();
-  const input = document.getElementById('composer-input') as HTMLTextAreaElement;
+  // Load the draft for the new selection.
+  input.value = state.drafts.get(renderedID) ?? '';
   if (!input.disabled) input.focus();
 }
 
@@ -1289,7 +1350,23 @@ async function refreshAll() {
         ? state.groups.some(g => g.group_id === state.selectedId)
         : state.peers.some(p => p.PeerID === state.selectedId);
       if (!stillThere) {
+        // v1.1.4 (2026-07-02): the previously-active
+        // conversation is gone (e.g. group removed,
+        // peer offline long enough to drop). Clear
+        // the textarea so the user doesn't see a
+        // "ghost" draft attached to a chat that's no
+        // longer reachable. The draft is still in
+        // state.drafts[oldId] — if a new event
+        // resurrects the same conversation key, the
+        // next selectPeer/selectGroup will rehydrate
+        // it.
+        const input = document.getElementById('composer-input') as HTMLTextAreaElement | null;
+        if (state.draftsLoaded && state.selectedId !== null) {
+          state.drafts.set(state.selectedId, input?.value ?? '');
+        }
         state.selectedId = null;
+        state.draftsLoaded = false;
+        if (input) input.value = '';
         renderChatHeader();
       }
     }
@@ -2867,8 +2944,24 @@ function wireEvents() {
     }
     if (err) {
       toast(`发送失败: ${err}`);
+      // v1.1.4 (2026-07-02): on send failure, leave
+      // the draft in place so the user can fix the
+      // recipient / text and retry. The per-chat
+      // draft map already has this conversation's
+      // text, so it survives the failed send.
     } else {
       input.value = '';
+      // v1.1.4 (2026-07-02): clear the draft entry
+      // for the conversation we just sent to. This
+      // way, if the user re-selects the chat after
+      // the message went out, the textarea starts
+      // empty (the message itself is in the chat
+      // log). The compose-in-progress text is gone
+      // for good — sending IS the commit, no
+      // undo-by-re-select.
+      if (state.selectedId !== null) {
+        state.drafts.set(state.selectedId, '');
+      }
     }
   });
 

@@ -55,10 +55,19 @@ func newTestNode(t *testing.T) (*Node, string) {
 	if err != nil {
 		t.Fatalf("New: %v", err)
 	}
-	// Schedule a logx.Close on test cleanup so the temp
-	// dir RemoveAll on Windows can actually delete the
-	// logfile (logx.Setup holds an exclusive write handle).
-	t.Cleanup(func() { _ = logx.Close() })
+	// v1.1.4 (2026-07-02) — schedule Node.Close on
+	// cleanup so the exclusive DataDir lockfile is
+	// released and t.TempDir's RemoveAll can clean
+	// up on Windows. Without this, t.TempDir fails
+	// with "file in use" because the lockfile
+	// (innerlink.lock) is still held by the test
+	// process — same root cause as the live
+	// "two innerlink.exe on one DataDir" bug the
+	// lockfile was added to fix in production.
+	t.Cleanup(func() {
+		_ = n.Close()
+		_ = logx.Close()
+	})
 	info, err := n.CreateGroup("测试群", nil)
 	if err != nil {
 		t.Fatalf("CreateGroup: %v", err)
@@ -240,10 +249,16 @@ func TestGroupSync_ApplyRosterUpdate_ReplacesMembers(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	// Schedule a final logx.Close — needed because the
-	// second node opened its own logfile which would
-	// otherwise stay held when t.TempDir cleans up.
-	t.Cleanup(func() { _ = logx.Close() })
+	// v1.1.4 (2026-07-02): n.Close() releases the
+	// exclusive DataDir lockfile. Without this,
+	// t.TempDir's RemoveAll on Windows fails with
+	// "file in use" on innerlink.lock. See the
+	// newTestNode cleanup comment for the same logic
+	// applied to the creator node.
+	t.Cleanup(func() {
+		_ = nC.Close()
+		_ = logx.Close()
+	})
 	// C must have accepted the invite first; mimic that
 	// by creating a 1-member members.json for C matching
 	// [creator, c]. (AcceptGroupInvite creates this; we
