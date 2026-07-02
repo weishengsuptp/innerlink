@@ -465,7 +465,48 @@ func (n *Node) Close() error {
 	if n.tr != nil {
 		n.tr.Close()
 	}
-	// Announcer has no Close() 鈥?Run() exits when ctx is
+	// v1.1.4 (2026-07-02) hotfix — Close deadlock on shutdown.
+	//
+	// Symptom: nd.Close() took > 5s, app.Shutdown's 5s timer
+	// fired, runtime.Stack dump showed 5 goroutines all
+	// blocked on `chan receive`:
+	//   - pkg/node/node.go:416  for ev := range n.ann.Events()
+	//     (announcer consumer started in Node.Start)
+	//   - app/app.go:999/1011/1024/1038  for ev := range
+	//     nd.SubscribePeers/Messages/Groups/Files()
+	//     (4 pump goroutines forwarding events to frontend)
+	//
+	// Root cause: the 4 public SubscribeXxx channels (messageCh,
+	// peerEventCh, fileEventCh, groupEventCh) were being
+	// close()d AFTER n.wg.Wait() at the bottom of this func.
+	// But those 4 channels are exactly what the pump
+	// goroutines are blocked on — so wg.Wait would never
+	// complete (pumps waiting for close, close waiting for
+	// wg.Wait) and the whole shutdown deadlocked for the
+	// ~5s read-deadline interval of the announcer's UDP
+	// socket (which would eventually let Run return, then
+	// closeEvents() would unblock goroutine 53 at
+	// node.go:416, but only after that 5s wall-clock
+	// tick).
+	//
+	// Fix: close the 4 SubscribeXxx channels FIRST, so the
+	// pump goroutines can drain their range loops and
+	// wg.Done() before wg.Wait blocks on them. Same with
+	// the announcer consumer — its events channel is closed
+	// by Announcer.Run on ctx.Done, which the n.cancel()
+	// above already triggered, so it'll fall through on
+	// its own once Run's read deadline elapses.
+	//
+	// Order matters: close channels BEFORE wg.Wait (so
+	// consumers can exit), but do the persistent-state
+	// flushes AFTER wg.Wait (so no goroutine is still
+	// mutating chat/roster/alias while we close them).
+	_ = logx.Close()
+	close(n.messageCh)
+	close(n.peerEventCh)
+	close(n.fileEventCh)
+	close(n.groupEventCh)
+	// Announcer has no Close() — Run() exits when ctx is
 	// canceled (defer conn.Close inside Run), so cancelling
 	// n.ctx above is enough to bring it down.
 	n.wg.Wait()
@@ -490,11 +531,6 @@ func (n *Node) Close() error {
 			log.Printf("[ERROR] close self alias: %v", err)
 		}
 	}
-	_ = logx.Close()
-	close(n.messageCh)
-	close(n.peerEventCh)
-	close(n.fileEventCh)
-	close(n.groupEventCh)
 	return nil
 }
 
