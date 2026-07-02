@@ -77,12 +77,24 @@ func NewApp() *App {
 //
 //  1. Stash the Wails context (so bound methods can
 //     log + emit events).
-//  2. Construct + Start the protocol Node with default
-//     options (data dir ./.innerlink, UDP/TCP default
-//     ports, info-level logging to ./innerlink.log).
-//  3. Start two background pump goroutines that
-//     forward SubscribePeers / SubscribeMessages events
-//     to the frontend as Wails runtime events.
+//  2. Construct + Start the protocol Node.
+//
+// v1.1.4 (2026-07-02) log routing fix: 潇男 pointed
+// out that the Wails app's logs were invisible because
+// logx defaults to "stderr only" when LogFile is empty,
+// and Wails release builds don't surface stderr anywhere
+// useful. We now ALWAYS set:
+//
+//   - LogFile = <exe-dir>/innerlink.log (next to the
+//     binary, NOT relative to cwd — Wails changes cwd
+//     to %APPDATA% which is non-obvious for users)
+//   - LogLevel = "debug" (dev phase; per 潇男 2026-07-02:
+//     "现阶段所有的发布都不是发布成品的, 不需要在意
+//     那些, 要把日志尽可能多的 丰富打印出来, 一切为了
+//     方便". When we ship a real production build we'll
+//     flip this back to "info" or "warn".)
+//
+// All in one place so the change is easy to audit.
 //
 // Pump goroutines exit when their source channel is
 // closed, which happens when Node.Close() is called in
@@ -93,7 +105,23 @@ func (a *App) Startup(ctx context.Context) {
 	log.Printf("[INFO  app] Startup ENTER (goroutines=%d)", runtime.NumGoroutine())
 	a.ctx = ctx
 
-	nd, err := node.New(node.Options{})
+	// Log file next to the binary, not relative to cwd.
+	// Wails on Windows cd's to %APPDATA%\Roaming\<name>\;
+	// using os.Executable() avoids the Wails cwd quirk
+	// (the user's bin dir is also where their web service
+	// on :10086 serves files, so the log lands there too).
+	exe, exeErr := os.Executable()
+	if exeErr != nil {
+		log.Printf("[WARN  app] os.Executable failed: %v (falling back to cwd)", exeErr)
+		exe, _ = os.Getwd()
+	}
+	logFile := filepath.Join(filepath.Dir(exe), "innerlink.log")
+	log.Printf("[INFO  app] log file: %s", logFile)
+
+	nd, err := node.New(node.Options{
+		LogFile:  logFile,
+		LogLevel: "debug",
+	})
 	if err != nil {
 		log.Printf("[ERROR app] node.New failed: %v", err)
 		log.Fatalf("innerlink: start: %v", err)
