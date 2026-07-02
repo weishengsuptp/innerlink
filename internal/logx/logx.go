@@ -114,7 +114,24 @@ func Setup(opts Options) error {
 	case 1:
 		out = writers[0]
 	default:
-		out = io.MultiWriter(writers...)
+		// v1.1.4 (2026-07-02) hotfix: don't use
+		// io.MultiWriter here. It calls writers in
+		// order and returns the FIRST error — so a
+		// closed/EBADF stderr (which is what Windows
+		// GUI binaries get when launched via explorer.exe
+		// or Start-Process without a console) aborts the
+		// write before the FILE writer ever gets the
+		// bytes. Net result: the log file stays empty
+		// even though logx.Setup "succeeded".
+		//
+		// fanOut writes to every writer regardless of
+		// individual failures. We return the FIRST
+		// error encountered so the stdlib log package
+		// sees something useful (it ignores the return
+		// from log.Printf anyway), but the side effect
+		// is what we care about: the file is updated
+		// even if stderr is closed.
+		out = fanOut(writers...)
 	}
 
 	// Hand our writer to the stdlib log package, and
@@ -274,4 +291,46 @@ func bytesIndexByte(b []byte, c byte) int {
 		}
 	}
 	return -1
+}
+
+// fanOut writes p to every w in writers, ignoring
+// individual failures (the call to stderr fails with
+// EBADF when a Windows GUI binary is launched via
+// explorer.exe — MultiWriter would abort on the first
+// failure and never reach the file writer). We return
+// the first non-nil error so the caller (stdlib log)
+// still sees a useful signal, but the side effect
+// (each writer gets its copy of p) is what matters in
+// practice. p is consumed exactly once across all
+// writers — they don't share its bytes.
+func fanOut(writers ...io.Writer) io.Writer {
+	return fanOutWriter{writers}
+}
+
+type fanOutWriter struct {
+	writers []io.Writer
+}
+
+func (t fanOutWriter) Write(p []byte) (int, error) {
+	var firstErr error
+	written := 0
+	for _, w := range t.writers {
+		n, err := w.Write(p)
+		// io.Writer contract: n is bytes consumed from p
+		// on this call. Since we write the same p to all,
+		// the "consumed" notion is meaningless to track
+		// across writers — each writer decides its own
+		// behavior. We report len(p) on success and 0
+		// on first error so the stdlib log package
+		// (which reads the count to update its buffer
+		// cursor — irrelevant for us since we don't
+		// keep a buffer) doesn't get confused.
+		if err != nil && firstErr == nil {
+			firstErr = err
+			continue
+		}
+		_ = n
+		written = len(p)
+	}
+	return written, firstErr
 }
