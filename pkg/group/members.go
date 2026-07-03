@@ -7,6 +7,7 @@ import (
 	"os"
 	"path/filepath"
 	"sort"
+	"sync"
 	"time"
 )
 
@@ -75,6 +76,13 @@ func LoadMembers(dataDir string, rawGroupID []byte) (*Members, error) {
 		return nil, fmt.Errorf("group: LoadMembers: bad GroupID size %d, want %d",
 			len(rawGroupID), RawGroupIDSize)
 	}
+	// Acquire the per-group lock so we never read while
+	// a concurrent Save is mid-rename. Without this, a
+	// reader can see a partial state (or a half-renamed
+	// file) on Windows.
+	mu := lockFor(rawGroupID)
+	mu.Lock()
+	defer mu.Unlock()
 	b, err := os.ReadFile(membersPath(dataDir, rawGroupID))
 	if err != nil {
 		return nil, err
@@ -86,6 +94,88 @@ func LoadMembers(dataDir string, rawGroupID []byte) (*Members, error) {
 	return &m, nil
 }
 
+// UpdateMembers runs fn under the per-group lock with the
+// current Members loaded. fn may mutate the in-memory
+// Members in any way; the result is auto-saved before
+// the lock is released. Returns the post-mutation m
+// (== the in-memory Members pointer that fn was called
+// with, after Save) so callers can broadcast /
+// publish from a consistent state.
+//
+// Use this for read-modify-write operations (e.g.
+// "add a member if not already present") that must be
+// atomic against concurrent writers. Pure reads should
+// use LoadMembers; pure writes that don't need to look
+// at the current state can use Save directly (after
+// LoadMembers).
+//
+// On a fresh group (members.json doesn't exist), fn is
+// called with an empty Members struct + nil error, and
+// the result is written (if fn didn't return an error).
+//
+// Why this exists: a previous version of pkg/node used
+// the pattern "LoadMembers → mutate → Save" which is
+// NOT atomic against another goroutine doing the same
+// thing — the in-memory mutation is outside the lock,
+// so two concurrent adds can both read the same base
+// state and overwrite each other on Save. This helper
+// closes the gap. Caught by S5 in the integration test
+// harness (2026-07-03).
+func UpdateMembers(dataDir string, rawGroupID []byte, fn func(*Members) error) (*Members, error) {
+	if len(rawGroupID) != RawGroupIDSize {
+		return nil, fmt.Errorf("group: UpdateMembers: bad GroupID size %d, want %d",
+			len(rawGroupID), RawGroupIDSize)
+	}
+	mu := lockFor(rawGroupID)
+	mu.Lock()
+	defer mu.Unlock()
+
+	b, err := os.ReadFile(membersPath(dataDir, rawGroupID))
+	m := &Members{}
+	if err == nil {
+		if err := json.Unmarshal(b, m); err != nil {
+			return nil, fmt.Errorf("group: parse members.json: %w", err)
+		}
+	} else if !os.IsNotExist(err) {
+		return nil, err
+	}
+
+	if err := fn(m); err != nil {
+		return nil, err
+	}
+
+	if err := m.saveLocked(dataDir, rawGroupID); err != nil {
+		return nil, err
+	}
+	return m, nil
+}
+
+// saveLocked writes m to members.json atomically. MUST be
+// called with the per-group lock held (via UpdateMembers
+// or by direct coordination). The Save() public method
+// acquires the lock itself for callers that don't already
+// hold it; this version is for the locked code path.
+func (m *Members) saveLocked(dataDir string, rawGroupID []byte) error {
+	dir := groupDir(dataDir, rawGroupID)
+	if err := os.MkdirAll(dir, 0o700); err != nil {
+		return fmt.Errorf("group: mkdir %s: %w", dir, err)
+	}
+	b, err := json.MarshalIndent(m, "", "  ")
+	if err != nil {
+		return fmt.Errorf("group: marshal members.json: %w", err)
+	}
+	final := filepath.Join(dir, membersFileName)
+	tmp := final + ".tmp"
+	if err := os.WriteFile(tmp, b, 0o600); err != nil {
+		return fmt.Errorf("group: write tmp %s: %w", tmp, err)
+	}
+	if err := os.Rename(tmp, final); err != nil {
+		_ = os.Remove(tmp)
+		return fmt.Errorf("group: rename %s -> %s: %w", tmp, final, err)
+	}
+	return nil
+}
+
 // Save writes m to <dataDir>/groups/<renderedID>/members.json
 // atomically (write to .tmp + rename) so a crash mid-write never
 // leaves a half-baked file. Creates the directory if missing.
@@ -93,11 +183,39 @@ func LoadMembers(dataDir string, rawGroupID []byte) (*Members, error) {
 // 0600 / 0700 perms: members.json leaks peerIDs (not secret, but
 // not public either — knowing someone's peerID enables direct
 // messaging without their consent). Group directory is owner-only.
+// saveLocks serializes Save / LoadMembers for the same
+// rawGroupID across the process. Multiple concurrent
+// writers (e.g. two CreatorOnAccept envelopes arriving
+// simultaneously) would otherwise race on the file-system
+// rename and one would fail with "Access is denied" on
+// Windows. Per-group locking keeps the contention local
+// to one group and lets unrelated groups proceed in
+// parallel.
+//
+// The map is keyed by the rendered GroupID string — fine
+// for process-local locking; not a substitute for the
+// in-memory mutex that pkg/node uses elsewhere.
+var saveLocks sync.Map // map[string]*sync.Mutex
+
+func lockFor(rawGroupID []byte) *sync.Mutex {
+	key := string(rawGroupID)
+	v, _ := saveLocks.LoadOrStore(key, &sync.Mutex{})
+	return v.(*sync.Mutex)
+}
+
 func (m *Members) Save(dataDir string, rawGroupID []byte) error {
 	if len(rawGroupID) != RawGroupIDSize {
 		return fmt.Errorf("group: Save: bad GroupID size %d, want %d",
 			len(rawGroupID), RawGroupIDSize)
 	}
+	// Serialize Save+LoadMembers for the same group. The
+	// lock is process-wide (any caller touching this
+	// group's members.json — Node, harness, recovery
+	// path — will queue behind us).
+	mu := lockFor(rawGroupID)
+	mu.Lock()
+	defer mu.Unlock()
+
 	dir := groupDir(dataDir, rawGroupID)
 	if err := os.MkdirAll(dir, 0o700); err != nil {
 		return fmt.Errorf("group: mkdir %s: %w", dir, err)

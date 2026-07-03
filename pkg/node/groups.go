@@ -225,6 +225,14 @@ func (n *Node) GetGroup(renderedID string) (*GroupInfo, error) {
 // GUI can distinguish "never joined" from "real error".
 var ErrGroupNotFound = errors.New("node: group not found")
 
+// errAlreadyMember is a sentinel returned from inside an
+// UpdateMembers callback to signal "no change needed".
+// CreatorOnAccept uses this to short-circuit the
+// already-member case (which the previous LoadMembers +
+// Contains check handled before the per-group lock was
+// added).
+var errAlreadyMember = errors.New("node: already a member")
+
 // InviteToGroup signs an Invite for inviteePeerID and sends it
 // over the 1:1 channel to that peer. The invitee's AcceptGroup
 // response will trigger this creator's "add member" flow.
@@ -501,7 +509,12 @@ func (n *Node) DeclineGroupInvite(env protocol.Envelope, fromPeerID []byte, reas
 		return err
 	}
 	st := n.channels.get(fromPeerID)
-	if st == nil {
+	if st == nil || st.ch == nil {
+		// Integration-test-harness path: no real
+		// channel exists (pubkey was seeded without
+		// ch). Drop the outbound ack; the harness
+		// doesn't model the decline-ack round-trip.
+		log.Printf("[GROUP ] declined invite to %s from %x (no channel — ack dropped)", inv.GroupID, fromPeerID)
 		return nil
 	}
 	log.Printf("[GROUP ] declined invite to %s from %x", inv.GroupID, fromPeerID)
@@ -515,6 +528,15 @@ func (n *Node) DeclineGroupInvite(env protocol.Envelope, fromPeerID []byte, reas
 // TypeGroupInviteAccept on the inviter. Adds the accepter
 // to members.json + SenderKeys distribution (TODO when
 // SenderKeys land).
+//
+// Concurrency: the read-modify-write of members.json is
+// wrapped in group.UpdateMembers, which holds a per-group
+// lock for the entire operation. Without this, two
+// accept envelopes arriving simultaneously would each
+// read {alice}, each add their own accepter, and the
+// second Save would clobber the first — losing one
+// member. Caught by S5 in the integration test harness
+// (2026-07-03).
 func (n *Node) CreatorOnAccept(env protocol.Envelope, fromPeerID []byte) error {
 	var ap acceptPayload
 	if err := json.Unmarshal(env.Payload, &ap); err != nil {
@@ -524,23 +546,28 @@ func (n *Node) CreatorOnAccept(env protocol.Envelope, fromPeerID []byte) error {
 	if err != nil {
 		return fmt.Errorf("node: CreatorOnAccept bad GroupID: %w", err)
 	}
-	m, err := group.LoadMembers(n.dataDir(), rawID)
-	if err != nil {
-		return fmt.Errorf("node: CreatorOnAccept load: %w", err)
-	}
 	accepterHex := peerBytesToHex(fromPeerID)
-	if m.Contains(accepterHex) {
+	now := time.Now().UTC()
+
+	// Atomic read-modify-write under the per-group lock.
+	m, err := group.UpdateMembers(n.dataDir(), rawID, func(m *group.Members) error {
+		if m.Contains(accepterHex) {
+			// Already a member — leave the file as-is
+			// (the caller will treat the no-op return
+			// below as "no change, no broadcast").
+			return errAlreadyMember
+		}
+		return m.AddMember(group.Member{
+			PeerID:   accepterHex,
+			JoinedAt: now,
+		})
+	})
+	if errors.Is(err, errAlreadyMember) {
 		log.Printf("[GROUP ] accept from %s: already member, no-op", accepterHex)
 		return nil
 	}
-	if err := m.AddMember(group.Member{
-		PeerID:   accepterHex,
-		JoinedAt: time.Now().UTC(),
-	}); err != nil {
-		return fmt.Errorf("node: CreatorOnAccept add member: %w", err)
-	}
-	if err := m.Save(n.dataDir(), rawID); err != nil {
-		return fmt.Errorf("node: CreatorOnAccept save: %w", err)
+	if err != nil {
+		return fmt.Errorf("node: CreatorOnAccept: %w", err)
 	}
 	log.Printf("[GROUP ] %s accepted invite to %s; roster updated", accepterHex, ap.GroupID)
 	// v1.1.1 (2026-06-29): broadcast the updated roster to
@@ -642,8 +669,14 @@ func (n *Node) SendGroupMessage(rawGroupID []byte, text string) error {
 			continue
 		}
 		st := n.channels.get(pid)
-		if st == nil {
-			// Member offline (no active TCP channel).
+		if st == nil || st.ch == nil {
+			// Member offline (no active TCP channel)
+			// OR integration-test-harness stub channel
+			// (pubkey seeded without ch). Either way,
+			// drop the outbound message and let the
+			// harness drive the receiver directly if
+			// needed.
+			//
 			// Pre-fix: dropped silently. Post-fix
 			// (v1.1.1, 2026-06-30): if the roster has
 			// an Addrs[] entry for this peer, fire a

@@ -357,6 +357,43 @@ func (h *Harness) peerByID(hexID string) *Peer {
 	return nil
 }
 
+// reRegisterPubkeys re-seeds every peer's pubkey cache
+// for every other peer. Used after a Peer.Restart(),
+// which clears the in-memory channel registry.
+//
+// Why this is needed: RegisterPeerPublicKeyForTest
+// populates the in-memory channelState map, not the
+// on-disk key file. After Close() the map is dropped.
+// Restart() creates a fresh Node but the test's
+// pubkey seeding is gone, so AcceptGroupInvite would
+// fail with "no active channel with peer X" until the
+// next seed.
+//
+// Production never has this problem because pubkeys
+// come from the on-disk roster (the persistent
+// channel-state pubkey lives in the device.key path,
+// which survives restart). The harness doesn't have
+// an on-disk equivalent, so we re-seed manually.
+func (h *Harness) reRegisterPubkeys() {
+	for _, p := range h.peers {
+		if p.Node == nil {
+			continue
+		}
+		for _, q := range h.peers {
+			if p.Node.SelfPeerID() == q.Node.SelfPeerID() {
+				continue
+			}
+			if q.Node == nil {
+				continue
+			}
+			// Best-effort: ignore errors here, the
+			// test will surface the real failure on
+			// the next AcceptGroupInvite call.
+			_ = p.Node.RegisterPeerPublicKeyForTest(q.PeerID(), q.Node.SelfPublicKey())
+		}
+	}
+}
+
 // Events returns a snapshot of one peer's drained events.
 // Mutating the returned slice will not race the drainer
 // because we copy under h.mu before returning.
