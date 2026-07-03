@@ -1642,6 +1642,40 @@ func (n *Node) ApplyRosterUpdate(env protocol.Envelope, fromPeerID []byte) error
 		GroupID:   m.GroupID,
 		GroupName: m.GroupName,
 	})
+
+	// v1.1.4 (2026-07-03): close the Q3 gossip gap.
+	//
+	// Scenario (Q3, 2026-07-02): bob (non-creator) leaves
+	// a 3-person group. bob.LeaveGroup calls
+	// broadcastRosterUpdate which iterates bob's current
+	// channels and sends the new (2-member) roster to
+	// alice and carol. Best-effort: if one of those
+	// channels is down at the moment of leave, the
+	// corresponding peer never gets the update, and that
+	// peer's local members.json stays at 3 forever (until
+	// they reconnect and syncRostersToPeer heals it on a
+	// future handshake).
+	//
+	// Fix: when the receiver IS the creator, re-broadcast
+	// the canonical roster to all members. The creator is
+	// the authoritative source — if alice (creator)
+	// received bob's leave but carol didn't (because
+	// carol's channel was down at the time), alice's
+	// re-broadcast from her still-up channel to carol
+	// closes the gap. Non-creator receivers do NOT
+	// re-broadcast (would cascade: every re-broadcast
+	// would itself trigger another re-broadcast).
+	//
+	// Failure mode this does NOT cover: if the creator's
+	// channel to the missed peer is ALSO down, the missed
+	// peer still stays stale until the next handshake
+	// (syncRostersToPeer heals it then). That's the same
+	// catch-up story as any other best-effort gossip
+	// pattern; the previous behavior had no creator-side
+	// amplification at all, this gets the easy case.
+	if finalCreator != "" && n.id != nil && finalCreator == n.id.PeerIDHex() {
+		n.broadcastRosterUpdate(m)
+	}
 	return nil
 }
 

@@ -465,18 +465,23 @@ func TestSystem_ThreePeerGroup(t *testing.T) {
 	time.Sleep(2 * time.Second)
 
 	// 16-17. alice and carol's members.json should
-	// now have 2 members. KNOWN LIMITATION: this only
-	// works if bob's leave broadcast reached carol.
-	// bob's broadcastRosterUpdate iterates his CURRENT
-	// channels; if one was down at the moment of leave,
-	// the other peer never learns. ApplyRosterUpdate on
-	// alice doesn't re-broadcast further. We test the
-	// happy path here (channels up) and document the
-	// gap; the S6 in-process test covers the
-	// late-leave-notice scenarios.
+	// now have 2 members.
 	//
-	// Strategy: wait up to 5s for carol to converge.
-	// If still 3 members, log the gap and continue.
+	// v1.1.4 (2026-07-03): previously this was a
+	// "KNOWN GAP" — bob's broadcastRosterUpdate is
+	// best-effort, and if a channel was down at the
+	// moment of leave, the missed peer would stay
+	// stuck at 3 members until next reconnect. The
+	// fix in ApplyRosterUpdate is: when the receiver
+	// IS the creator, re-broadcast the canonical
+	// roster after applying. So even if bob's
+	// direct broadcast to carol failed, alice
+	// (creator, on a still-up channel to carol)
+	// re-broadcasts and carol converges.
+	//
+	// We now assert strict convergence (both peers
+	// at 2 members) instead of logging the gap and
+	// moving on.
 	for _, p := range []*cliPeer{alice, carol} {
 		membersPath := filepath.Join(p.DataDir, "groups", gidLine, "members.json")
 		// Poll for up to 5s.
@@ -499,7 +504,8 @@ func TestSystem_ThreePeerGroup(t *testing.T) {
 			time.Sleep(100 * time.Millisecond)
 		}
 		if !converged {
-			t.Logf("KNOWN GAP: peer %s did not converge to 2 members after bob leave (broadcast channel was down — see S6 in-process test)", p.Name)
+			t.Errorf("peer %s did not converge to 2 members within 5s after bob leave (Q3 gossip gap regression — ApplyRosterUpdate should re-broadcast when the local is the creator)", p.Name)
+			dumpPeerLogs(t, alice, bob, carol)
 		}
 	}
 }
