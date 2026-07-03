@@ -1499,7 +1499,11 @@ func (n *Node) broadcastMetaUpdate(m *group.Members) {
 			continue
 		}
 		st := n.channels.get(pid)
-		if st == nil {
+		if st == nil || st.ch == nil {
+			// Test-only stub channels have nil ch;
+			// the harness drives receiver-side
+			// ApplyMetaUpdate directly via the
+			// SynthesizeMetaEnvelope helper.
 			continue
 		}
 		env := protocol.Envelope{

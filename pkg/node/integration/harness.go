@@ -184,8 +184,8 @@ type peerEvents struct {
 // teardown via CloseAll(). t.Cleanup registers CloseAll so
 // the test framework unwinds cleanly.
 func NewHarness(t *testing.T, names []string) *Harness {
-	if len(names) < 2 {
-		t.Fatalf("harness needs at least 2 peers (got %d: %v)", len(names), names)
+	if len(names) < 1 {
+		t.Fatalf("harness needs at least 1 peer (got %d: %v)", len(names), names)
 	}
 	h := &Harness{
 		t:      t,
@@ -616,6 +616,28 @@ func SynthesizeAcceptEnvelope(invitee *Peer, inv *group.Invite) protocol.Envelop
 	return protocol.Envelope{
 		Type:    protocol.TypeGroupInviteAccept,
 		Payload: payload,
+	}
+}
+
+// SynthesizeMetaEnvelope builds a TypeGroupMetaUpdate
+// envelope from the given peer (the broadcaster). The
+// receiver-side ApplyMetaUpdate applies it to local
+// members.json in place. Used by scenarios that
+// exercise rename / remark without going through real
+// channel broadcasts.
+func SynthesizeMetaEnvelope(from *Peer, rawGroupID []byte, name, remark string) protocol.Envelope {
+	payload, _ := json.Marshal(map[string]string{
+		"group_id":   group.RenderGroupID(rawGroupID),
+		"group_name": name,
+		"remark":     remark,
+	})
+	return protocol.Envelope{
+		Version: protocol.ProtocolVersion,
+		Type:    protocol.TypeGroupMetaUpdate,
+		From:    from.PeerIDBytes(),
+		Payload: payload,
+		GroupID: rawGroupID,
+		TS:      time.Now().UnixMilli(),
 	}
 }
 

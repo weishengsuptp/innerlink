@@ -684,6 +684,20 @@ func (n *Node) SelfPublicKey() []byte {
 	return n.id.PublicKey()
 }
 
+// HandleIncomingTextForTest is the public wrapper for
+// handleIncomingText. The integration test harness
+// uses it to drive receiver-side message processing
+// without going through the dispatcher (which requires
+// a real channel).
+//
+// Production code should NOT call this directly —
+// the dispatcher in handleInbound invokes
+// handleIncomingText. The "ForTest" suffix is a
+// naming convention to flag test-only entry points.
+func (n *Node) HandleIncomingTextForTest(env protocol.Envelope, fromPeerHex string) error {
+	return n.handleIncomingText(env, fromPeerHex)
+}
+
 // RegisterPeerPublicKeyForTest seeds this Node's
 // channel-state pubkey cache for peerHex, so that
 // lookupPeerPublicKey(peerHex) succeeds without an
@@ -721,6 +735,72 @@ func (n *Node) appendHistory(rec *storage.Record) {
 	n.historyMu.Lock()
 	n.history = append(n.history, rec)
 	n.historyMu.Unlock()
+}
+
+// handleIncomingText is the receiver-side handler for
+// TypeText envelopes, extracted from the dispatcher so
+// the integration test harness can drive it directly
+// (in-process without a real channel). Production
+// callers go through the dispatcher in handleInbound.
+//
+// Splitting this out is necessary because the in-process
+// harness has no real channel, so the dispatcher
+// path (ch.recv → dispatcher) isn't reachable. Tests
+// that need cross-peer message delivery synthesize
+// a TypeText envelope and call HandleIncomingTextForTest
+// directly on the receiver.
+//
+// Returns the rendered GroupID for group messages, or
+// the peer's hex ID for 1:1 messages, so the caller can
+// match it to a conversation.
+func (n *Node) handleIncomingText(env protocol.Envelope, fromPeerHex string) error {
+	now := time.Now().UTC()
+	if env.IsGroup() {
+		// Group text: route to per-group chat.enc,
+		// publish with PeerID = group ID so the GUI
+		// sidebar lands the bubble in the group
+		// conversation, and SenderID = original
+		// sender so the GUI can render "Alice: hi".
+		rendered := group.RenderGroupID(env.GroupID)
+		rec := &storage.Record{
+			Timestamp: now,
+			From:      fromPeerHex,
+			To:        "",
+			Direction: "in",
+			Body:      string(env.Payload),
+			MsgID:     "",
+			GroupID:   rendered,
+		}
+		if err := n.chatStore.AppendGroup(rendered, rec); err != nil {
+			return fmt.Errorf("node: handleIncomingText group append: %w", err)
+		}
+		n.appendHistory(rec)
+		n.publishMessage(Message{
+			PeerID:    rendered,
+			SenderID:  fromPeerHex,
+			Body:      string(env.Payload),
+			Timestamp: rec.Timestamp,
+			Direction: "in",
+		})
+		return nil
+	}
+	rec := &storage.Record{
+		Timestamp: now,
+		From:      fromPeerHex,
+		To:        n.id.PeerIDHex(),
+		Direction: "in",
+		Body:      string(env.Payload),
+		MsgID:     "",
+	}
+	if err := n.chatStore.Append(rec); err != nil {
+		return fmt.Errorf("node: handleIncomingText append: %w", err)
+	}
+	n.appendHistory(rec)
+	n.publishMessage(Message{
+		PeerID: fromPeerHex, Body: string(env.Payload),
+		Timestamp: rec.Timestamp, Direction: "in",
+	})
+	return nil
 }
 
 func (n *Node) publishMessage(msg Message) {
@@ -1022,52 +1102,9 @@ func (n *Node) wrapChannel(conn *transport.Conn, sess *handshake.Session) {
 			case protocol.TypeText:
 				log.Printf("[MSG  ] in  <%s> %s", peerHexStr, string(env.Payload))
 				n.aliasStore.Touch(peerHexStr)
-				now := time.Now().UTC()
-				if env.IsGroup() {
-					// Group text: route to per-group chat.enc,
-					// publish with PeerID = group ID so the GUI
-					// sidebar lands the bubble in the group
-					// conversation, and SenderID = original
-					// sender so the GUI can render "Alice: hi".
-					rendered := group.RenderGroupID(env.GroupID)
-					rec := &storage.Record{
-						Timestamp: now,
-						From:      peerHexStr,
-						To:        "",
-						Direction: "in",
-						Body:      string(env.Payload),
-						MsgID:     "",
-						GroupID:   rendered,
-					}
-					if err := n.chatStore.AppendGroup(rendered, rec); err != nil {
-						log.Printf("[ERROR] chat log group append: %v", err)
-					}
-					n.appendHistory(rec)
-					n.publishMessage(Message{
-						PeerID:    rendered,
-						SenderID:  peerHexStr,
-						Body:      string(env.Payload),
-						Timestamp: rec.Timestamp,
-						Direction: "in",
-					})
-					break
+				if err := n.handleIncomingText(env, peerHexStr); err != nil {
+					log.Printf("[ERROR] handleIncomingText: %v", err)
 				}
-				rec := &storage.Record{
-					Timestamp: now,
-					From:      peerHexStr,
-					To:        n.id.PeerIDHex(),
-					Direction: "in",
-					Body:      string(env.Payload),
-					MsgID:     "",
-				}
-				if err := n.chatStore.Append(rec); err != nil {
-					log.Printf("[ERROR] chat log append: %v", err)
-				}
-				n.appendHistory(rec)
-				n.publishMessage(Message{
-					PeerID: peerHexStr, Body: string(env.Payload),
-					Timestamp: rec.Timestamp, Direction: "in",
-				})
 			case protocol.TypePing:
 				log.Printf("[MSG  ] in  <%s> ping", peerHexStr)
 				n.aliasStore.Touch(peerHexStr)

@@ -19,6 +19,7 @@ import (
 
 	"github.com/weishengsuptp/innerlink/internal/protocol"
 	"github.com/weishengsuptp/innerlink/pkg/group"
+	"github.com/weishengsuptp/innerlink/pkg/node"
 )
 
 // CreateGroupAction creates a group on the given peer and
@@ -379,4 +380,111 @@ func (h *Harness) RestartPeerAction(name string) error {
 // actions.go self-contained.
 func nowMs() int64 {
 	return time.Now().UnixMilli()
+}
+
+// SetGroupNameAction has the given peer call
+// SetGroupName(renderedID, name). Only the creator is
+// allowed to rename; non-creator callers get an error
+// (which the caller is expected to handle / log).
+//
+// Modeled as a normal Node API call; the in-process
+// harness doesn't need a synthesized broadcast envelope
+// because the rename path doesn't depend on the
+// per-channel crypto state.
+func (h *Harness) SetGroupNameAction(peerName, renderedID, name string) (*node.GroupInfo, error) {
+	p := h.Peer(peerName)
+	if p == nil || p.Node == nil {
+		return nil, fmt.Errorf("SetGroupNameAction: peer %q not running", peerName)
+	}
+	return p.Node.SetGroupName(renderedID, name)
+}
+
+// SetGroupRemarkAction has the given peer call
+// SetGroupRemark(renderedID, remark). Creator-only,
+// same shape as SetGroupNameAction.
+func (h *Harness) SetGroupRemarkAction(peerName, renderedID, remark string) (*node.GroupInfo, error) {
+	p := h.Peer(peerName)
+	if p == nil || p.Node == nil {
+		return nil, fmt.Errorf("SetGroupRemarkAction: peer %q not running", peerName)
+	}
+	return p.Node.SetGroupRemark(renderedID, remark)
+}
+
+// DeclineInviteAction has invitee run DeclineGroupInvite
+// against the inviter. Used in scenarios that exercise
+// the decline path (e.g. multi-invitee partial-accept).
+func (h *Harness) DeclineInviteAction(inviteeName string, inv *group.Invite, inviterName, reason string) error {
+	invitee := h.Peer(inviteeName)
+	if invitee == nil || invitee.Node == nil {
+		return fmt.Errorf("DeclineInviteAction: invitee %q not running", inviteeName)
+	}
+	inviter := h.Peer(inviterName)
+	if inviter == nil || inviter.Node == nil {
+		return fmt.Errorf("DeclineInviteAction: inviter %q not running", inviterName)
+	}
+	rawID, _ := group.ParseGroupID(inv.GroupID)
+	payload, _ := json.Marshal(map[string]interface{}{
+		"group_id": inv.GroupID,
+		"reason":   reason,
+	})
+	env := protocol.Envelope{
+		Version: protocol.ProtocolVersion,
+		Type:    protocol.TypeGroupInviteDecline,
+		From:    invitee.PeerIDBytes(),
+		Payload: payload,
+		GroupID: rawID,
+		TS:      nowMs(),
+	}
+	return inviter.Node.DeclineGroupInvite(env, invitee.PeerIDBytes(), reason)
+}
+
+// SendGroupMessageAction has sender call
+// SendGroupMessage(rawID, text). The message is recorded
+// in sender's local chat.enc and broadcast to every
+// member (in-process: dropped for offline members; in
+// production: buffered + retried via dial).
+//
+// Note: this duplicates the existing SendGroupMessageAction
+// declared at the top of this file (returns string, error).
+// Callers can use either; the one above is used by the
+// original fuzz, the one below is the simpler signature.
+// (Both kept because refactoring fuzz call sites is out of
+// scope for this batch of changes.)
+
+// DeliverGroupMessageAction synthesizes a TypeText envelope
+// at senderName (the originator) and dispatches it to
+// recipientName (the receiver) via the public
+// HandleIncomingTextForTest hook. This models "the message
+// was delivered over the channel" in the in-process
+// harness.
+//
+// Used by scenarios that need to verify the receiver's
+// chat.enc / HistoryGroup reflects the sender's send
+// without depending on the cross-channel broadcast loop
+// (which has nil ch in the harness).
+func (h *Harness) DeliverGroupMessageAction(senderName, recipientName, groupID, text string) error {
+	sender := h.Peer(senderName)
+	recipient := h.Peer(recipientName)
+	if sender == nil || sender.Node == nil {
+		return fmt.Errorf("DeliverGroupMessageAction: sender %q not running", senderName)
+	}
+	if recipient == nil || recipient.Node == nil {
+		return fmt.Errorf("DeliverGroupMessageAction: recipient %q not running", recipientName)
+	}
+	if recipient.IsOffline() {
+		return nil // production would buffer
+	}
+	rawID, err := group.ParseGroupID(groupID)
+	if err != nil {
+		return fmt.Errorf("DeliverGroupMessageAction: bad groupID: %w", err)
+	}
+	env := protocol.Envelope{
+		Version: protocol.ProtocolVersion,
+		Type:    protocol.TypeText,
+		From:    sender.PeerIDBytes(),
+		Payload: []byte(text),
+		GroupID: rawID,
+		TS:      nowMs(),
+	}
+	return recipient.Node.HandleIncomingTextForTest(env, sender.PeerID())
 }
