@@ -655,6 +655,37 @@ func SynthesizeRosterEnvelope(p *Peer, groupID string, m *group.Members) protoco
 	}
 }
 
+// SynthesizeRosterEnvelopeWithLastModified — v1.1.6 test
+// helper — builds a roster envelope with an EXPLICIT
+// LastModified (zero means "pretend backlevel sender").
+// Use this when a scenario wants to push an inbound that
+// ApplyRosterUpdate's freshness gate would either accept
+// (LM strictly newer than receiver's local) or refuse
+// (LM zero, or LM strictly older).
+//
+// The Members slice is taken from `m` as-is — typically
+// the scenario either: (1) passes a freshly-built
+// group.Members describing the desired post-state, or
+// (2) passes a snapshot from another peer's
+// LoadMembers(...) directly.
+func SynthesizeRosterEnvelopeWithLastModified(p *Peer, groupID string, m *group.Members, lastModified time.Time) protocol.Envelope {
+	rawID, _ := group.ParseGroupID(groupID)
+	payload, _ := json.Marshal(rosterPayloadJSON{
+		GroupID:      m.GroupID,
+		GroupName:    m.GroupName,
+		Creator:      m.Creator,
+		Members:      m.Members,
+		Remark:       m.Remark,
+		LastModified: lastModified,
+	})
+	return protocol.Envelope{
+		Type:    protocol.TypeGroupRosterUpdate,
+		Payload: payload,
+		GroupID: rawID,
+		From:    p.PeerIDBytes(),
+	}
+}
+
 // PushRosterFromTo fakes the post-add roster push: reads
 // `from`'s on-disk members.json for the group, then
 // invokes ApplyRosterUpdate on every other peer with that
@@ -699,20 +730,42 @@ func (h *Harness) PushRosterFromTo(fromName, groupID string, toNames []string) i
 // the wire shape (it hasn't changed since v1.1 and is the
 // canonical definition in pkg/node/groups.go).
 type rosterPayloadJSON struct {
-	GroupID   string         `json:"group_id"`
-	GroupName string         `json:"group_name"`
-	Creator   string         `json:"creator"`
-	Members   []group.Member `json:"members"`
-	Remark    string         `json:"remark,omitempty"`
+	GroupID      string         `json:"group_id"`
+	GroupName    string         `json:"group_name"`
+	Creator      string         `json:"creator"`
+	Members      []group.Member `json:"members"`
+	Remark       string         `json:"remark,omitempty"`
+	LastModified time.Time      `json:"last_modified,omitempty"`
 }
 
 func rosterPayloadFromMembers(m *group.Members) rosterPayloadJSON {
+	// v1.1.6: ApplyRosterUpdate's freshness gate refuses
+	// inbound with LastModified <= local. Tests synthesize
+	// envelopes directly via the harness, bypassing the
+	// production broadcast pipeline that stamps LM.
+	// Without a default LM stamp here, every harness-pushed
+	// payload would carry rp.LastModified = zero — flagged
+	// as "backlevel sender" and refused by a v1.1.6+
+	// receiver with a post-LM local.
+	//
+	// Default the timestamp to now() so the harness
+	// matches the production wire shape. Tests that
+	// intentionally want a strictly-older or backlevel
+	// payload use SynthesizeRosterEnvelopeWithLastModified
+	// with an explicit mutate callback (see
+	// TestScenario_StaleRosterRefused for the canonical
+	// example).
+	lm := m.LastModified
+	if lm.IsZero() {
+		lm = time.Now().UTC()
+	}
 	return rosterPayloadJSON{
-		GroupID:   m.GroupID,
-		GroupName: m.GroupName,
-		Creator:   m.Creator,
-		Members:   m.Members,
-		Remark:    m.Remark,
+		GroupID:      m.GroupID,
+		GroupName:    m.GroupName,
+		Creator:      m.Creator,
+		Members:      m.Members,
+		Remark:       m.Remark,
+		LastModified: lm,
 	}
 }
 
