@@ -1470,38 +1470,6 @@ func (n *Node) ApplyLeaveNotice(env protocol.Envelope, fromPeerID []byte) error 
 	if err := m.Save(n.dataDir(), rawID); err != nil {
 		return fmt.Errorf("node: ApplyLeaveNotice save: %w", err)
 	}
-	// v1.1.4 hotfix (2026-07-06) — receiver-side leave
-	// forward. Persist this leave to OUR leavelog so that
-	// if WE later handshake with a peer that was offline
-	// during the leave (and thus never received the
-	// leaver's direct envelope), OUR syncLeaveNotices
-	// ToPeer replays it on the next handshake and the
-	// third peer drops the leaver locally.
-	//
-	// Without this, the third peer stays stale until
-	// either the leaver itself handshakes again (which
-	// never happens for a peer that's permanently gone)
-	// or a future CreatorOnAccept / re-broadcast
-	// incidentally overwrites the third peer's local m
-	// with a snapshot that excludes the leaver — the
-	// last resort that did converge in some repro
-	// scenarios but is fragile.
-	//
-	// Dedup is in Save() (groupID-keyed, latest wins) so
-	// even if multiple sources replay the same leave,
-	// the receiver's leavelog stays bounded.
-	if n.leavelog != nil {
-		if err := n.leavelog.Record(leavelog.Entry{
-			GroupID: ln.GroupID,
-			LeftAt:  ln.LeftAt,
-		}); err != nil {
-			log.Printf("[WARN ] ApplyLeaveNotice: leavelog.Record group=%s: %v",
-				ln.GroupID[:8], err)
-		} else if err := n.leavelog.Save(); err != nil {
-			log.Printf("[WARN ] ApplyLeaveNotice: leavelog.Save group=%s: %v",
-				ln.GroupID[:8], err)
-		}
-	}
 	// Broadcast the new roster to remaining members
 	// (best-effort; offline members will catch up on
 	// reconnect via syncRostersToPeer).
