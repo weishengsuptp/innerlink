@@ -420,6 +420,23 @@ func (n *Node) AcceptGroupInvite(env protocol.Envelope, fromPeerID []byte) error
 			log.Printf("[WARN ] leavelog: save on re-accept %s: %v", inv.GroupID, err)
 		}
 	}
+	// v1.2 (2026-07-06): clear the (group, self) entry from
+	// witnesslog on re-accept. ApplyRosterUpdate's witness
+	// check refuses to add a peer we have a witness record
+	// for, so if the peer that just self-destructed (and
+	// triggered our witness entry via ApplyLeaveNotice) is
+	// re-accepted, we MUST clear our witness record or the
+	// next roster push from the creator will be silently
+	// refused at the witness step — the same end-state bug
+	// as the 21:08 leavelog-stuck issue, but for a
+	// different store. Mirrors the leavelog.Remove above.
+	if n.witnesslog != nil {
+		if err := n.witnesslog.Remove(inv.GroupID, selfHex); err != nil {
+			log.Printf("[WARN ] witnesslog: remove (g, self) on re-accept %s: %v", inv.GroupID, err)
+		} else if err := n.witnesslog.Save(); err != nil {
+			log.Printf("[WARN ] witnesslog: save on re-accept %s: %v", inv.GroupID, err)
+		}
+	}
 	log.Printf("[GROUP ] accepted invite to %s (inviter=%s)", inv.GroupID, inviterHex)
 	// v1.1 (2026-06-29) hotfix: seed chat.enc so ListGroups
 	// (which filters by chat.enc existence in storage/group.go)
@@ -1266,6 +1283,18 @@ func peerBytesToHex(b []byte) string {
 	return hex.EncodeToString(b)
 }
 
+// shortHex returns the first 8 chars of a hex peerID for
+// friendly log lines. v1.2 (2026-07-06) added: witness-log
+// rejection logs in ApplyRosterUpdate needed a hex-trim
+// helper that takes a string (peerBytesToHex takes raw
+// bytes; rp.Members[].PeerID is already a hex string).
+func shortHex(s string) string {
+	if len(s) <= 8 {
+		return s
+	}
+	return s[:8]
+}
+
 // rosterPayload is the JSON shape of a TypeGroupRosterUpdate
 // envelope's Payload. We send the entire current Members
 // (group_id, group_name, creator, members) so the receiver
@@ -1291,6 +1320,18 @@ type rosterPayload struct {
 	Creator   string         `json:"creator"`
 	Members   []group.Member `json:"members"`
 	Remark    string         `json:"remark,omitempty"`
+	// Reset is a v1.2 (2026-07-06) admin flag: when true,
+	// the receiver treats the inbound as an authoritative
+	// "wipe + re-add" from the creator and overwrites its
+	// local member list wholesale. The v1.1.4 baseline did
+	// this unconditionally (every inbound was authoritative),
+	// but v1.2 made inbound from non-creator peers advisory
+	// to close the "creator's memory getting overwritten"
+	// bug class. Reset is the explicit escape hatch for
+	// when the creator actually wants to wipe-and-replace.
+	// The harness's TestScenario_RosterReplace scenario
+	// (S11) is the user-facing test of this path.
+	Reset bool `json:"reset,omitempty"`
 }
 
 // metaPayload is the JSON shape of a TypeGroupMetaUpdate
@@ -1609,10 +1650,40 @@ func (n *Node) ApplyRosterUpdate(env protocol.Envelope, fromPeerID []byte) error
 		}
 	}
 
+	// v1.2 (2026-07-06): rewrite the merge strategy.
+	//
+	// v1.1.4 baseline did `Members: rp.Members` — a full
+	// overwrite. That was the v1.1.4 base bug at the root
+	// of every "群主被 inbound 覆盖记忆" regression: any
+	// time a peer pushed a stale-or-stale-by-design roster
+	// update (e.g. carol's best-effort broadcast after her
+	// channel had been offline and she missed a recent
+	// change), the local members.json got clobbered and
+	// members "disappeared" from the group's authoritative
+	// view. The 14:00 g_45cf1e4a (3,2) and 16:30 g_e0fe50
+	// (3,2→2,2) bugs were both this exact path.
+	//
+	// New merge:
+	//   1. Start from local members.json if present
+	//      (preserves everyone the local view already
+	//      knows about — including the creator at index 0
+	//      per v1.1.2 invariant).
+	//   2. Add any peer from inbound that's NOT already
+	//      local. Witness check: refuse to add a peer we
+	//      have a witness record for (we saw them leave;
+	//      adding them back is exactly the "resurrect the
+	//      dead" case the witness log exists to prevent).
+	//   3. Never drop. Inbound < local leaves local
+	//      intact — this is the structural fix for
+	//      "creator's memory getting overwritten".
+	//
+	// First-ever roster (no local state) still uses
+	// inbound as-is — there's nothing to preserve.
+	//
 	// We may not have a local members.json yet if the
 	// roster update arrives before our AcceptGroupInvite
-	// has finished its initial save. That's OK: write
-	// the inbound roster as the canonical local state.
+	// has finished its initial save. That's OK: take the
+	// inbound roster as the canonical local state.
 	m := &group.Members{
 		GroupID:   rp.GroupID,
 		GroupName: rp.GroupName,
@@ -1621,9 +1692,100 @@ func (n *Node) ApplyRosterUpdate(env protocol.Envelope, fromPeerID []byte) error
 		// doesn't echo it). Leave zero — UI doesn't
 		// surface it for non-creator members anyway.
 		CreatedAt: time.Time{},
-		Members:   rp.Members,
 		Remark:    rp.Remark,
+		// Members: constructed below, NOT rp.Members.
 	}
+	existing, existingErr := group.LoadMembers(n.dataDir(), rawID)
+	hasLocal := existingErr == nil && existing != nil && len(existing.Members) > 0
+	if hasLocal {
+		// Step 1: start from local (preserves v1.1.2
+		// creator-first invariant — existing.Members[0]
+		// is the creator).
+		m.Members = make([]group.Member, len(existing.Members))
+		copy(m.Members, existing.Members)
+		if m.GroupName == "" {
+			m.GroupName = existing.GroupName
+		}
+		// Defensive: if local and inbound disagree on
+		// the creator, log it. We keep local (the
+		// creator of record is whichever peer the
+		// local view already locked onto — flipping
+		// it would break the v1.1.2 invariant for
+		// every other peer who synced from us).
+		if existing.Creator != "" && existing.Creator != finalCreator {
+			log.Printf("[WARN ] ApplyRosterUpdate: existing Creator=%s disagrees with inbound=%s; keeping local (creator-authority)",
+				shortHex(existing.Creator), shortHex(finalCreator))
+		}
+	} else {
+		// No local state: take inbound as the seed
+		// (first-time sync, or a peer that just joined
+		// before AcceptGroupInvite's initial save
+		// landed).
+		m.Members = make([]group.Member, len(rp.Members))
+		copy(m.Members, rp.Members)
+	}
+	// Step 2: add NEW inbound peers. We do this in BOTH
+	// branches (has-local and no-local) so that even the
+	// first-time-sync path benefits from witness check
+	// if there happens to be one (defensive — typically
+	// no witness record exists on the very first sync).
+	//
+	// v1.2 (2026-07-06): the witness 拒复活 rule only
+	// applies to inbound from NON-creator senders. A peer
+	// is witness of someone leaving; the CREATOR is the
+	// source of truth for "who is currently in this
+	// group". When the creator re-invites a peer that
+	// we previously witnessed leave, the creator's
+	// "they're back" roster push is an intentional
+	// override — not stale data we should refuse.
+	// Without this carve-out, every other member who
+	// witnessed the leave would silently refuse to
+	// re-accept the returned peer even after the creator
+	// legitimately re-invited them (the 21:08 bug class,
+	// but for the new witness store).
+	//
+	// v1.2 (2026-07-06) also: when the inbound carries
+	// the explicit Reset flag, the creator is signaling
+	// "I am wiping and re-adding; trust me". That is the
+	// admin escape hatch (S11 RosterReplace scenario) and
+	// short-circuits both the local-preserve and the
+	// witness-refuse paths.
+	inboundFromCreator := n.id != nil && rp.Creator != "" && peerBytesToHex(fromPeerID) == rp.Creator
+	if rp.Reset {
+		// Admin wipe-and-replace. Wholly overwrite the
+		// member list with the inbound; preserve the
+		// creator-first invariant by re-anchoring m.Members
+		// from scratch.
+		m.Members = nil
+		for _, p := range rp.Members {
+			if m.Contains(p.PeerID) {
+				continue
+			}
+			m.Members = append(m.Members, p)
+		}
+	} else {
+		for _, p := range rp.Members {
+			if m.Contains(p.PeerID) {
+				continue
+			}
+			// v1.2: witness 拒复活. A peer we saw leave
+			// shouldn't be silently re-added by an inbound
+			// roster push from a non-creator — the next
+			// AcceptLeaveNotice (or the next handshake) will
+			// reconcile. This is the rule that closes the
+			// "B 错把 A 复活" half of the v1.1.4 gossip gap
+			// (the other half is handled by the "never drop"
+			// rule above).
+			if !inboundFromCreator && n.witnesslog != nil && n.witnesslog.Contains(rp.GroupID, p.PeerID) {
+				log.Printf("[GROUP ] roster update from non-creator %s: refuse to re-add %s to %s (witnessed leave)",
+					peerBytesToHex(fromPeerID), shortHex(p.PeerID), shortHex(rp.GroupID))
+				continue
+			}
+			m.Members = append(m.Members, p)
+		}
+	}
+	// Step 3 is implicit: we never drop. local members
+	// that inbound didn't mention stay in m.Members.
 	if err := m.Save(n.dataDir(), rawID); err != nil {
 		return fmt.Errorf("node: ApplyRosterUpdate save: %w", err)
 	}
@@ -1632,7 +1794,7 @@ func (n *Node) ApplyRosterUpdate(env protocol.Envelope, fromPeerID []byte) error
 		creatorShort = creatorShort[:8]
 	}
 	log.Printf("[GROUP ] roster synced from %s: %d members (creator=%s)",
-		peerBytesToHex(fromPeerID), len(rp.Members), creatorShort)
+		peerBytesToHex(fromPeerID), len(m.Members), creatorShort)
 	// v1.1.1 (2026-06-29): tell the local frontend the
 	// roster changed so the sidebar's "<N> 成员" count
 	// and the settings panel's member list refresh
@@ -1683,6 +1845,7 @@ func (n *Node) ApplyRosterUpdate(env protocol.Envelope, fromPeerID []byte) error
 // TypeGroupMetaUpdate. Updates the editable name + remark
 // in our local members.json. v1.1.1 (2026-06-29).
 func (n *Node) ApplyMetaUpdate(env protocol.Envelope, fromPeerID []byte) error {
+
 	var mp metaPayload
 	if err := json.Unmarshal(env.Payload, &mp); err != nil {
 		return fmt.Errorf("node: ApplyMetaUpdate unmarshal: %w", err)

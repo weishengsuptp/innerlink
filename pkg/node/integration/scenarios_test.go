@@ -180,9 +180,18 @@ func TestScenario_AcceptWhileOffline(t *testing.T) {
 	alice.SetOffline(false)
 
 	// Step 6: simulate carol reconnecting to alice by
-	// pushing carol's roster to alice. Production does
-	// this on the inbound "I see you online" handshake;
-	// the harness's PushRosterAction models it.
+	// pushing carol's roster AND carol's witness log
+	// to alice. Production does both on the inbound
+	// "I see you online" handshake (handleInbound calls
+	// syncLeaveNoticesToPeer AND syncRostersToPeer on
+	// every channel open). v1.2 (2026-07-06): the v1.1.4
+	// 19:48 fix used to live in ApplyRosterUpdate's
+	// wholesale-overwrite path. v1.2's witness-log
+	// refactor moved the fix to the leave-notice path —
+	// carol's witness for (g_xxx, bob) replays to alice
+	// and alice's ApplyLeaveNotice drops bob. The roster
+	// push then becomes a no-op reconciliation.
+	h.PushLeaveNoticesAction("carol", gid, []string{"alice"})
 	h.PushRosterAction("carol", gid, []string{"alice"})
 
 	// EXPECTED: alice catches up to {alice, carol}.

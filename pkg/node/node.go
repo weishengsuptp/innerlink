@@ -19,6 +19,7 @@ import (
 	"github.com/weishengsuptp/innerlink/internal/identity"
 	"github.com/weishengsuptp/innerlink/internal/leavelog"
 	"github.com/weishengsuptp/innerlink/internal/logx"
+	"github.com/weishengsuptp/innerlink/internal/witnesslog"
 	"github.com/weishengsuptp/innerlink/internal/paths"
 	"github.com/weishengsuptp/innerlink/internal/protocol"
 	"github.com/weishengsuptp/innerlink/internal/roster"
@@ -51,7 +52,8 @@ type Node struct {
 	aliasStore  *alias.Store
 	rosterStore *roster.Store
 	selfidStore *selfid.Store
-	leavelog    *leavelog.Store // v1.1.4 (2026-07-02): offline-replay log of groups self has left
+	leavelog    *leavelog.Store   // v1.1.4 (2026-07-02): offline-replay log of groups self has left
+	witnesslog  *witnesslog.Store // v1.2 (2026-07-06): relay log of leaves this device has witnessed for OTHER peers
 	selfAlias   *selfAliasStore
 
 	// v1.1.4 (2026-07-02): global data lock. Held by every
@@ -280,6 +282,21 @@ func New(opts Options) (*Node, error) {
 			leavelogStore = &leavelog.Store{}
 		}
 	}
+	// v1.2 (2026-07-06): witnesslog — relay log of leaves
+	// THIS device has witnessed for OTHER peers. Physically
+	// separate from leavelog (which is "groups SELF has
+	// left") because the v1.1.4 hotfix attempt 03b7b68
+	// showed mixing the two collides with ApplyRosterUpdate's
+	// "leavelog.Contains = I already left" guard. See
+	// internal/witnesslog package doc.
+	witnesslogStore, err := witnesslog.Open(filepath.Join(layout.DataDir, "witnessed_leaves.json"))
+	if err != nil {
+		log.Printf("[WARN ] witnesslog: parse failed (%v) — proceeding with empty log (ripple propagation disabled this session)", err)
+		witnesslogStore, _ = witnesslog.Open(filepath.Join(layout.DataDir, "witnessed_leaves.json.tmp")) //nolint:errcheck
+		if witnesslogStore == nil {
+			witnesslogStore = &witnesslog.Store{}
+		}
+	}
 	selfAliasStore, err := loadSelfAlias(filepath.Join(layout.DataDir, "alias.txt"))
 	if err != nil {
 		_ = chatStore.Close()
@@ -297,6 +314,7 @@ func New(opts Options) (*Node, error) {
 		rosterStore: rosterStore,
 		selfidStore: selfidStore,
 		leavelog:    leavelogStore,
+		witnesslog:  witnesslogStore,
 		selfAlias:   selfAliasStore,
 		lockFile:    lockFile,
 		channels:    newChannelRegistry(),
@@ -639,6 +657,11 @@ func (n *Node) Close() error {
 	if n.leavelog != nil {
 		if err := n.leavelog.Save(); err != nil {
 			log.Printf("[WARN ] leavelog: close-time save: %v", err)
+		}
+	}
+	if n.witnesslog != nil {
+		if err := n.witnesslog.Save(); err != nil {
+			log.Printf("[WARN ] witnesslog: close-time save: %v", err)
 		}
 	}
 
@@ -1326,45 +1349,69 @@ func (n *Node) broadcastRosterToAll(exclude []byte) {
 // already processed does no harm and incurs one packet
 // per entry.
 //
-// Skipped when the leavelog is empty (the common case
-// for a peer that has never left a group).
+// Skipped when both logs are empty (the common case for
+// a peer that has never left or witnessed a leave).
+//
+// v1.2 (2026-07-06) split this from a single leavelog
+// loop into two passes that share the same envelope type
+// (TypeGroupLeaveNotice) and the same receiver-side
+// handler (ApplyLeaveNotice, which doesn't care whether
+// LeaverID is self or someone else — it just does
+// RemoveMember). Part 1 carries "I left these groups"
+// (leaver = self). Part 2 carries "I saw these peers
+// leave" (leaver = whoever witnessed). Each entry the
+// receiver applies triggers its own witnesslog.Record
+// in §4.1, which is what makes the ripple propagate:
+// the receiver becomes a relay for the next handshake.
 func (n *Node) syncLeaveNoticesToPeer(peerHex string, ch *protocol.Channel) {
-	if n.leavelog == nil || ch == nil || len(peerHex) == 0 {
+	if ch == nil || len(peerHex) == 0 {
 		return
 	}
-	entries := n.leavelog.List()
-	if len(entries) == 0 {
+	if n.leavelog == nil && n.witnesslog == nil {
 		return
 	}
 	sent := 0
-	for _, e := range entries {
-		// We only send a notice if WE were the leaver
-		// (this is always true — the log is per-device,
-		// not per-group — but the comment is here so a
-		// future "I saw someone else leave" log
-		// structure doesn't surprise readers). The
-		// leaver_id field carries our own peerID; the
-		// receiver uses it to find the row in their
-		// members.json and RemoveMember(leaver_id).
-		notice := protocol.LeaveNotice{
-			GroupID:  e.GroupID,
-			LeaverID: n.id.PeerIDHex(),
-			LeftAt:   e.LeftAt,
-		}
-		payload, err := json.Marshal(notice)
+	// Helper: marshal + send one LeaveNotice. Returns
+	// true on success (caller bumps sent).
+	sendNotice := func(groupID, leaverID string, leftAt time.Time) bool {
+		payload, err := json.Marshal(protocol.LeaveNotice{
+			GroupID:  groupID,
+			LeaverID: leaverID,
+			LeftAt:   leftAt,
+		})
 		if err != nil {
-			log.Printf("[WARN ] syncLeaveNoticesToPeer(%s): marshal %s: %v", peerHex, e.GroupID, err)
-			continue
+			log.Printf("[WARN ] syncLeaveNoticesToPeer(%s): marshal %s/%s: %v", peerHex, groupID[:min(8, len(groupID))], leaverID[:min(8, len(leaverID))], err)
+			return false
 		}
 		env := protocol.Envelope{
 			Type:    protocol.TypeGroupLeaveNotice,
 			Payload: payload,
 		}
 		if err := ch.Send(n.ctx, env); err != nil {
-			log.Printf("[WARN ] syncLeaveNoticesToPeer(%s): send %s: %v", peerHex, e.GroupID, err)
-			continue
+			log.Printf("[WARN ] syncLeaveNoticesToPeer(%s): send %s/%s: %v", peerHex, groupID[:min(8, len(groupID))], leaverID[:min(8, len(leaverID))], err)
+			return false
 		}
-		sent++
+		return true
+	}
+	// Part 1 (v1.1.4): push entries from our own leavelog
+	// — "I left these groups, leaver_id is me".
+	if n.leavelog != nil {
+		for _, e := range n.leavelog.List() {
+			if sendNotice(e.GroupID, n.id.PeerIDHex(), e.LeftAt) {
+				sent++
+			}
+		}
+	}
+	// Part 2 (v1.2): push entries from our witnesslog —
+	// "I saw these peers leave, leaver_id is whoever I
+	// witnessed". Reuses the same envelope + same
+	// receiver-side handler.
+	if n.witnesslog != nil {
+		for _, e := range n.witnesslog.List() {
+			if sendNotice(e.GroupID, e.LeaverID, e.WitnessedAt) {
+				sent++
+			}
+		}
 	}
 	if sent > 0 {
 		log.Printf("[GROUP ] leave pre-sync to %s: %d notice(s)", peerHex, sent)
@@ -1449,6 +1496,28 @@ func (n *Node) ApplyLeaveNotice(env protocol.Envelope, fromPeerID []byte) error 
 	}
 	log.Printf("[GROUP ] leave notice applied: dropping %s from group=%s (now %d members)",
 		ln.LeaverID[:8], ln.GroupID[:8], len(m.Members))
+	// v1.2 (2026-07-06): record the witnessed leave to
+	// our witnesslog so future handshakes relay it to
+	// other peers we connect to. This is what closes the
+	// v1.1.4 gossip gap: the leaver doesn't have to be
+	// online themselves for the rest of the group to
+	// learn about their leave — any online witness
+	// becomes a relay. The record happens BEFORE both the
+	// empty-roster dissolve branch and the non-empty
+	// Save branch so it covers both cases (a witness of
+	// a "last member out" notice is still useful for
+	// relaying to peers we connect to later, even though
+	// we no longer have the group locally).
+	if n.witnesslog != nil {
+		if err := n.witnesslog.Record(witnesslog.Entry{
+			GroupID:     m.GroupID,
+			LeaverID:    ln.LeaverID,
+			WitnessedAt: time.Now().UTC(),
+		}); err != nil {
+			log.Printf("[WARN ] ApplyLeaveNotice: witnesslog.Record(%s, %s): %v",
+				m.GroupID[:8], ln.LeaverID[:8], err)
+		}
+	}
 	// If we just emptied the roster, dissolve the group
 	// (mirrors LeaveGroup's own empty-members branch in
 	// pkg/node/groups.go).
@@ -1610,3 +1679,27 @@ const shutdownDelay = 200 * time.Millisecond
 
 // keep os import referenced.
 var _ = os.Stderr
+
+// WitnessEntriesFor returns a copy of the witnesslog
+// entries for the given raw groupID. Test-only export —
+// the integration harness uses this to drive its
+// PushLeaveNoticesAction helper (which models the
+// production handleInbound path's syncLeaveNoticesToPeer
+// call). Not used in production code paths; if a
+// non-test caller needs the same data, the right shape
+// is probably a "sync witness to peer" envelope handler,
+// not direct log access. v1.2 (2026-07-06).
+func (n *Node) WitnessEntriesFor(rawGroupID []byte) []witnesslog.Entry {
+	if n.witnesslog == nil {
+		return nil
+	}
+	rendered := group.RenderGroupID(rawGroupID)
+	all := n.witnesslog.List()
+	out := make([]witnesslog.Entry, 0, len(all))
+	for _, e := range all {
+		if e.GroupID == rendered {
+			out = append(out, e)
+		}
+	}
+	return out
+}

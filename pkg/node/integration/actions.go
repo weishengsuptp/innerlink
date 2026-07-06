@@ -335,6 +335,115 @@ func (h *Harness) PushRosterAction(fromName, groupID string, toNames []string) i
 	return h.PushRosterFromTo(fromName, groupID, toNames)
 }
 
+// PushLeaveNoticesAction synthesizes a "I saw these leaves"
+// fan-out from `fromName` to each peer in `toNames`. v1.2
+// (2026-07-06) added this helper: production's
+// handleInbound path calls syncLeaveNoticesToPeer on
+// every handshake, which pushes BOTH the sender's
+// leavelog AND the sender's witnesslog to the new peer.
+// The harness's PushRosterAction only models the roster
+// half. Scenarios that need to model the full "I just
+// came back online and my friend is filling me in"
+// handshake now have to drive the leave-notice half
+// themselves — that's this helper.
+//
+// Why this matters for v1.2: the 19:48 user-reported
+// bug (creator alice goes offline, member bob leaves,
+// alice reconnects) used to be fixed by ApplyRosterUpdate
+// blindly overwriting alice's stale 3-member local with
+// carol's 2-member push. v1.2 changes that — we no longer
+// let inbound from non-creator peers shrink our local
+// view. Instead, the fix moves to the leave-notice path:
+// when carol and alice reconnect, carol's witness for
+// (g, bob) replays to alice via syncLeaveNoticesToPeer,
+// alice's ApplyLeaveNotice drops bob, and the roster
+// reconciliation is a no-op. To exercise this in a
+// harness, scenarios call this helper BEFORE the
+// PushRosterAction.
+func (h *Harness) PushLeaveNoticesAction(fromName, groupID string, toNames []string) int {
+	from := h.Peer(fromName)
+	pushed := 0
+	for _, toName := range toNames {
+		to := h.Peer(toName)
+		if from == nil || to == nil || from.Node == nil || to.Node == nil || fromName == toName {
+			continue
+		}
+		if to.IsOffline() {
+			continue
+		}
+		// Walk from's witnesslog for the group; replay
+		// each entry as a LeaveNotice to `to`.
+		rawID, err := group.ParseGroupID(groupID)
+		if err != nil {
+			continue
+		}
+		// from.witnesslog is unexported in production —
+		// the harness reaches it through the public
+		// snapshot API instead.
+		entries := h.witnessEntriesFor(fromName, rawID[:])
+		for _, ln := range entries {
+			payload, err := json.Marshal(protocol.LeaveNotice{
+				GroupID:  ln.groupID,
+				LeaverID: ln.leaverID,
+				LeftAt:   ln.leftAt,
+			})
+			if err != nil {
+				continue
+			}
+			env := protocol.Envelope{
+				Version: protocol.ProtocolVersion,
+				Type:    protocol.TypeGroupLeaveNotice,
+				From:    from.PeerIDBytes(),
+				Payload: payload,
+				TS:      nowMs(),
+			}
+			if err := to.Node.ApplyLeaveNotice(env, from.PeerIDBytes()); err != nil {
+				h.t.Errorf("PushLeaveNoticesAction: %s.ApplyLeaveNotice from %s: %v",
+					toName, fromName, err)
+				continue
+			}
+			pushed++
+		}
+	}
+	return pushed
+}
+
+// witnessLogEntry is the minimal projection of an
+// internal/witnesslog.Entry the harness needs to replay
+// a LeaveNotice. We don't expose witnesslog directly
+// (it's unexported in pkg/node), so the harness uses
+// its own shape and `witnessEntriesFor` fills it in.
+type witnessLogEntry struct {
+	groupID  string
+	leaverID string
+	leftAt   time.Time
+}
+
+// witnessEntriesFor reads `fromName`'s witness log and
+// returns entries for the given raw groupID. We reach
+// into pkg/node via the test-only Node.WitnessEntriesFor
+// helper added in v1.2 (2026-07-06). The alternative was
+// reading <DataDir>/witnessed_leaves.json directly and
+// re-decoding the on-disk schema, but the Node method
+// already does that and keeps the harness insulated from
+// future schema changes.
+func (h *Harness) witnessEntriesFor(fromName string, rawGroupID []byte) []witnessLogEntry {
+	from := h.Peer(fromName)
+	if from == nil || from.Node == nil {
+		return nil
+	}
+	src := from.Node.WitnessEntriesFor(rawGroupID)
+	out := make([]witnessLogEntry, 0, len(src))
+	for _, e := range src {
+		out = append(out, witnessLogEntry{
+			groupID:  e.GroupID,
+			leaverID: e.LeaverID,
+			leftAt:   e.WitnessedAt,
+		})
+	}
+	return out
+}
+
 // SendGroupMessageAction has a peer send a group message.
 // In-process, this only updates the sender's local chat
 // log. The harness's drainer goroutines pick up the

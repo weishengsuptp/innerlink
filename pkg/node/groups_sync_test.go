@@ -287,7 +287,17 @@ func TestGroupSync_ApplyRosterUpdate_ReplacesMembers(t *testing.T) {
 	}
 
 	// Now invoke ApplyRosterUpdate on C with the
-	// creator's 3-member roster.
+	// creator's 3-member roster. v1.2 (2026-07-06) added
+	// the Reset flag — when set, the receiver treats the
+	// inbound as an authoritative "wipe + re-add" from
+	// the creator and overwrites its local member list.
+	// This test's "ReplacesMembers" semantics (C ends up
+	// with the inbound 3-member set exactly) is preserved
+	// by setting Reset=true; without it, v1.2's "never
+	// drop" rule would keep C's prior 2-member local and
+	// add the inbound delta, ending at 4. See S11 in
+	// scenarios_more_test.go for the harness-level
+	// RosterReplace scenario.
 	env := protocol.Envelope{
 		Type: protocol.TypeGroupRosterUpdate,
 		Payload: mustJSON(t, rosterPayload{
@@ -295,6 +305,7 @@ func TestGroupSync_ApplyRosterUpdate_ReplacesMembers(t *testing.T) {
 			GroupName: creatorMembers.GroupName,
 			Members:   creatorMembers.Members,
 			Remark:    creatorMembers.Remark,
+			Reset:     true,
 		}),
 	}
 	cFakeFromPeerID := make([]byte, 16)
