@@ -1310,19 +1310,6 @@ type rosterPayload struct {
 	Creator   string         `json:"creator"`
 	Members   []group.Member `json:"members"`
 	Remark    string         `json:"remark,omitempty"`
-	// LastModified — v1.1.6 (2026-07-05) — the local
-	// m.LastModified at the time the sender marshalled
-	// this payload. Receivers use it as a freshness
-	// signal: an inbound roster update with LastModified
-	// strictly older than the local m.LastModified is
-	// treated as a stale snapshot and refused (so a peer
-	// that was offline during a leave / leave-broadcast
-	// cannot drag the local view back to its pre-leave
-	// state on re-handshake). Zero (the v1.1.5 and
-	// earlier wire shape) is treated as "unknown" —
-	// see ApplyRosterUpdate's accept/refuse rule for the
-	// full matrix.
-	LastModified time.Time `json:"last_modified,omitempty"`
 }
 
 // metaPayload is the JSON shape of a TypeGroupMetaUpdate
@@ -1362,12 +1349,11 @@ func (n *Node) broadcastRosterUpdate(m *group.Members) {
 		return
 	}
 	payload, err := json.Marshal(rosterPayload{
-		GroupID:      m.GroupID,
-		GroupName:    m.GroupName,
-		Creator:      m.Creator,
-		Members:      m.Members,
-		Remark:       m.Remark,
-		LastModified: m.LastModified,
+		GroupID:   m.GroupID,
+		GroupName: m.GroupName,
+		Creator:   m.Creator,
+		Members:   m.Members,
+		Remark:    m.Remark,
 	})
 	if err != nil {
 		log.Printf("[WARN  ] broadcastRosterUpdate: marshal: %v", err)
@@ -1543,12 +1529,11 @@ func (n *Node) syncRostersToPeer(peerHex string, ch *protocol.Channel) {
 			continue
 		}
 		payload, err := json.Marshal(rosterPayload{
-			GroupID:      m.GroupID,
-			GroupName:    m.GroupName,
-			Creator:      m.Creator,
-			Members:      m.Members,
-			Remark:       m.Remark,
-			LastModified: m.LastModified,
+			GroupID:   m.GroupID,
+			GroupName: m.GroupName,
+			Creator:   m.Creator,
+			Members:   m.Members,
+			Remark:    m.Remark,
 		})
 		if err != nil {
 			log.Printf("[WARN ] syncRostersToPeer(%s): marshal %s: %v", peerHex, rendered, err)
@@ -1712,101 +1697,63 @@ func (n *Node) ApplyRosterUpdate(env protocol.Envelope, fromPeerID []byte) error
 		}
 	}
 
-	// v1.1.6 — LastModified freshness gate.
+	// v1.1.5 — design notes (the creator-authority rule
+	// below was considered and rejected for this hotfix; see
+	// commit message for the trade-off discussion):
 	//
-	// Bug context: peer X (offline during Y's leave) holds a
-	// stale m.Members view. When X reconnects, X's
-	// syncRostersToPeer pushes that stale view to peers who
-	// already converged. Pre-v1.1.6 ApplyRosterUpdate
-	// blindly overwrites local m with the inbound — which
-	// reverses a recently-applied leave on the receiver
-	// side. The user-visible symptom: creator view = 3
-	// (correct), rejoiner view = 2 (stale), even though
-	// only 2 of the original 3 members remain.
+	// Bug context (real reproduction, 2026-07-05 16:11-16:12):
+	//   alice is the creator of g_e6ab2bdd with 3 members
+	//   [alice, 大刀, 老邓]. 大刀's binary (built 2026-07-02,
+	//   pre-v1.1.4) holds a stale 2-member copy in its local
+	//   members.json. At 16:11:55 大刀 pushes a RosterUpdate
+	//   envelope with 2 members, which ApplyRosterUpdate
+	//   blindly overwrites alice's local m with. 老邓's
+	//   reconnect 9 seconds later picks up alice's now-2
+	//   view via syncRostersToPeer, and 老邓 ends up with
+	//   2 members. Result: creator view = 3 (correct),
+	//   rejoiner view = 2 (stale).
 	//
-	// Fix: carry m.LastModified in the rosterPayload so the
-	// receiver can ask "did this remote view post-date my
-	// local view?". Strict-older inbound (rp.LastModified
-	// <= local.LastModified, with local > zero) is refused.
+	// Considered fix (rejected here, see below): refuse to
+	// shrink creator's local m when inbound has fewer
+	// members. The rule would have been:
+	//   if WE are the creator AND len(local.Members) > len(rp.Members):
+	//     ignore inbound
+	// That fix would heal the 2026-07-05 reproduction but
+	// ALSO break TestScenario_AcceptWhileOffline, where the
+	// canonical propagation path is "carol pushes her
+	// 2-member roster to alice on handshake" — alice
+	// under-fix mode refuses the inbound and stays at 3
+	// forever. Production has the same problem: when the
+	// creator goes offline during a leave, the rejoining
+	// peer's RosterUpdate carries the post-leave state and
+	// the creator needs to absorb it to converge. The
+	// creator-as-authority rule blocks exactly that
+	// legit signal.
 	//
-	// Backward-compat rules (zero = pre-LM era):
-	//   local.LM > 0 AND rp.LM > 0: compare strict — refuse
-	//                              if rp.LM <= local.LM.
-	//   local.LM = 0: my file was never touched by a
-	//                 v1.1.6+ binary. Inbound takes the
-	//                 floor: trust (legacy behavior).
-	//   rp.LM = 0:    sender is back-level or pre-LM-era.
-	//                 Their snapshot has no freshness info;
-	//                 we cannot prove it's stale, only that
-	//                 we can't trust it relative to our
-	//                 post-LM local. Refuse and rely on
-	//                 next-handshake (which by then has
-	//                 both sides upgraded) to converge.
-	//
-	// This ungates the leave path: ApplyLeaveNotice is the
-	// authoritative leave trigger (it removes a specific
-	// LeaverID by name, then broadcasts the canonical
-	// post-removal roster with the post-LeaveGroup LM
-	// stamp). RosterUpdate is now strictly a freshness-
-	// gated state-snapshot.
-	if existing, lerr := group.LoadMembers(n.dataDir(), rawID); lerr == nil {
-		if !existing.LastModified.IsZero() && !rp.LastModified.After(existing.LastModified) {
-			// Refuse if local has a v1.1.6+ stamp AND:
-			//   a) inbound LastModified is strictly older
-			//      (stale snapshot, e.g. an offline peer
-			//      pushing its pre-leave state on
-			//      reconnect)
-			//   b) inbound LastModified is exactly equal
-			//      (idempotent re-push, nothing new to
-			//      learn — refuse to avoid double-saving)
-			//   c) inbound LastModified is zero (sender is
-			//      pre-v1.1.6 / backlevel binary carrying
-			//      no freshness info — strict refusal
-			//      because we can't order their snapshot
-			//      against ours, and a stale re-push would
-			//      drag us back to pre-LM era).
-			//
-			// If local.LastModified is zero (this group
-			// has never been touched by a v1.1.6+ binary
-			// since the upgrade landed — e.g. an old
-			// members.json from pre-v1.1.6), we fall
-			// through to the legacy "trust the inbound,
-			// overwrite local" path: that path now stamps
-			// the freshly-saved m.LastModified (via
-			// group.Members.saveLocked), so the next
-			// inbound gets the v1.1.6+ gate applied.
-			log.Printf("[GROUP ] roster update from %s for %s ignored: inbound LastModified %v not strictly newer than local %v (stale / backlevel / idempotent)",
-				peerBytesToHex(fromPeerID), rp.GroupID[:8],
-				rp.LastModified.Format("15:04:05.000"), existing.LastModified.Format("15:04:05.000"))
-			// Still tell the GUI the group was "touched"
-			// (alias refresh, or simply keep its current
-			// view). Real healing path: the next peer
-			// that's still post-leave-replay (e.g. carol
-			// after bob's LeaveNotice reaches her) will
-			// push a fresh LM > local.LM from their
-			// post-removal local, which ApplyRosterUpdate
-			// will accept.
-			n.publishGroupEvent(GroupEvent{
-				Type:      GroupUpdated,
-				GroupID:   rp.GroupID,
-				GroupName: rp.GroupName,
-			})
-			return nil
-		}
-	}
+	// Decision: the real fix is a deeper redesign of the
+	// roster gossip layer (creator-side ownership +
+	// leavenotice-carrying syncRostersToPeer). That is
+	// v1.1.6 / v1.2 scope. This hotfix (v1.1.5) lands the
+	// high-value narrow fix (LeaveGroup emits explicit
+	// TypeGroupLeaveNotice, ApplyLeaveNotice broadcasts the
+	// post-removal roster — so live leaves always
+	// converge), and leaves the 2026-07-05 cross-version
+	// stale-replication as a separate tracked issue.
 
 	// We may not have a local members.json yet if the
 	// roster update arrives before our AcceptGroupInvite
 	// has finished its initial save. That's OK: write
 	// the inbound roster as the canonical local state.
 	m := &group.Members{
-		GroupID:      rp.GroupID,
-		GroupName:    rp.GroupName,
-		Creator:      finalCreator,
-		CreatedAt:    time.Time{},
-		Members:      rp.Members,
-		Remark:       rp.Remark,
-		LastModified: rp.LastModified, // pre-populate; saveLocked overwrites with now-stamp anyway
+		GroupID:   rp.GroupID,
+		GroupName: rp.GroupName,
+		Creator:   finalCreator,
+		// CreatedAt unknown on the receiver (sender
+		// doesn't echo it). Leave zero — UI doesn't
+		// surface it for non-creator members anyway.
+		CreatedAt: time.Time{},
+		Members:   rp.Members,
+		Remark:    rp.Remark,
 	}
 	if err := m.Save(n.dataDir(), rawID); err != nil {
 		return fmt.Errorf("node: ApplyRosterUpdate save: %w", err)

@@ -43,28 +43,11 @@ type Members struct {
 	// (WeChat-style "群公告"-ish). Optional; "" means unset.
 	// v1.1.1 (2026-06-29). Mirrored across all members via
 	// TypeGroupMetaUpdate; receivers update their local
-	// members.json so the sidebar + settings panel show
-	// the same value across peers. Old files without this field
+	// members.json so the sidebar + settings panel show the
+	// same value across peers. Old files without this field
 	// unmarshal to "" (json default).
 	Remark   string   `json:"remark,omitempty"`
 	Members  []Member `json:"members"`
-	// LastModified — v1.1.6 (2026-07-05) — touch timestamp
-	// of this local m.Members. Updated on every saveLocked.
-	// Carried in rosterPayload so receivers can decide
-	// "did this remote view post-date my local view?" and
-	// refuse to overwrite a fresher local with a stale
-	// inbound.
-	//
-	// Zero value: this file has never been touched by a
-	// v1.1.6+ binary (created pre-LM and never re-saved
-	// since, or saved by a backlevel binary). The
-	// ApplyRosterUpdate accept/refuse rule treats zero
-	// specially:
-	//   local.LastModified > 0 AND inbound.LastModified <= local:
-	//     refuse (inbound is stale relative to my local).
-	//   otherwise: accept (covers pre-LM era, fresh info,
-	//     and inbound-only-from-fresher-binary paths).
-	LastModified time.Time `json:"last_modified,omitempty"`
 }
 
 // membersFileName is exported as a constant so tests and storage
@@ -173,12 +156,6 @@ func UpdateMembers(dataDir string, rawGroupID []byte, fn func(*Members) error) (
 // acquires the lock itself for callers that don't already
 // hold it; this version is for the locked code path.
 func (m *Members) saveLocked(dataDir string, rawGroupID []byte) error {
-	// v1.1.6 — stamp every save with the local wall-clock
-	// time so receivers can refuse strictly-older inbound
-	// roster views. We update LastModified BEFORE marshalling
-	// so the value lands in this exact file write, even on
-	// racing writers (each acquires the per-group saveLock).
-	m.LastModified = time.Now().UTC()
 	dir := groupDir(dataDir, rawGroupID)
 	if err := os.MkdirAll(dir, 0o700); err != nil {
 		return fmt.Errorf("group: mkdir %s: %w", dir, err)
@@ -239,10 +216,6 @@ func (m *Members) Save(dataDir string, rawGroupID []byte) error {
 	mu.Lock()
 	defer mu.Unlock()
 
-	// v1.1.6 — stamp save timestamp before marshal so this
-	// exact write carries LastModified; receivers can then
-	// order inbound roster views by freshness.
-	m.LastModified = time.Now().UTC()
 	dir := groupDir(dataDir, rawGroupID)
 	if err := os.MkdirAll(dir, 0o700); err != nil {
 		return fmt.Errorf("group: mkdir %s: %w", dir, err)

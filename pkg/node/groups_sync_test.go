@@ -236,11 +236,6 @@ func TestGroupSync_ApplyRosterUpdate_ReplacesMembers(t *testing.T) {
 	}); err != nil {
 		t.Fatal(err)
 	}
-	// v1.1.6 — AddMember doesn't persist; bump
-	// creatorMembers.LastModified so the freshness gate
-	// (applied in ApplyRosterUpdate on the receiver
-	// side) accepts the synthesized payload below.
-	creatorMembers.LastModified = time.Now().UTC().Add(2 * time.Second)
 
 	// Now simulate the receiver-side dispatcher calling
 	// ApplyRosterUpdate on a fresh Node C with the
@@ -292,19 +287,14 @@ func TestGroupSync_ApplyRosterUpdate_ReplacesMembers(t *testing.T) {
 	}
 
 	// Now invoke ApplyRosterUpdate on C with the
-	// creator's 3-member roster. v1.1.6 — the payload
-	// must carry LastModified so ApplyRosterUpdate's
-	// freshness gate can order this against C's local.
-	// Without it, the gate refuses as if from a
-	// backlevel sender.
+	// creator's 3-member roster.
 	env := protocol.Envelope{
 		Type: protocol.TypeGroupRosterUpdate,
 		Payload: mustJSON(t, rosterPayload{
-			GroupID:      creatorMembers.GroupID,
-			GroupName:    creatorMembers.GroupName,
-			Members:      creatorMembers.Members,
-			Remark:       creatorMembers.Remark,
-			LastModified: creatorMembers.LastModified,
+			GroupID:   creatorMembers.GroupID,
+			GroupName: creatorMembers.GroupName,
+			Members:   creatorMembers.Members,
+			Remark:    creatorMembers.Remark,
 		}),
 	}
 	cFakeFromPeerID := make([]byte, 16)
@@ -384,19 +374,14 @@ func TestGroupSync_ApplyRosterUpdate_PreservesCreator(t *testing.T) {
 
 		// Stub a 2-member roster with a non-self creator
 		// so we can assert inbound-Creator overrides local.
-		// v1.1.6 — payload carries LastModified so
-		// ApplyRosterUpdate's freshness gate accepts it
-		// (otherwise the gate refuses zero-LM inbound as
-		// backlevel).
 		inbound := rosterPayload{
-			GroupID:      rendered,
-			GroupName:    "测试群",
-			Creator:      "deadbeefdeadbeef00000000000000aa",
-			Members:      []group.Member{
+			GroupID:   rendered,
+			GroupName: "测试群",
+			Creator:   "deadbeefdeadbeef00000000000000aa",
+			Members: []group.Member{
 				{PeerID: creatorHex, JoinedAt: time.Now().UTC(), IsCreator: true},
 				{PeerID: "b000000000000000000000000000bb01", JoinedAt: time.Now().UTC()},
 			},
-			LastModified: time.Now().UTC(),
 		}
 		env := protocol.Envelope{
 			Type: protocol.TypeGroupRosterUpdate,

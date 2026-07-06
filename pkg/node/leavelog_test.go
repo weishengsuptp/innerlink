@@ -122,11 +122,6 @@ func TestLeaveNotice_ReAcceptClearsLeavelog(t *testing.T) {
 	if err := cm.Save(creator.dataDir(), rawID); err != nil {
 		t.Fatal(err)
 	}
-	// v1.1.6 — re-load so the in-memory cm reflects the
-	// Save-stamped LastModified (the freshness gate on
-	// the receiver side reads cm.LastModified from the
-	// payload below).
-	cm, _ = group.LoadMembers(creator.dataDir(), rawID)
 	// Mirror the 2-member roster onto the invitee
 	// (AcceptGroupInvite would normally do this in
 	// production; we shortcut here to focus on the
@@ -208,33 +203,14 @@ func TestLeaveNotice_ReAcceptClearsLeavelog(t *testing.T) {
 		t.Fatal(err)
 	}
 	// Now push the creator's 2-member roster.
-	// v1.1.6 — payload carries LastModified so the
-	// freshness gate accepts; without it the gate
-	// refuses zero-LM inbound as if from a backlevel
-	// sender (which would resurrect Assert 3's
-	// "ApplyRosterUpdate was skipped" failure).
-	//
-	// cm.LastModified reflects when AddMember+iHex
-	// was saved — that's earlier than im2.Save above,
-	// so the strict-newer gate would refuse if we
-	// passed cm.LastModified verbatim. Bump to a
-	// strictly-future timestamp to mirror the
-	// production ordering (creator broadcasts AFTER
-	// invitee's local save). The "freshness" semantic
-	// is what we're testing — and the in-memory cm is
-	// the source of truth for the inbound payload in
-	// this synthesis — so we set the timestamp right
-	// before the payload marshal.
-	cm.LastModified = time.Now().UTC().Add(2 * time.Second)
 	env := protocol.Envelope{
 		Type: protocol.TypeGroupRosterUpdate,
 		Payload: mustJSON(t, rosterPayload{
-			GroupID:      cm.GroupID,
-			GroupName:    cm.GroupName,
-			Creator:      cm.Creator,
-			Members:      cm.Members,
-			Remark:       cm.Remark,
-			LastModified: cm.LastModified,
+			GroupID:   cm.GroupID,
+			GroupName: cm.GroupName,
+			Creator:   cm.Creator,
+			Members:   cm.Members,
+			Remark:    cm.Remark,
 		}),
 	}
 	fromPeerID := make([]byte, 16)

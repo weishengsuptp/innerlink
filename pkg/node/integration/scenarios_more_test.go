@@ -496,17 +496,12 @@ func TestScenario_RosterReplace(t *testing.T) {
 			{PeerID: carolID}, // bob removed, only carol + alice
 		},
 	}
-	// v1.1.6 — payload must carry LastModified or
-	// ApplyRosterUpdate's freshness gate refuses the
-	// wipe+re-add as if from a backlevel sender. Set
-	// it to a fresh timestamp so the gate accepts.
 	resetPayload, _ := json.Marshal(map[string]interface{}{
-		"group_id":      gid,
-		"group_name":    "g1",
-		"creator":       alice.PeerID(),
-		"members":       resetMembers.Members,
-		"reset":         true, // signals the wipe+re-add
-		"last_modified": time.Now().UTC().Format(time.RFC3339Nano),
+		"group_id":   gid,
+		"group_name": "g1",
+		"creator":    alice.PeerID(),
+		"members":    resetMembers.Members,
+		"reset":      true, // signals the wipe+re-add
 	})
 	resetEnv := protocol.Envelope{
 		Version: protocol.ProtocolVersion,
