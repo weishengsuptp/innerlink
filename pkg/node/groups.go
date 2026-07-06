@@ -897,35 +897,6 @@ func (n *Node) LeaveGroup(renderedID string) error {
 	// and best-effort drops offline peers (same semantics as
 	// the accept path — see agent memory entry on roster
 	// write-broadcast exclusions).
-	// v1.1.5 (2026-07-05) — ORDER MATTERS here. The leaver
-	// ships TWO envelopes to its live channels: first a
-	// TypeGroupLeaveNotice (an EXPLICIT signal carrying the
-	// leaver's own LeaverID), then a TypeGroupRosterUpdate
-	// (a snapshot of the post-leave m.Members). The LeaveNotice
-	// must arrive at the receiver BEFORE the RosterUpdate so
-	// that the receiver's ApplyLeaveNotice can run first,
-	// drop the leaver, save + broadcast the authoritative
-	// new roster to the remaining members. If the order
-	// were reversed (R first, L second), the receiver's
-	// ApplyRosterUpdate would overwrite its local m with
-	// the inbound snapshot and the subsequent LeaveNotice
-	// would hit the idempotent "leaver not in roster"
-	// no-op branch — meaning no re-broadcast, and the
-	// remaining peers (peers the leaver had no live
-	// channel with) wouldn't learn about the leave.
-	//
-	// Why we still send both: some peers (especially the
-	// creator in a 3+ peer group) might be offline at the
-	// moment of leave; they receive the LeaveNotice via
-	// the leavelog.Saved() persistence +
-	// syncLeaveNoticesToPeer handshake replay path (see
-	// pkg/node/node.go). The RosterUpdate envelope keeps
-	// the snapshot semantics for any peer that joined
-	// after the fact and is still bootstrapping.
-	n.broadcastLeaveNotice(leavelog.Entry{
-		GroupID: renderedID,
-		LeftAt:  time.Now().UTC(),
-	})
 	n.broadcastRosterUpdate(m)
 	// v1.1.4 (2026-07-02): persist the leave to the
 	// device-level leavelog so we can replay a
@@ -943,6 +914,16 @@ func (n *Node) LeaveGroup(renderedID string) error {
 		}); err != nil {
 			log.Printf("[WARN ] leavelog: record %s: %v", renderedID, err)
 		} else if err := n.leavelog.Save(); err != nil {
+			// Log but don't fail the LeaveGroup — the
+			// broadcast already did its best, and a
+			// missing leavelog entry just means a future
+			// restart won't replay (we'll catch the
+			// creator up via the next in-person
+			// conversation or via the user's manual
+			// fix). Better to leave the group cleanly
+			// than to surface an error to the GUI
+			// after the user has already seen the
+			// toast.
 			log.Printf("[WARN ] leavelog: save %s: %v", renderedID, err)
 		}
 	}
@@ -1402,75 +1383,6 @@ func (n *Node) broadcastRosterUpdate(m *group.Members) {
 		delivered, len(m.Members)-1)
 }
 
-// broadcastLeaveNotice sends a TypeGroupLeaveNotice
-// envelope to every currently-online channel whose peer
-// is still a member of the group (i.e. peers in the
-// post-leave roster). Best-effort: channels-not-up peers
-// will catch up via syncLeaveNoticesToPeer on the next
-// handshake (leavelog.Saved() below guarantees this).
-//
-// v1.1.5 (2026-07-05) — see pkg/node/groups.go LeaveGroup
-// for the design rationale: RosterUpdate is a snapshot of
-// current state, but membership changes (the "bob left"
-// signal) flow through LeaveNotice so the receiver runs
-// ApplyLeaveNotice (idempotent, with re-broadcast on
-// success). Without this dual path, a peer's local roster
-// could silently stay stale if the inbound RosterUpdate
-// snapshot was lost or shrunken by a stale-data race.
-//
-// `entry.GroupID` should be the renderedID; `entry.LeftAt`
-// is the time the leaver pressed LeaveGroup. LeaverID is
-// our own peerID hex (we ARE the leaver).
-func (n *Node) broadcastLeaveNotice(entry leavelog.Entry) {
-	if n.channels == nil || n.id == nil {
-		return
-	}
-	rendered := entry.GroupID
-	rawID, err := group.ParseGroupID(rendered)
-	if err != nil {
-		log.Printf("[WARN  ] broadcastLeaveNotice: bad group_id %q: %v", rendered, err)
-		return
-	}
-	selfHex := n.id.PeerIDHex()
-	payload, err := json.Marshal(protocol.LeaveNotice{
-		GroupID:  rendered,
-		LeaverID: selfHex,
-		LeftAt:   entry.LeftAt,
-	})
-	if err != nil {
-		log.Printf("[WARN  ] broadcastLeaveNotice: marshal: %v", err)
-		return
-	}
-	delivered := 0
-	// Iterate LIVE channels; offline peers pick the notice up
-	// via syncLeaveNoticesToPeer on handshake. This avoids
-	// wasteful dial-and-fire here — the leaver is also
-	// leaving, we can't rely on them being online long.
-	for _, st := range n.channels.snapshot() {
-		if st == nil || st.ch == nil || len(st.peerID) == 0 {
-			continue
-		}
-		stHex := peerHex(st.peerID)
-		// Skip self (would be a loop) — defensive, leaver
-		// can't be in its own channels map.
-		if stHex == selfHex {
-			continue
-		}
-		env := protocol.Envelope{
-			Type:    protocol.TypeGroupLeaveNotice,
-			Payload: payload,
-			GroupID: rawID,
-		}
-		if err := st.ch.Send(n.ctx, env); err != nil {
-			log.Printf("[WARN  ] broadcastLeaveNotice to %s: %v", stHex[:8], err)
-			continue
-		}
-		delivered++
-	}
-	log.Printf("[GROUP ] leave notice broadcast to %d live channel(s) for group=%s",
-		delivered, rendered[:12])
-}
-
 // syncRostersToPeer pushes fresh TypeGroupRosterUpdate
 // envelopes for every local group that includes peerHex
 // in its roster. Best-effort / silent skip when peerHex
@@ -1697,49 +1609,6 @@ func (n *Node) ApplyRosterUpdate(env protocol.Envelope, fromPeerID []byte) error
 		}
 	}
 
-	// v1.1.5 — design notes (the creator-authority rule
-	// below was considered and rejected for this hotfix; see
-	// commit message for the trade-off discussion):
-	//
-	// Bug context (real reproduction, 2026-07-05 16:11-16:12):
-	//   alice is the creator of g_e6ab2bdd with 3 members
-	//   [alice, 大刀, 老邓]. 大刀's binary (built 2026-07-02,
-	//   pre-v1.1.4) holds a stale 2-member copy in its local
-	//   members.json. At 16:11:55 大刀 pushes a RosterUpdate
-	//   envelope with 2 members, which ApplyRosterUpdate
-	//   blindly overwrites alice's local m with. 老邓's
-	//   reconnect 9 seconds later picks up alice's now-2
-	//   view via syncRostersToPeer, and 老邓 ends up with
-	//   2 members. Result: creator view = 3 (correct),
-	//   rejoiner view = 2 (stale).
-	//
-	// Considered fix (rejected here, see below): refuse to
-	// shrink creator's local m when inbound has fewer
-	// members. The rule would have been:
-	//   if WE are the creator AND len(local.Members) > len(rp.Members):
-	//     ignore inbound
-	// That fix would heal the 2026-07-05 reproduction but
-	// ALSO break TestScenario_AcceptWhileOffline, where the
-	// canonical propagation path is "carol pushes her
-	// 2-member roster to alice on handshake" — alice
-	// under-fix mode refuses the inbound and stays at 3
-	// forever. Production has the same problem: when the
-	// creator goes offline during a leave, the rejoining
-	// peer's RosterUpdate carries the post-leave state and
-	// the creator needs to absorb it to converge. The
-	// creator-as-authority rule blocks exactly that
-	// legit signal.
-	//
-	// Decision: the real fix is a deeper redesign of the
-	// roster gossip layer (creator-side ownership +
-	// leavenotice-carrying syncRostersToPeer). That is
-	// v1.1.6 / v1.2 scope. This hotfix (v1.1.5) lands the
-	// high-value narrow fix (LeaveGroup emits explicit
-	// TypeGroupLeaveNotice, ApplyLeaveNotice broadcasts the
-	// post-removal roster — so live leaves always
-	// converge), and leaves the 2026-07-05 cross-version
-	// stale-replication as a separate tracked issue.
-
 	// We may not have a local members.json yet if the
 	// roster update arrives before our AcceptGroupInvite
 	// has finished its initial save. That's OK: write
@@ -1773,6 +1642,40 @@ func (n *Node) ApplyRosterUpdate(env protocol.Envelope, fromPeerID []byte) error
 		GroupID:   m.GroupID,
 		GroupName: m.GroupName,
 	})
+
+	// v1.1.4 (2026-07-03): close the Q3 gossip gap.
+	//
+	// Scenario (Q3, 2026-07-02): bob (non-creator) leaves
+	// a 3-person group. bob.LeaveGroup calls
+	// broadcastRosterUpdate which iterates bob's current
+	// channels and sends the new (2-member) roster to
+	// alice and carol. Best-effort: if one of those
+	// channels is down at the moment of leave, the
+	// corresponding peer never gets the update, and that
+	// peer's local members.json stays at 3 forever (until
+	// they reconnect and syncRostersToPeer heals it on a
+	// future handshake).
+	//
+	// Fix: when the receiver IS the creator, re-broadcast
+	// the canonical roster to all members. The creator is
+	// the authoritative source — if alice (creator)
+	// received bob's leave but carol didn't (because
+	// carol's channel was down at the time), alice's
+	// re-broadcast from her still-up channel to carol
+	// closes the gap. Non-creator receivers do NOT
+	// re-broadcast (would cascade: every re-broadcast
+	// would itself trigger another re-broadcast).
+	//
+	// Failure mode this does NOT cover: if the creator's
+	// channel to the missed peer is ALSO down, the missed
+	// peer still stays stale until the next handshake
+	// (syncRostersToPeer heals it then). That's the same
+	// catch-up story as any other best-effort gossip
+	// pattern; the previous behavior had no creator-side
+	// amplification at all, this gets the easy case.
+	if finalCreator != "" && n.id != nil && finalCreator == n.id.PeerIDHex() {
+		n.broadcastRosterUpdate(m)
+	}
 	return nil
 }
 
