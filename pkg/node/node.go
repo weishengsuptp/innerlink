@@ -1479,6 +1479,48 @@ func (n *Node) ApplyLeaveNotice(env protocol.Envelope, fromPeerID []byte) error 
 	if !m.Contains(ln.LeaverID) {
 		return nil
 	}
+	// 2.5 v1.2.2 (2026-07-08): stale-leave-notice guard.
+	//
+	// Scenario (user-reported 2026-07-08 13:04):
+	//   1. Member d85dc3bb leaves g_422a61 at 10:38:18.
+	//      Peer 128 (511aab2) witnesses and records to
+	//      its witnesslog.
+	//   2. Creator re-invites d85dc3bb at 10:39:51 —
+	//      d85dc3bb rejoins. Our local m.Members has
+	//      d85dc3bb with JoinedAt = 10:39:51.
+	//   3. Peer 128 reconnects at 10:40:04. Its
+	//      syncLeaveNoticesToPeer replays its stale
+	//      witnesslog to us. ln.LeftAt ≈ 10:39:28
+	//      (when peer 128 witnessed the original leave).
+	//   4. Pre-fix: we blindly RemoveMember(d85dc3bb)
+	//      because d85dc3bb IS in m.Members, dropping a
+	//      legitimately rejoined member. Then we
+	//      broadcast the drop — every peer sees d85dc3bb
+	//      disappear, the re-invite is silently undone.
+	//
+	// Fix: if leaver's current JoinedAt in our roster
+	// is strictly AFTER ln.LeftAt, the notice is stale —
+	// the leaver left, then was re-invited, and we're
+	// processing a delayed replay of the old leave.
+	// Skip the drop. The witnesslog entry that came
+	// along with this notice will still be recorded
+	// below (dedup'd by (g, leaver)) so the "resurrect
+	// protection" survives — peer 128's view of d85dc3bb
+	// as "left" just becomes out-of-date, which the
+	// creator's subsequent roster push (with d85dc3bb
+	// listed + inboundFromCreator carve-out) will heal.
+	for _, mem := range m.Members {
+		if mem.PeerID != ln.LeaverID {
+			continue
+		}
+		if !mem.JoinedAt.IsZero() && !ln.LeftAt.IsZero() && mem.JoinedAt.After(ln.LeftAt) {
+			log.Printf("[GROUP ] leave notice from %s: skip drop %s from %s (re-joined at %s, after LeftAt=%s)",
+				peerBytesToHex(fromPeerID), shortHex(ln.LeaverID), shortHex(ln.GroupID),
+				mem.JoinedAt.Format("15:04:05"), ln.LeftAt.Format("15:04:05"))
+			return nil
+		}
+		break
+	}
 	// 3. Leaver is in our roster. Remove + (maybe
 	// dissolve) + broadcast.
 	if !m.RemoveMember(ln.LeaverID) {
@@ -1518,6 +1560,35 @@ func (n *Node) ApplyLeaveNotice(env protocol.Envelope, fromPeerID []byte) error 
 				m.GroupID[:8], ln.LeaverID[:8], err)
 		}
 	}
+	// v1.2.1 (2026-07-08): creator-side amplification on
+	// the leave path. ApplyRosterUpdate already has a
+	// similar Q3 fix (re-broadcast when receiver is the
+	// creator), but it can race against a leave notice
+	// arriving in the opposite order — ApplyRosterUpdate
+	// sees a pre-leave local state and re-broadcasts a
+	// stale roster that still lists the leaver. The
+	// mirror call here fires AFTER our RemoveMember has
+	// landed, so we always re-broadcast the post-leave
+	// roster regardless of which envelope won the race.
+	// Cheap: the worst case is two broadcasts to the
+	// same set of peers (idempotent on the receiver).
+	if m.Creator != "" && n.id != nil && m.Creator == n.id.PeerIDHex() {
+		n.broadcastRosterUpdate(m)
+	}
+	// v1.2.1 (2026-07-08): mirror the leave notice to
+	// remaining peers. The LeaveGroup author already
+	// broadcasts a leave notice at leave time, but only
+	// to peers it has a channel with. If we're catching
+	// up via a relayed notice (ApplyLeaveNotice path),
+	// the leaver didn't talk to us directly — and the
+	// peer's ApplyRosterUpdate's "never drop" rule
+	// (v1.2) means a 2-member roster push alone won't
+	// heal their stale local view. Re-broadcasting the
+	// leave notice gives those peers a deterministic
+	// RemoveMember on the same g_xxx, which they
+	// accept (no witness collision — we're the creator,
+	// they trust our notice).
+	n.broadcastLeaveNotice(m, ln.LeaverID, ln.LeftAt)
 	// If we just emptied the roster, dissolve the group
 	// (mirrors LeaveGroup's own empty-members branch in
 	// pkg/node/groups.go).

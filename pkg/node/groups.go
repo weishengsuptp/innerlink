@@ -914,6 +914,20 @@ func (n *Node) LeaveGroup(renderedID string) error {
 	// and best-effort drops offline peers (same semantics as
 	// the accept path — see agent memory entry on roster
 	// write-broadcast exclusions).
+	//
+	// v1.2.1 (2026-07-08) addition: also broadcast a
+	// TypeGroupLeaveNotice alongside the roster update.
+	// Roster-only broadcasting was insufficient because
+	// (a) the post-RemoveMember(self) marshal could race
+	// against a stale self-included snapshot on the
+	// receiver's side, and (b) v1.2's ApplyRosterUpdate
+	// "never drop" rule means inbound-roster cannot heal
+	// missing leavers anymore — only a leave notice can.
+	// Sending both at leave time gives online peers a
+	// synchronous "drop this peer" instruction without
+	// relying on the leaver's future re-handshake replay.
+	// See pkg/node/groups.go broadcastLeaveNotice.
+	n.broadcastLeaveNotice(m, selfHex, time.Now().UTC())
 	n.broadcastRosterUpdate(m)
 	// v1.1.4 (2026-07-02): persist the leave to the
 	// device-level leavelog so we can replay a
@@ -1360,6 +1374,76 @@ type metaPayload struct {
 // local members.json matches the canonical one.
 // Best-effort / idempotent — receiving a roster update
 // that's identical to your local state is a no-op.
+// broadcastLeaveNotice sends a TypeGroupLeaveNotice to
+// every member currently in m.Members (which, at the
+// only call site, is post-RemoveMember(self) — so the
+// leaver is no longer in the slice). Best-effort, same
+// shape as broadcastRosterUpdate.
+//
+// v1.2.1 (2026-07-08) added this. The v1.1.4 baseline only
+// broadcast the post-leave roster — which is the visible
+// state change but doesn't carry the "I, <leaver>, am
+// leaving" semantic that the receiving ApplyLeaveNotice
+// needs to do a deterministic RemoveMember. The harness's
+// LeaveGroupAction (test-only) had its own LeaveNotice
+// fan-out, but production LeaveGroup did not, which made
+// the live bug reproduce: the creator receives a stale
+// 3-member roster (the leaver forgot to drop themselves
+// before marshalling) and never learns the leaver is
+// gone until the leaver comes back online and replays
+// their leavelog. v1.2.1 fixes the gap by sending the
+// notice in-band at leave time, so every online peer
+// drops the leaver synchronously. The leavelog+sync path
+// stays in place as the offline-peer catch-up story.
+func (n *Node) broadcastLeaveNotice(m *group.Members, leaverPeerID string, leftAt time.Time) {
+	if n.channels == nil {
+		return
+	}
+	rendered := m.GroupID
+	rawID, err := group.ParseGroupID(rendered)
+	if err != nil {
+		log.Printf("[WARN  ] broadcastLeaveNotice: bad group_id %q: %v", rendered, err)
+		return
+	}
+	payload, err := json.Marshal(protocol.LeaveNotice{
+		GroupID:  rendered,
+		LeaverID: leaverPeerID,
+		LeftAt:   leftAt,
+	})
+	if err != nil {
+		log.Printf("[WARN  ] broadcastLeaveNotice: marshal: %v", err)
+		return
+	}
+	delivered := 0
+	for _, mem := range m.Members {
+		// m.Members already excludes the leaver (we
+		// RemoveMember'd before calling broadcast*), so
+		// no need to skip — every entry is a target.
+		pid, err := hexToBytes(mem.PeerID)
+		if err != nil {
+			continue
+		}
+		st := n.channels.get(pid)
+		if st == nil || st.ch == nil {
+			continue
+		}
+		env := protocol.Envelope{
+			Type:    protocol.TypeGroupLeaveNotice,
+			Payload: payload,
+			GroupID: rawID,
+		}
+		if err := st.ch.Send(n.ctx, env); err != nil {
+			log.Printf("[WARN  ] broadcastLeaveNotice to %s: %v", mem.PeerID, err)
+			continue
+		}
+		delivered++
+	}
+	if delivered > 0 {
+		log.Printf("[GROUP ] leave notice broadcast to %d/%d remaining (leaver=%s)",
+			delivered, len(m.Members), leaverPeerID[:8])
+	}
+}
+
 func (n *Node) broadcastRosterUpdate(m *group.Members) {
 	if n.channels == nil {
 		return
@@ -1795,6 +1879,21 @@ func (n *Node) ApplyRosterUpdate(env protocol.Envelope, fromPeerID []byte) error
 	}
 	log.Printf("[GROUP ] roster synced from %s: %d members (creator=%s)",
 		peerBytesToHex(fromPeerID), len(m.Members), creatorShort)
+	// v1.2.1 (2026-07-08): the v1.1.4 "Q3 fix" creator-side
+	// re-broadcast on roster receipt is REMOVED here.
+	// The reasoning: under v1.2's "never drop" rule,
+	// this ApplyRosterUpdate can fire with a stale
+	// pre-leave local state if a leave notice is
+	// concurrently in-flight (leave notice arrives
+	// *after* this roster update in TCP order), so
+	// the broadcast would carry the leaver and the
+	// other peer would write a stale 3-member local.
+	// The creator-side amplification now lives in
+	// ApplyLeaveNotice instead — it's guaranteed to
+	// fire *after* RemoveMember + Save, so its
+	// broadcast always carries the post-leave roster.
+	// See pkg/node/node.go ApplyLeaveNotice for the
+	// mirror call.
 	// v1.1.1 (2026-06-29): tell the local frontend the
 	// roster changed so the sidebar's "<N> 成员" count
 	// and the settings panel's member list refresh
@@ -1804,40 +1903,21 @@ func (n *Node) ApplyRosterUpdate(env protocol.Envelope, fromPeerID []byte) error
 		GroupID:   m.GroupID,
 		GroupName: m.GroupName,
 	})
-
-	// v1.1.4 (2026-07-03): close the Q3 gossip gap.
-	//
-	// Scenario (Q3, 2026-07-02): bob (non-creator) leaves
-	// a 3-person group. bob.LeaveGroup calls
-	// broadcastRosterUpdate which iterates bob's current
-	// channels and sends the new (2-member) roster to
-	// alice and carol. Best-effort: if one of those
-	// channels is down at the moment of leave, the
-	// corresponding peer never gets the update, and that
-	// peer's local members.json stays at 3 forever (until
-	// they reconnect and syncRostersToPeer heals it on a
-	// future handshake).
-	//
-	// Fix: when the receiver IS the creator, re-broadcast
-	// the canonical roster to all members. The creator is
-	// the authoritative source — if alice (creator)
-	// received bob's leave but carol didn't (because
-	// carol's channel was down at the time), alice's
-	// re-broadcast from her still-up channel to carol
-	// closes the gap. Non-creator receivers do NOT
-	// re-broadcast (would cascade: every re-broadcast
-	// would itself trigger another re-broadcast).
-	//
-	// Failure mode this does NOT cover: if the creator's
-	// channel to the missed peer is ALSO down, the missed
-	// peer still stays stale until the next handshake
-	// (syncRostersToPeer heals it then). That's the same
-	// catch-up story as any other best-effort gossip
-	// pattern; the previous behavior had no creator-side
-	// amplification at all, this gets the easy case.
-	if finalCreator != "" && n.id != nil && finalCreator == n.id.PeerIDHex() {
-		n.broadcastRosterUpdate(m)
-	}
+	// v1.2.1 (2026-07-08): the v1.1.4 "Q3 fix" creator-side
+	// re-broadcast on roster receipt is REMOVED here.
+	// The reasoning: under v1.2's "never drop" rule,
+	// this ApplyRosterUpdate can fire with a stale
+	// pre-leave local state if a leave notice is
+	// concurrently in-flight (leave notice arrives
+	// *after* this roster update in TCP order), so
+	// the broadcast would carry the leaver and the
+	// other peer would write a stale 3-member local.
+	// The creator-side amplification now lives in
+	// ApplyLeaveNotice instead — it's guaranteed to
+	// fire *after* RemoveMember + Save, so its
+	// broadcast always carries the post-leave roster.
+	// See pkg/node/node.go ApplyLeaveNotice for the
+	// mirror call.
 	return nil
 }
 
