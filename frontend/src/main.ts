@@ -823,14 +823,19 @@ function renderPeerList() {
 
   list.innerHTML = sorted.map(p => {
     const st = peerState(p);
-    // v1.2.4 修 (2026-07-11 15:43): 最简方案 — 直接从
-    // state.history 数 in 消息, selectedId === peerId 时
-    // 显示 0 (user 正在看那个 chat), 否则显示 inCount。
-    // 不用累加 Map, 不用 lastReadIdx 游标, 杜绝 14:30 / 14:18
-    // / 14:43 三次都漏 1 in 的累加 / lastReadIdx 游标 bug。
+    // v1.2.4 修 (2026-07-11 16:55): 真根因。
+    // 之前 selectedId === peerId ? 0 : inCount — user 选了
+    // 那个人跳 chat tab, selectedId = peerId, in 消息
+    // m.PeerID 又是同一个人 -> selectedId === m.PeerID ->
+    // unread = 0 -> 1st in 永远 0 红点, 跟实际 in 数差 1。
+    // user 16:52 明确要求: "消息弹框出来一条, 立刻变成 1"
+    // — 红点必须跟 in 消息数实时一致, 不论 selectedId。
+    // 删特殊清零, 红点永远 = inCount。已读语义改成 "切到
+    // chat pane 看了内容" 触发 (renderMessages 末尾) —
+    // 见 selectPeer 末尾的 readMarker 推进。
     const histList = state.history.get(p.PeerID) || [];
     const inCount = histList.filter(m => m.Direction === 'in').length;
-    const unread = p.PeerID === state.selectedId ? 0 : inCount;
+    const unread = inCount;
     const name = peerDisplay(p);
     // Meta line: <display-name> · IP
     // display-name falls back through alias → hostname
@@ -904,11 +909,11 @@ function renderGroupList() {
     return (a.group_name || '').localeCompare(b.group_name || '');
   });
   list.innerHTML = sorted.map(g => {
-    // v1.2.4 修 (2026-07-11 15:43): 跟 renderPeerList 同 — 选
-    // 中显示 0, 否则 inCount。
+    // v1.2.4 修 (2026-07-11 16:55): 跟 renderPeerList 同 —
+    // 删 selectedId 特殊清零, unread 永远 = inCount。
     const histList = state.history.get(g.group_id) || [];
     const inCount = histList.filter(m => m.Direction === 'in').length;
-    const unread = g.group_id === state.selectedId ? 0 : inCount;
+    const unread = inCount;
     // "X 在线" 数字包含 self —— 因为 self 永远在群里（这是 sidebar
     // 列出这个群的前提 = g.self === true），把 self 排除会让
     // 用户看着"群主本人不在线?"——其实他只是在看自己的视角，
