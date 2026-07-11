@@ -131,17 +131,17 @@ interface UIState {
   nearBottom: boolean;
   // unreadCount: peer hex ID -> number of incoming
   // messages not yet seen. Reset to 0 in selectPeer.
-  // v1.2.4 修 (2026-07-11 14:43): 7/11 14:30 user 反馈 "发 8
-  // 显示 7" / 14:42 "发 5 显示 4", +1 累加路径 root cause 没
-  // 找准, 改用 state.history 直接数。unreadCount Map 保留
-  // 字段以免破坏其他引用, 但 message:event handler 不再 +1,
-  // 渲染时从 state.history 算 inCount - lastReadIdx[peerId]。
+  // v1.2.4 修 (2026-07-11 15:43): 7/11 15:23 user 反馈 "3 out
+  // 显示 2 红点" — 14:30 / 14:18 / 14:43 三次改都没根除漏 1 in
+  // 的根因 (累加 Map / lastReadIdx / state.history 数 都丢 1)。
+  // 改用最简方案: renderPeerList 直接从 state.history 数 in 数,
+  // selectedId === peerId 时显示 0 (user 在看那个 chat), 否则
+  // 显示完整 inCount。不用累加 Map, 不用 lastReadIdx 游标。
+  // state.unreadCount / groupUnread 字段保留 (避免破坏引用)
+  // 但不在渲染路径上用。
   unreadCount: Map<string, number>;
-  // lastReadIdx: peer/groupId -> 已读到的 in 消息数 (state.history
-  // 里的 in 消息数)。selectPeer / selectGroup 时推到当前 inCount
-  // 实现 "切过去时清 0"。message:event handler 不动这个 Map,
-  // 只 push state.history 即可 — state.history 是唯一 source of
-  // truth, lastReadIdx 是 "读到哪了" 的游标。
+  // lastReadIdx: 7/11 15:43 标记 deprecated, 不再用。
+  // 见上方注释 + renderPeerList / renderChatList 实现。
   lastReadIdx: Map<string, number>;
   // groupUnread: rendered group ID -> incoming unread count
   // (mirrors unreadCount but for group conversations; they
@@ -823,14 +823,14 @@ function renderPeerList() {
 
   list.innerHTML = sorted.map(p => {
     const st = peerState(p);
-    // v1.2.4 修 (2026-07-11 14:43): 改用 state.history 数 unread。
-    // 单一 source of truth — inCount - lastReadIdx 即为真实
-    // 未读数, 不依赖累加 Map 状态。state.unreadCount 保留
-    // 但只作为兜底 (累加路径不再 +1)。
+    // v1.2.4 修 (2026-07-11 15:43): 最简方案 — 直接从
+    // state.history 数 in 消息, selectedId === peerId 时
+    // 显示 0 (user 正在看那个 chat), 否则显示 inCount。
+    // 不用累加 Map, 不用 lastReadIdx 游标, 杜绝 14:30 / 14:18
+    // / 14:43 三次都漏 1 in 的累加 / lastReadIdx 游标 bug。
     const histList = state.history.get(p.PeerID) || [];
     const inCount = histList.filter(m => m.Direction === 'in').length;
-    const lastRead = state.lastReadIdx.get(p.PeerID) || 0;
-    const unread = Math.max(0, inCount - lastRead);
+    const unread = p.PeerID === state.selectedId ? 0 : inCount;
     const name = peerDisplay(p);
     // Meta line: <display-name> · IP
     // display-name falls back through alias → hostname
@@ -904,12 +904,11 @@ function renderGroupList() {
     return (a.group_name || '').localeCompare(b.group_name || '');
   });
   list.innerHTML = sorted.map(g => {
-    // v1.2.4 修 (2026-07-11 14:43): 改用 state.history 数 unread
-    // (跟 renderPeerList 同样的 source of truth 改动)。
+    // v1.2.4 修 (2026-07-11 15:43): 跟 renderPeerList 同 — 选
+    // 中显示 0, 否则 inCount。
     const histList = state.history.get(g.group_id) || [];
     const inCount = histList.filter(m => m.Direction === 'in').length;
-    const lastRead = state.lastReadIdx.get(g.group_id) || 0;
-    const unread = Math.max(0, inCount - lastRead);
+    const unread = g.group_id === state.selectedId ? 0 : inCount;
     // "X 在线" 数字包含 self —— 因为 self 永远在群里（这是 sidebar
     // 列出这个群的前提 = g.self === true），把 self 排除会让
     // 用户看着"群主本人不在线?"——其实他只是在看自己的视角，
@@ -1390,21 +1389,15 @@ async function selectPeer(peerId: string) {
   state.draftsLoaded = true;
   // Opening a conversation clears its unread badge.
   state.unreadCount.set(peerId, 0);
-  // v1.2.4 修 (2026-07-11 14:43): 单一 source of truth —
-  // lastReadIdx 推到当前 inCount, 切过去时 in - lastRead = 0
-  // = 清 0。注意 History 重新拉后 state.history 是历史快照,
-  // 然后 message:event handler 会 push 新 in 消息 — 但 selectPeer
-  // 是同步路径, 这里先 set lastReadIdx, 后续 in 走完会再重算。
-  // renderPeerList 会从当前 state.history 数 in 重算 unread。
+  // v1.2.4 修 (2026-07-11 15:43): 最简方案 — 不用 lastReadIdx,
+  // 渲染时直接 selectedId === peerId ? 0 : inCount。selectPeer
+  // 只需 reload history + renderPeerList, 渲染时自动显示 0。
   try {
     const h = await History(peerId);
     state.history.set(peerId, (h as node.Message[]) || []);
-    const inCount = (h || []).filter((m: any) => m.Direction === 'in').length;
-    state.lastReadIdx.set(peerId, inCount);
     state.unreadCount.set(peerId, 0);
   } catch (e) {
     state.history.set(peerId, []);
-    state.lastReadIdx.set(peerId, 0);
     state.unreadCount.set(peerId, 0);
     toast(`读取历史失败: ${e}`);
   }
@@ -1443,18 +1436,14 @@ async function selectGroup(renderedID: string) {
   // re-render both lists (the active highlight lives in
   // different DOM nodes for the two sections).
   state.groupUnread.set(renderedID, 0);
-  // v1.2.4 修 (2026-07-11 14:43): 单一 source of truth — 跟
-  // selectPeer 一样, lastReadIdx 推到当前 inCount 切过去时清 0。
+  // v1.2.4 修 (2026-07-11 15:43): 跟 selectPeer 同 — 不用
+  // lastReadIdx, 渲染时直接 selectedId === groupId ? 0 : inCount。
   try {
     const r = await HistoryGroup(renderedID);
-    const msgs = (r && r.messages) || [];
-    state.history.set(renderedID, msgs);
-    const inCount = msgs.filter(m => m.Direction === 'in').length;
-    state.lastReadIdx.set(renderedID, inCount);
+    state.history.set(renderedID, (r && r.messages) || []);
     state.groupUnread.set(renderedID, 0);
   } catch (e) {
     state.history.set(renderedID, []);
-    state.lastReadIdx.set(renderedID, 0);
     state.groupUnread.set(renderedID, 0);
     toast(`读取群历史失败: ${e}`);
   }
