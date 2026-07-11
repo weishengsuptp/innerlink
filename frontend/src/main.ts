@@ -3762,6 +3762,46 @@ function wireEvents() {
   });
   EventsOn('message:event', (m: node.Message) => {
     if (!m || !m.PeerID) return;
+    // v1.2.4 修 (2026-07-11 15:53): 1st in 漏红点根因
+    // 修。前面 5 次改法 (累加 Map / lastReadIdx / state.history
+    // 单一 source of truth / selectedId === peerId) 都在算
+    // inCount, 但没解决 row 不渲染的问题: 1st in 时 peer:event
+    // / refreshAll 也许还没把发送方加到 state.peers, renderPeerList
+    // 从 state.peers 算 row 找不到, 行不显示, 红点 0。2nd in
+    // 来时 peer:event 触发 refreshAll 把 peer 加进 state.peers,
+    // row 才显示, 但此时 inCount 已经是 2/3 — 永远漏第 1 个 in。
+    // 修法: 1st in 时如果 state.peers 没这个 peer (且不是 group
+    // id), 主动 add 一个 placeholder PeerInfo, 让 renderPeerList
+    // 能找到这个 peer 出 row + 红点。placeholder 字段值之后
+    // refreshAll 会用真实值覆盖 (Alias / Addrs / LastSeen /
+    // Online)。
+    if (m.Direction === 'in' && !isGroupId(m.PeerID)
+        && !state.peers.some(p => p.PeerID === m.PeerID)) {
+      state.peers.push({
+        PeerID: m.PeerID,
+        Addrs: [] as string[],
+        IsSelf: false,
+        Alias: '',
+        LastSeen: '',
+        Online: false,
+      } as unknown as node.PeerInfo);
+    }
+    // 同上 — group in 漏 row 同样根因, 1st group in 时
+    // state.groups 也许没这个 group (group:event 还没触发
+    // refreshAll), renderGroupList 找不到 row 漏 1 in。
+    // placeholder group 字段 (group_name / members) 之后
+    // refreshAll 会覆盖。
+    if (m.Direction === 'in' && isGroupId(m.PeerID)
+        && !state.groups.some(g => g.group_id === m.PeerID)) {
+      state.groups.push({
+        group_id: m.PeerID,
+        group_name: '',
+        members: [],
+        creator: '',
+        self: false,
+        invites: [],
+      } as any);
+    }
     // v1.1 (2026-06-28): the conversation key is just
     // m.PeerID — for 1:1 it's the peer's 32-char hex;
     // for groups it's the rendered "g_<64hex>" string.
@@ -3807,6 +3847,12 @@ function wireEvents() {
       if (isGroupId(m.PeerID)) renderGroupList();
       else renderPeerList();
     }
+    // v1.2.4 修 (2026-07-11 15:53): contacts view 也要同步
+    // 重渲染 — 上面 placeholder 主动加进 state.peers /
+    // state.groups, 但 renderContactList 只在 refreshAll
+    // 末尾 + view 切到 contacts 时调。1st in 来时如果不主动
+    // 调, 联系人 tab 不会显示新加的 placeholder peer / group。
+    if (state.view === 'contacts') renderContactList();
     // Live-update the history drawer if it's open so
     // new messages appear without a manual refresh.
     if (state.historyDrawerOpen) renderHistoryList();
