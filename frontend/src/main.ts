@@ -131,7 +131,18 @@ interface UIState {
   nearBottom: boolean;
   // unreadCount: peer hex ID -> number of incoming
   // messages not yet seen. Reset to 0 in selectPeer.
+  // v1.2.4 修 (2026-07-11 14:43): 7/11 14:30 user 反馈 "发 8
+  // 显示 7" / 14:42 "发 5 显示 4", +1 累加路径 root cause 没
+  // 找准, 改用 state.history 直接数。unreadCount Map 保留
+  // 字段以免破坏其他引用, 但 message:event handler 不再 +1,
+  // 渲染时从 state.history 算 inCount - lastReadIdx[peerId]。
   unreadCount: Map<string, number>;
+  // lastReadIdx: peer/groupId -> 已读到的 in 消息数 (state.history
+  // 里的 in 消息数)。selectPeer / selectGroup 时推到当前 inCount
+  // 实现 "切过去时清 0"。message:event handler 不动这个 Map,
+  // 只 push state.history 即可 — state.history 是唯一 source of
+  // truth, lastReadIdx 是 "读到哪了" 的游标。
+  lastReadIdx: Map<string, number>;
   // groupUnread: rendered group ID -> incoming unread count
   // (mirrors unreadCount but for group conversations; they
   // share the same conversation-key routing).
@@ -166,6 +177,13 @@ interface UIState {
   // members.json → the peer is no longer a "candidate"
   // anyway). v1.1.2 (2026-06-30).
   pendingInvites: Map<string, Set<string>>;
+  // v1.2.4 (2026-07-11): which list is shown in the
+  // middle column (chat vs contacts).
+  view: 'chat' | 'contacts';
+  // v1.2.4 (2026-07-11): set of conversation IDs (peer
+  // hex or group id) that have been chatted with —
+  // drives chat view rows + "已加" pill in contacts view.
+  chatList: Set<string>;
 }
 
 interface FileBubbleState {
@@ -191,11 +209,24 @@ const state: UIState = {
   draftsLoaded: false,
   nearBottom: true,
   unreadCount: new Map(),
+  // v1.2.4 修 (2026-07-11 14:43): 单一 source of truth — 改用
+  // state.history 算 unread, lastReadIdx 记录 user 切到 peer
+  // 时已读到的 in 消息数。详见 state interface 注释。
+  lastReadIdx: new Map(),
   groupUnread: new Map(),
   fileBubbles: new Map(),
   historyDrawerOpen: false,
   groupSettingsDrawerOpen: false,
   pendingInvites: new Map(),
+  // v1.2.4 (2026-07-11): view 切换 — which list is shown
+  // in the middle column. Flipped by setView() when
+  // user clicks rail-view-chat / rail-view-contacts.
+  view: 'chat' as 'chat' | 'contacts',
+  // v1.2.4 (2026-07-11): B 折中 — every conversation that
+  // has received or sent at least one message is in this
+  // set. Drives the chat view; the contacts view marks
+  // these with a small "已加" pill.
+  chatList: new Set<string>(),
 };
 
 // isGroupId reports whether the conversation key is a
@@ -305,39 +336,59 @@ function peerState(p: node.PeerInfo): 'online' | 'recent' | 'offline' {
   return 'offline';
 }
 
-// timeAgo formats a timestamp as a Chinese relative
-// phrase. Online peers get "在线"; recent peers get
-// "刚刚" / "5 分钟前" / "30 分钟前" / "X 小时前";
-// older timestamps get days / months / calendar-year
-// diff. We use calendar-year diff (now.getFullYear() -
-// t.getFullYear()) rather than elapsed time so the
-// output matches user intuition: an entry from 2024
-// is "2 年前" in 2026, not "1 年前" (elapsed 18 months
-// floors to 1 year, but the year boundary crossed).
-function timeAgo(ts: any, online: boolean): string {
-  if (online) return '在线';
+// timeAgo formats a timestamp for the chat list /
+// contact list row. 7/11 14:22 拍板 — user 反馈
+// "2025 年前" 不合理, 应按本地日历与当前时间比:
+//   - 一天内 (本地同一日期): HH:mm
+//   - 昨天: "昨天"
+//   - 前天: "前天"
+//   - 30+ 天但同一年: MM-DD
+//   - 跨阳历年: YYYY-MM
+// 不再输出 "X 分钟前" / "X 年前" 等相对词, 因为 chat
+// 列表项是"最近的消息时间为标准", 时间越具体越准。
+//
+// 7/11 14:30 修 — 去掉 "if (online) return '在线'" 早
+// return, 让 online peer 也显示具体时间。peer 在线
+// 状态已经通过 .peer-dot LED + meta line 在线 IP /
+// "最近在线 X 分钟" 表达, 列表行右边不重复显示。
+//
+// online 参数保留 (call site 传, 这里不读) — 后续如
+// 果想加 "在线 + 最近时间" 复合显示, 把这个 _online
+// 改回 online 直接用, 不破坏 call site 签名。
+function timeAgo(ts: any, _online: boolean): string {
+  void _online; // suppress unused-arg TS warning; see above
   if (!ts) return '';
   const t = new Date(ts);
   if (isNaN(t.getTime())) return '';
   const now = new Date();
-  const diff = now.getTime() - t.getTime();
-  if (diff < 0) return ''; // future timestamp, skip
-  if (diff < 60 * 1000) return '刚刚';
-  if (diff < 60 * 60 * 1000) return `${Math.floor(diff / 60000)} 分钟前`;
-  if (diff < 24 * 60 * 60 * 1000) return `${Math.floor(diff / 3600000)} 小时前`;
-  if (diff < 30 * 24 * 60 * 60 * 1000) {
-    const d = Math.floor(diff / 86400000);
-    return d === 1 ? '昨天' : `${d} 天前`;
+  if (now.getTime() - t.getTime() < 0) return ''; // future ts
+  // 同一天 (本地日历)
+  const sameDay =
+    now.getFullYear() === t.getFullYear() &&
+    now.getMonth() === t.getMonth() &&
+    now.getDate() === t.getDate();
+  if (sameDay) {
+    const hh = String(t.getHours()).padStart(2, '0');
+    const mm = String(t.getMinutes()).padStart(2, '0');
+    return `${hh}:${mm}`;
   }
-  // Calendar-aware: 30+ days uses year/month/day diff
-  // rather than raw elapsed milliseconds, so a Feb 2024
-  // entry in Jun 2026 reads "2 年前", not "2 年 4 个月前".
-  const yearDiff = now.getFullYear() - t.getFullYear();
-  if (yearDiff >= 1) return `${yearDiff} 年前`;
-  // Same year but 30+ days ago: count months.
-  const monthDiff = now.getMonth() - t.getMonth();
-  if (monthDiff >= 1) return `${monthDiff} 个月前`;
-  return '1 个月前';
+  // 用本地零点比对天数, dayDiff = 1 → 昨天, 2 → 前天,
+  // 3+ → 进入月日 / 年月分支。
+  const nowMid = new Date(now.getFullYear(), now.getMonth(), now.getDate()).getTime();
+  const tMid = new Date(t.getFullYear(), t.getMonth(), t.getDate()).getTime();
+  const dayDiff = Math.round((nowMid - tMid) / 86400000);
+  if (dayDiff === 1) return '昨天';
+  if (dayDiff === 2) return '前天';
+  // 同年
+  if (now.getFullYear() === t.getFullYear()) {
+    const M = String(t.getMonth() + 1).padStart(2, '0');
+    const D = String(t.getDate()).padStart(2, '0');
+    return `${M}-${D}`;
+  }
+  // 跨年
+  const Y = t.getFullYear();
+  const M = String(t.getMonth() + 1).padStart(2, '0');
+  return `${Y}-${M}`;
 }
 
 // dayLabel returns the Chinese day header for a message
@@ -423,6 +474,11 @@ function senderNameForRow(pid: string, m: node.Message): string {
   return shortId(pid);
 }
 
+// v1.2.4 (2026-07-11): selectPeer / selectGroup were
+// already defined in v1.2.2; the helpers below just hook
+// in the chat-pane show/hide (was always visible in
+// v1.2.2 — now hidden by default per chat-demo.html
+// 拍板).
 function selectedPeer(): node.PeerInfo | null {
   if (!state.selectedId) return null;
   if (isGroupId(state.selectedId)) return null;
@@ -460,46 +516,85 @@ function toast(msg: string, variant: 'info' | 'success' | 'error' = 'info') {
 }
 
 // ----- DOM injection (one-shot at startup) -----
+// v1.2.4 (2026-07-11): UI 升级，按 chat-demo.html 拍板
+// 改写 sidebar layout（56px rail + 280px list + flex:1 右侧
+// chat pane）。v1.2.2 全部 ID（me-name / me-host / me-status
+// / led / group-list / peer-list / group-count / peer-online
+// / peer-count / btn-create-group / btn-scan / btn-test-reveal）
+// 都保留在 hidden 元素中 — wireEvents + render 函数整段不
+// 动。chat pane 完整保留 v1.2.2（chat-header / messages /
+// composer / drawer / modal / toast / popover）。
 function mount() {
   document.querySelector('#app')!.innerHTML = `
     <div class="app">
-      <aside class="sidebar">
-        <div class="me">
-          <div class="me-label">我</div>
-          <div class="me-name" id="me-name">—</div>
-          <div class="me-host" id="me-host">本机 · —</div>
-          <div class="me-status"><span class="led"></span><span id="me-status">启动中…</span></div>
-        </div>
-        <div class="sidebar-section">
-          <div class="sidebar-header">
-            <span class="sidebar-title">群组</span>
-            <span class="sidebar-count">
-              <span id="group-count">0</span>
-              <button class="sidebar-add-btn" id="btn-create-group" title="新建群组">
-                <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4"><path d="M12 5v14"/><path d="M5 12h14"/></svg>
-              </button>
-            </span>
-          </div>
-          <div class="peer-list group-list" id="group-list"></div>
-        </div>
-        <div class="sidebar-section">
-        <div class="sidebar-header">
-          <span class="sidebar-title">Peers</span>
-          <span class="sidebar-count"><span id="peer-online">0</span> / <span id="peer-count">0</span></span>
-        </div>
-        <div class="peer-list" id="peer-list"></div>
-        </div>
-        <div class="sidebar-footer">
-          <button class="btn-mini" id="btn-scan" title="扫描 IP 段">
-            <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2"><circle cx="11" cy="11" r="7"/><path d="m21 21-4.3-4.3"/></svg>
-            scan
+      <!-- v1.2.4: 56px sidebar-rail，按 demo 拍板 1:1 -->
+      <aside class="sidebar-rail">
+        <div class="rail-avatar me" id="rail-avatar" title="点开看自己">?</div>
+        <button class="rail-icon active" id="rail-view-chat" title="消息">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M21 11.5a8.38 8.38 0 0 1-.9 3.8 8.5 8.5 0 0 1-7.6 4.7 8.38 8.38 0 0 1-3.8-.9L3 21l1.9-5.7a8.38 8.38 0 0 1-.9-3.8 8.5 8.5 0 0 1 4.7-7.6 8.38 8.38 0 0 1 3.8-.9h.5a8.48 8.48 0 0 1 8 8v.5z"/></svg>
+        </button>
+        <button class="rail-icon" id="rail-view-contacts" title="通讯录">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M17 21v-2a4 4 0 0 0-4-4H5a4 4 0 0 0-4 4v2"/><circle cx="9" cy="7" r="4"/><path d="M23 21v-2a4 4 0 0 0-3-3.87"/><path d="M16 3.13a4 4 0 0 1 0 7.75"/></svg>
+        </button>
+        <button class="rail-icon" id="rail-scan" title="手动扫描 IP 段（CIDR），找 UDP 发现不到的 peer">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="11" cy="11" r="7"/><path d="m21 21-4.3-4.3"/></svg>
+        </button>
+        <div class="rail-spacer"></div>
+        <!-- v1.2.2 hidden IDs (wireEvents + render 函数都引用
+             这些 ID；保留在 DOM 中即可，display:none 不影响
+             querySelector 找到元素 + render 函数更新文本) -->
+        <span class="me-hidden" hidden>
+          <span id="me-name">—</span>
+          <span id="me-host">本机 · —</span>
+          <span id="me-status">启动中…</span>
+          <span class="led"></span>
+          <span id="group-count">0</span>
+          <span id="peer-online">0</span>
+          <span id="peer-count">0</span>
+          <button id="btn-create-group">+</button>
+          <button id="btn-scan">scan</button>
+          <button id="btn-test-reveal">测试</button>
+        </span>
+      </aside>
+      <!-- v1.2.4: 280px sidebar-list，按 demo 拍板 1:1 —
+           双视图容器（消息 / 通讯录），data-view 切换。
+           v1.2.4 (2026-07-11): #btn-create-group 放在搜索框
+           右边 — 跟 v1.2.2 拍板"群组 + 新建群组"按钮等价
+           但视觉对齐 demo 拍板 search-bar 风格。v1.2.2
+           wireEvents 引用 #btn-create-group 触发
+           openCreateGroupModal — 按钮 visible 后建群 modal
+           立刻能弹。-->
+      <aside class="sidebar-list" id="sidebar-list" data-view="chat">
+        <div class="search-bar">
+          <input id="sidebar-search" type="search" placeholder="搜索（昵称 / IP / 消息）" />
+          <button class="sidebar-add-btn" id="btn-create-group" title="新建群组">
+            <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4"><path d="M12 5v14"/><path d="M5 12h14"/></svg>
           </button>
-          <button class="btn-mini" id="btn-test-reveal" title="测试 RevealInFolder: 弹资源管理器选 device.key">
-            测试
-          </button>
+        </div>
+        <div class="list-wrap">
+          <!-- v1.2.4 (2026-07-11): 消息 view 只显示 chatList
+               (已聊过的 peer / 群) — 不是镜像全 peer 列表。
+               识别到的新 peer 默认只在通讯录 view 出现。
+               注意: list-contacts 不能用 HTML hidden 属性 —
+               hidden = display:none 优先级最高, CSS
+               data-view="contacts" 没法覆盖它切到 visible。
+               改用 CSS class 控制 (默认 .list { display:none }
+               data-view="contacts" 切到 block)。-->
+          <div class="list list-chat" id="list-chat"></div>
+          <div class="list list-contacts" id="list-contacts"></div>
+          <!-- v1.2.2 legacy render 容器（hidden）— wireEvents
+               + render 函数仍引用 #group-list / #peer-list。
+               保留这些 ID 在 DOM 中，让 v1.2.2 render 仍能
+               querySelector 找到元素。 -->
+          <div class="peer-list group-list" id="group-list" hidden></div>
+          <div class="peer-list" id="peer-list" hidden></div>
         </div>
       </aside>
-      <section class="chat">
+      <!-- v1.2.4: 右侧 chat pane hidden。chat-demo.html
+           拍板是空 section 灰色占位 — 不显示 chat pane。选
+           peer 后 JS 把 chat-pane 取消 hidden 切出来。 -->
+      <section class="chat-pane-spacer" id="chat-pane-spacer"></section>
+      <section class="chat" id="chat-pane" data-empty="true" hidden>
         <div class="chat-header">
           <div class="avatar" id="chat-avatar">?</div>
           <div class="peer-title">
@@ -513,20 +608,9 @@ function mount() {
             <button class="icon-btn" id="btn-dial" title="发文件" disabled>
               <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="m21.44 11.05-9.19 9.19a6 6 0 0 1-8.49-8.49l9.19-9.19a4 4 0 0 1 5.66 5.66l-9.2 9.19a2 2 0 0 1-2.83-2.83l8.49-8.48"/></svg>
             </button>
-            <!-- v1.1.1 (2026-06-29): group settings button.
-                 Only enabled when the selected conversation
-                 is a group (WeChat-style ⋯ → 群设置 panel).
-                 For 1:1 chats the button stays disabled —
-                 per-peer settings aren't a feature yet. -->
             <button class="icon-btn" id="btn-group-settings" title="群设置" disabled>
               <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2"><circle cx="12" cy="5" r="1.5"/><circle cx="12" cy="12" r="1.5"/><circle cx="12" cy="19" r="1.5"/></svg>
             </button>
-            <!-- "more" (⋮) button removed v1.1 — its only
-                 action was "clear chat history", which
-                 the user downprioritized. The history
-                 affordance now lives in the composer
-                 toolbar (the 📜 button) and opens a
-                 right-side drawer with search. -->
           </div>
         </div>
         <div class="messages" id="messages">
@@ -739,7 +823,14 @@ function renderPeerList() {
 
   list.innerHTML = sorted.map(p => {
     const st = peerState(p);
-    const unread = state.unreadCount.get(p.PeerID) || 0;
+    // v1.2.4 修 (2026-07-11 14:43): 改用 state.history 数 unread。
+    // 单一 source of truth — inCount - lastReadIdx 即为真实
+    // 未读数, 不依赖累加 Map 状态。state.unreadCount 保留
+    // 但只作为兜底 (累加路径不再 +1)。
+    const histList = state.history.get(p.PeerID) || [];
+    const inCount = histList.filter(m => m.Direction === 'in').length;
+    const lastRead = state.lastReadIdx.get(p.PeerID) || 0;
+    const unread = Math.max(0, inCount - lastRead);
     const name = peerDisplay(p);
     // Meta line: <display-name> · IP
     // display-name falls back through alias → hostname
@@ -758,7 +849,7 @@ function renderPeerList() {
           <div class="peer-meta">${meta}</div>
         </div>
         <span class="badge ${unread > 0 ? 'show' : ''}">${unread > 0 ? unread : ''}</span>
-        <span class="peer-time">${escapeHtml(timeAgo(p.LastSeen, p.Online))}</span>
+        <span class="peer-time">${escapeHtml(timeAgo(lastMessageTs(p.PeerID, p.LastSeen), p.Online))}</span>
       </div>
     `;
   }).join('');
@@ -774,6 +865,22 @@ function renderPeerList() {
   const online = state.peers.filter(p => p.Online).length;
   document.getElementById('peer-online')!.textContent = String(online);
   document.getElementById('peer-count')!.textContent = String(state.peers.length);
+}
+
+// lastMessageTs returns the timestamp of the most recent
+// message in the conversation with peerId (1:1 only —
+// group timestamp is computed inline in renderGroupList),
+// falling back to fallback when there's no history yet.
+// 7/11 14:22 拍板 — chat 列表项的时间按"最近的消息时间"算,
+// 不是 peer.LastSeen, 否则离线 peer 永远显示旧的 LastSeen
+// ("2025 年前" 这种)。
+function lastMessageTs(peerId: string, fallback?: string): string {
+  const list = state.history.get(peerId);
+  if (list && list.length > 0) {
+    const last = list[list.length - 1];
+    if (last && last.Timestamp) return last.Timestamp;
+  }
+  return fallback || '';
 }
 
 // renderGroupList renders the "群组" section in the
@@ -797,7 +904,12 @@ function renderGroupList() {
     return (a.group_name || '').localeCompare(b.group_name || '');
   });
   list.innerHTML = sorted.map(g => {
-    const unread = state.groupUnread.get(g.group_id) || 0;
+    // v1.2.4 修 (2026-07-11 14:43): 改用 state.history 数 unread
+    // (跟 renderPeerList 同样的 source of truth 改动)。
+    const histList = state.history.get(g.group_id) || [];
+    const inCount = histList.filter(m => m.Direction === 'in').length;
+    const lastRead = state.lastReadIdx.get(g.group_id) || 0;
+    const unread = Math.max(0, inCount - lastRead);
     // "X 在线" 数字包含 self —— 因为 self 永远在群里（这是 sidebar
     // 列出这个群的前提 = g.self === true），把 self 排除会让
     // 用户看着"群主本人不在线?"——其实他只是在看自己的视角，
@@ -820,6 +932,7 @@ function renderGroupList() {
           <div class="peer-meta">${memberLabel}${onlineLabel}</div>
         </div>
         <span class="badge ${unread > 0 ? 'show' : ''}">${unread > 0 ? unread : ''}</span>
+        <span class="peer-time">${escapeHtml(timeAgo(lastMessageTs(g.group_id), false))}</span>
       </div>
     `;
   }).join('');
@@ -1249,6 +1362,15 @@ function renderMessage(m: node.Message, peerId: string): string {
 
 // ----- actions -----
 async function selectPeer(peerId: string) {
+  // v1.2.4 (2026-07-11): unhide chat-pane (was hidden
+  // by default per chat-demo.html 拍板 empty right section).
+  const pane = document.getElementById('chat-pane');
+  const spacer = document.getElementById('chat-pane-spacer');
+  if (pane) pane.hidden = false;
+  if (spacer) spacer.hidden = true;
+  // v1.2.4 (2026-07-11): B 折中 — selecting a peer adds
+  // it to chatList.
+  addChatMember(peerId);
   // v1.1.4 (2026-07-02) — swap the per-conversation
   // composer draft. Save whatever is currently in
   // the textarea under the OLD selectedId, then load
@@ -1268,11 +1390,22 @@ async function selectPeer(peerId: string) {
   state.draftsLoaded = true;
   // Opening a conversation clears its unread badge.
   state.unreadCount.set(peerId, 0);
+  // v1.2.4 修 (2026-07-11 14:43): 单一 source of truth —
+  // lastReadIdx 推到当前 inCount, 切过去时 in - lastRead = 0
+  // = 清 0。注意 History 重新拉后 state.history 是历史快照,
+  // 然后 message:event handler 会 push 新 in 消息 — 但 selectPeer
+  // 是同步路径, 这里先 set lastReadIdx, 后续 in 走完会再重算。
+  // renderPeerList 会从当前 state.history 数 in 重算 unread。
   try {
     const h = await History(peerId);
     state.history.set(peerId, (h as node.Message[]) || []);
+    const inCount = (h || []).filter((m: any) => m.Direction === 'in').length;
+    state.lastReadIdx.set(peerId, inCount);
+    state.unreadCount.set(peerId, 0);
   } catch (e) {
     state.history.set(peerId, []);
+    state.lastReadIdx.set(peerId, 0);
+    state.unreadCount.set(peerId, 0);
     toast(`读取历史失败: ${e}`);
   }
   renderPeerList();
@@ -1289,6 +1422,13 @@ async function selectPeer(peerId: string) {
 // selectPeer but calls HistoryGroup (per-group chat.enc)
 // instead of History (per-peer chat.enc). v1.1 (2026-06-28).
 async function selectGroup(renderedID: string) {
+  // v1.2.4 (2026-07-11): unhide chat-pane (was hidden
+  // by default per chat-demo.html 拍板 empty right section).
+  const pane = document.getElementById('chat-pane');
+  const spacer = document.getElementById('chat-pane-spacer');
+  if (pane) pane.hidden = false;
+  if (spacer) spacer.hidden = true;
+  addChatMember(renderedID);
   // v1.1.4 (2026-07-02) — same per-conversation draft
   // swap as selectPeer; see that function's comment
   // for the rationale.
@@ -1303,11 +1443,19 @@ async function selectGroup(renderedID: string) {
   // re-render both lists (the active highlight lives in
   // different DOM nodes for the two sections).
   state.groupUnread.set(renderedID, 0);
+  // v1.2.4 修 (2026-07-11 14:43): 单一 source of truth — 跟
+  // selectPeer 一样, lastReadIdx 推到当前 inCount 切过去时清 0。
   try {
     const r = await HistoryGroup(renderedID);
-    state.history.set(renderedID, (r && r.messages) || []);
+    const msgs = (r && r.messages) || [];
+    state.history.set(renderedID, msgs);
+    const inCount = msgs.filter(m => m.Direction === 'in').length;
+    state.lastReadIdx.set(renderedID, inCount);
+    state.groupUnread.set(renderedID, 0);
   } catch (e) {
     state.history.set(renderedID, []);
+    state.lastReadIdx.set(renderedID, 0);
+    state.groupUnread.set(renderedID, 0);
     toast(`读取群历史失败: ${e}`);
   }
   renderPeerList();
@@ -1324,14 +1472,142 @@ async function selectGroup(renderedID: string) {
 // keep the active highlight in sync across both sections
 // (a peer can become selected, an active group gets
 // unselected, etc.). v1.1 (2026-06-28).
+// v1.2.4 (2026-07-11): view 切换 — setView flips
+// sidebar-list middle column between "消息" (chat list)
+// and "通讯录" (peer + group directory). Toggles
+// data-view on #sidebar-list; CSS picks which .list-*
+// is visible. Also flips .active class on rail icons.
+function setView(v: 'chat' | 'contacts') {
+  state.view = v;
+  const list = document.getElementById('sidebar-list');
+  if (list) list.dataset.view = v;
+  const rc = document.getElementById('rail-view-chat');
+  const rco = document.getElementById('rail-view-contacts');
+  if (rc) rc.classList.toggle('active', v === 'chat');
+  if (rco) rco.classList.toggle('active', v === 'contacts');
+  // Re-render the just-shown list so it has fresh data
+  // (the other list is kept rendered in the DOM, just
+  // display:none — no re-mount flicker).
+  if (v === 'contacts') renderContactList();
+}
+
+// v1.2.4 (2026-07-11): B 折中 — every incoming message
+// from a peer/group auto-adds that ID to chatList. Also
+// every group you're a member of. User explicitly
+// selecting a peer/group also adds. Once in chatList,
+// the row shows up in the chat view; the contacts view
+// marks it with a small "已加" pill.
+function addChatMember(id: string) {
+  if (!id) return;
+  if (!state.chatList) state.chatList = new Set<string>();
+  if (state.chatList.has(id)) return;
+  state.chatList.add(id);
+}
+
+// v1.2.4 (2026-07-11): render the contacts directory —
+// every discovered peer + group. No "已加" pill: the
+// v1.2.2 design used online/offline LED + IP/最近在线 in
+// the meta line to convey status; chatList membership is
+// a private book-keeping concern that the user does not
+// want surfaced in the UI.
+function renderContactList() {
+  const list = document.getElementById('list-contacts');
+  if (!list) return;
+  const rows: string[] = [];
+  // Peers first
+  for (const p of state.peers) {
+    const display = peerDisplay(p);
+    const ip = p.Addrs[0]?.split(':')[0] || '';
+    const st = peerState(p);
+    const ledCls = st === 'online' ? 'online' : (st === 'recent' ? 'recent' : 'offline');
+    const statusText = st === 'online'
+      ? `在线 · ${escapeHtml(ip)}`
+      : (st === 'recent'
+        ? `最近 · ${escapeHtml(ip)}`
+        : (p.LastSeen ? `离线 · 上次在线 ${escapeHtml(timeAgo(p.LastSeen, false))}` : '离线'));
+    rows.push(`
+      <div class="contact-item" data-peer="${escapeHtml(p.PeerID)}">
+        <div class="avatar">${escapeHtml(avatarChar(display))}</div>
+        <div class="info">
+          <div class="name">${escapeHtml(display)}</div>
+          <div class="meta"><span class="status-led ${ledCls}"></span>${statusText}</div>
+        </div>
+      </div>
+    `);
+  }
+  // Then groups
+  for (const g of state.groups) {
+    rows.push(`
+      <div class="contact-item" data-group="${escapeHtml(g.group_id)}">
+        <div class="avatar empty">${escapeHtml(avatarChar(g.group_name || '#'))}</div>
+        <div class="info">
+          <div class="name">${escapeHtml(g.group_name || '(未命名群组)')}</div>
+          <div class="meta">${g.members.length} 成员</div>
+        </div>
+      </div>
+    `);
+  }
+  if (rows.length === 0) {
+    list.innerHTML = '';
+    return;
+  }
+  list.innerHTML = rows.join('');
+  // Click a contact row to add to chat list and switch to chat view
+  list.querySelectorAll<HTMLElement>('.contact-item').forEach(el => {
+    el.addEventListener('click', () => {
+      const peer = el.getAttribute('data-peer');
+      const group = el.getAttribute('data-group');
+      const id = peer || group || '';
+      if (id) addChatMember(id);
+      setView('chat');
+      if (peer) selectPeer(peer);
+      else if (group) selectGroup(group);
+    });
+  });
+}
+
 function renderChatList() {
-  renderGroupList();
+  // v1.2.4 (2026-07-11): 消息 view 只显示 chatList —
+  // 已聊过的 peer / 群 (selectPeer / selectGroup 触发
+  // addChatMember 加进去)。不是镜像全 peer 列表。新发现
+  // 的 peer 默认只在通讯录 view 出现。
+  //
+  // 我们复用 v1.2.2 的 #group-list + #peer-list 容器
+  // (hidden) 里的 .peer 节点 — renderPeerList /
+  // renderGroupList 写到那里 — 但只在 chatList 里的才
+  // clone 到 #list-chat 可见。空 list 留空 (没有"还没有
+  // 对话"placeholder / "通讯录"提示 pill — 跟 demo 拍板
+  // 一致)。
+  const g = document.getElementById('group-list');
+  const p = document.getElementById('peer-list');
+  const out = document.getElementById('list-chat');
+  if (!out) { renderGroupList(); return; }
+  const rows: string[] = [];
+  if (g) {
+    g.querySelectorAll<HTMLElement>('.peer').forEach(el => {
+      const id = el.getAttribute('data-group');
+      if (id && state.chatList?.has(id)) rows.push(el.outerHTML);
+    });
+  }
+  if (p) {
+    p.querySelectorAll<HTMLElement>('.peer').forEach(el => {
+      const id = el.getAttribute('data-peer');
+      if (id && state.chatList?.has(id)) rows.push(el.outerHTML);
+    });
+  }
+  out.innerHTML = rows.join('');
 }
 
 async function refreshAll() {
   try {
-    const peers = (await ListPeers()) as node.PeerInfo[];
-    state.selfId = await SelfPeerID();
+    // v1.2.4 (2026-07-11): defensive null check — if Wails
+    // runtime isn't ready yet (ListPeers returns null/undefined
+    // on the very first tick before bindings are wired), the
+    // .filter() below would throw "Cannot read properties of
+    // null". Treat null as empty.
+    const raw = await ListPeers();
+    const peers = (Array.isArray(raw) ? raw : []) as node.PeerInfo[];
+    state.selfId = (await SelfPeerID()) || '';
     // Filter self defensively (see comment in innerlink
     // release notes; without the PeerID fallback, self
     // sometimes leaks into the peer list and shows up
@@ -1341,9 +1617,19 @@ async function refreshAll() {
     // Also load groups — the sidebar's "群组" section
     // reflects the on-disk group roster. v1.1 (2026-06-28).
     await loadGroups();
+    // v1.2.4 (2026-07-11): B 折中 — every group you're a
+    // member of is auto-added to chatList so its row shows
+    // up in the chat view.
+    for (const g of state.groups) if (g.self) addChatMember(g.group_id);
     renderMe();
     renderPeerList();
     renderGroupList();
+    // v1.2.4 (2026-07-11): mirror #group-list + #peer-list
+    // content into the visible #list-chat.
+    renderChatList();
+    // v1.2.4 (2026-07-11): also re-render the contacts
+    // list if it's currently the visible view.
+    if (state.view === 'contacts') renderContactList();
     renderChatHeader();
     if (state.selectedId) {
       const stillThere = isGroupId(state.selectedId)
@@ -1687,6 +1973,10 @@ async function onGroupEvent(ev: any) {
   // success in real time).
   const prevCount = state.groups.find(g => g.group_id === ev.GroupID)?.members?.length ?? -1;
   await loadGroups();
+  // v1.2.4 (2026-07-11): B 折中 — every group you're a
+  // member of is auto-added to chatList so the row shows
+  // up in the chat view.
+  for (const g of state.groups) if (g.self) addChatMember(g.group_id);
   renderGroupList();
   if (ev.Type === 'removed') {
     if (state.selectedId === ev.GroupID) {
@@ -2996,6 +3286,60 @@ function wireEvents() {
 
   // Sidebar footer mini buttons.
   document.getElementById('btn-scan')!.addEventListener('click', () => promptScan());
+
+  // v1.2.4: rail-view icons flip sidebar-list middle column
+  // between "chat" and "contacts". setView is a no-op when
+  // state.view already matches; it also re-renders the
+  // contacts list on switch so it has fresh data.
+  document.getElementById('rail-view-chat')?.addEventListener('click', () => setView('chat'));
+  document.getElementById('rail-view-contacts')?.addEventListener('click', () => setView('contacts'));
+  // v1.2.4 修 (2026-07-11 14:18): #list-chat 是从 #peer-list / #group-list
+  // outerHTML clone 出来的 — outerHTML 不带 event listener, 所以 chat
+  // 列表的 row 点不动。用事件委托在容器上, 一次绑好 innerHTML 换不换都
+  // 有效。peer / group 分支跟 renderPeerList / renderGroupList 原始绑定
+  // 路径保持一致。
+  document.getElementById('list-chat')?.addEventListener('click', (ev) => {
+    const t = ev.target as HTMLElement | null;
+    if (!t) return;
+    const row = t.closest('.peer') as HTMLElement | null;
+    if (!row) return;
+    const pid = row.getAttribute('data-peer');
+    if (pid) { void selectPeer(pid); return; }
+    const gid = row.getAttribute('data-group');
+    if (gid) { void selectGroup(gid); }
+  });
+  // v1.2.4: rail-scan icon = manual CIDR scan. The hidden
+  // #btn-scan in the legacy footer path still works (it
+  // shares the same promptScan() handler).
+  document.getElementById('rail-scan')?.addEventListener('click', () => promptScan());
+
+  // v1.2.4: search box filters whichever view is active.
+  document.getElementById('sidebar-search')?.addEventListener('input', () => {
+    const q = (document.getElementById('sidebar-search') as HTMLInputElement | null)?.value.trim().toLowerCase() || '';
+    if (state.view === 'chat') {
+      // Filter the chat list by re-rendering with q
+      const out = document.getElementById('list-chat');
+      if (!out) return;
+      // The chat list is a mirror of #group-list + #peer-list;
+      // we re-mirror with a substring filter on the visible rows.
+      const gHtml = document.getElementById('group-list')?.innerHTML || '';
+      const pHtml = document.getElementById('peer-list')?.innerHTML || '';
+      out.innerHTML = gHtml + pHtml;
+      // Best-effort hide non-matching rows
+      out.querySelectorAll<HTMLElement>('.peer').forEach(el => {
+        const txt = el.textContent || '';
+        el.style.display = !q || txt.toLowerCase().includes(q) ? '' : 'none';
+      });
+    } else {
+      renderContactList();
+      const out = document.getElementById('list-contacts');
+      if (!out) return;
+      out.querySelectorAll<HTMLElement>('.contact-item').forEach(el => {
+        const txt = el.textContent || '';
+        el.style.display = !q || txt.toLowerCase().includes(q) ? '' : 'none';
+      });
+    }
+  });
   // Debug "测试" button in the sidebar footer. Calls the
   // Go-side DebugReveal / DebugOpen which snapshot the
   // process table before and after the launch to detect
@@ -3410,6 +3754,10 @@ function wireEvents() {
     // refresh the drawer if it's open (cheap).
     if (state.historyDrawerOpen) void refreshHistoryList();
   });
+  // v1.2.4 (2026-07-11): after every refreshAll the chat
+  // list mirror needs to re-sync to #list-chat (since
+  // #group-list / #peer-list contents changed).
+  // Hook into refreshAll via a thin wrapper.
   // v1.1 (2026-06-28): group lifecycle events from Go.
   // Triggered by:
   //   - pkg/node CreateGroup (we just created a group)
@@ -3434,18 +3782,41 @@ function wireEvents() {
     const list = state.history.get(m.PeerID) || [];
     list.push(m);
     state.history.set(m.PeerID, list);
+    // v1.2.4 修 (2026-07-11 13:08): 撤销 "in 消息不自动加 chatList"
+    // 拍板。原因: 7/11 13:08 user 反馈"对面消息框不出现不合理" —
+    // 即便 user 没点通讯录里的人, 消息 tab (#list-chat) 也应该
+    // 立即出现消息项。改回 in 消息一来就 addChatMember + renderChatList,
+    // 同时 renderPeerList/renderGroupList (联系人 view 也立即出现 row,
+    // 不加"已加" pill — pill 拍板版已删)。
+    if (m.Direction === 'in') addChatMember(m.PeerID);
+    renderChatList();
+    // v1.2.4 修 (2026-07-11 14:18): in 消息总是 +1 unread, 即便
+    // selectedId === m.PeerID 也算。原因是 7/11 14:18 user 反馈
+    // "发了 5 条显示 4 红点" — 之前 selectedId === PeerID 时跳过
+    // 累加, 导致 in 消息数 ≠ 红点数。切到 PeerID 时 selectPeer
+    // 仍清 0 (line 1328), 所以 badge 行为合理: 在别处看时是
+    // 累积的 "未读" 数, 切过去时一次清 0, 不会 double-count。
     if (state.selectedId === m.PeerID) {
       renderMessages();
-    } else if (m.Direction === 'in') {
-      if (isGroupId(m.PeerID)) {
-        const n = (state.groupUnread.get(m.PeerID) || 0) + 1;
-        state.groupUnread.set(m.PeerID, n);
-        renderGroupList();
-      } else {
-        const n = (state.unreadCount.get(m.PeerID) || 0) + 1;
-        state.unreadCount.set(m.PeerID, n);
-        renderPeerList();
-      }
+    }
+    // v1.2.4 修 (2026-07-11 14:43): 7/11 14:30 user 反馈
+    // "发 8 显示 7" / 14:42 "发 5 显示 4", +1 累加路径 root
+    // cause 没找准, **改用 state.history 直接数 in 数**。
+    // 累加 Map 之前一直丢 1, 现在单一 source of truth — state.history.
+    // 渲染时 (renderPeerList / renderChatList) 用
+    // inCount - lastReadIdx[peerId] 算 unread。selectedId 切到
+    // PeerID 时 selectPeer / selectGroup 把 lastReadIdx[peerId]
+    // 推到当前 inCount, 实现"切过去时清 0"。
+    //
+    // 这里只 push + set + addChatMember + renderChatList, 不再
+    // +1 累加, 不再兜底。in / out 都不动 unreadCount Map。
+    if (m.Direction === 'in') {
+      if (isGroupId(m.PeerID)) renderGroupList();
+      else renderPeerList();
+    } else if (m.Direction === 'out') {
+      // out 消息也调一次 render, 让 list / 行实时更新最近时间
+      if (isGroupId(m.PeerID)) renderGroupList();
+      else renderPeerList();
     }
     // Live-update the history drawer if it's open so
     // new messages appear without a manual refresh.
