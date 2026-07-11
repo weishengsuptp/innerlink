@@ -1,4 +1,4 @@
-// innerlink frontend — vanilla TypeScript, no framework.
+﻿// innerlink frontend — vanilla TypeScript, no framework.
 //
 // Layout & visuals: v0.1 UI design mockup
 // (D:\mavis-tmp\innerlink-ui-mockup.html). All
@@ -139,14 +139,37 @@ interface UIState {
   // 显示完整 inCount。不用累加 Map, 不用 lastReadIdx 游标。
   // state.unreadCount / groupUnread 字段保留 (避免破坏引用)
   // 但不在渲染路径上用。
+  //
+  // v1.2.4+ 08:55 改回: user 8:55 报新语义, 未读 = filter
+  // in - lastReadIdx[peerId] (切走后对方发 in 数, 不算 self
+  // out). state.unreadCount / state.groupUnread 重新启用,
+  // renderPeerList / renderContactList / renderGroupList 算
+  // c = state.unreadCount.get / state.groupUnread.get, 渲染
+  // 时不算 selectedId 特殊清 0 (清 0 在 selectPeer / selectGroup
+  // 末尾通过 lastReadIdx = filter in 实现).
   unreadCount: Map<string, number>;
-  // lastReadIdx: 7/11 15:43 标记 deprecated, 不再用。
-  // 见上方注释 + renderPeerList / renderChatList 实现。
+  // v1.2.4+ 08:55 重新启用 lastReadIdx — 7/11 15:43 标记
+  // deprecated 后 21:55 / 22:56 改成 state.history.filter in
+  // 累加, user 8:55 报跟"切走新增" 不一致 (切到 A + 切走 A
+  // 后 in 仍算 in, 永远累加, user 期望 1 红点 实际 3 红点).
+  // 重新启用 lastReadIdx: 切到 chat 时 set lastReadIdx[peerId]
+  // = filter in (清 0), 切走后收 in 时 unreadCount[peerId] =
+  // filter in - lastReadIdx[peerId] (切走新增 in). 持久化到
+  // localStorage, 重启后保留.
   lastReadIdx: Map<string, number>;
   // groupUnread: rendered group ID -> incoming unread count
   // (mirrors unreadCount but for group conversations; they
   // share the same conversation-key routing).
   groupUnread: Map<string, number>;
+  // v1.2.4+ 08:55 sending: send 期间 true 防止多倍发送 —
+  // user 8:51-8:53 阶段连敲回车 trace 看到 11 条重复消息
+  // 全发出去 (有 3-4 字节短消息重复 3-5 次). 根因: form
+  // submit async, input.value = "" 在 SendText 完成之后
+  // 才清空, 期间 user 再敲回车 input 还有内容 -> requestSubmit
+  // 多次 -> SendText 多次. 修法: state.sending flag, send
+  // 期间 true 拒绝新 submit + Enter keydown. try/finally
+  // 失败也立即释放.
+  sending: boolean;
   // fileBubbles: fileID -> file-bubble state. Picker
   // route creates a placeholder bubble the moment the
   // user picks a file (so the UI shows progress even
@@ -209,11 +232,22 @@ const state: UIState = {
   draftsLoaded: false,
   nearBottom: true,
   unreadCount: new Map(),
-  // v1.2.4 修 (2026-07-11 14:43): 单一 source of truth — 改用
-  // state.history 算 unread, lastReadIdx 记录 user 切到 peer
-  // 时已读到的 in 消息数。详见 state interface 注释。
+  // v1.2.4+ 08:55 重新启用 lastReadIdx — 之前 7/11 15:43
+  // 拍板说"deprecated 不用" 改成 state.history.filter in
+  // 累加. user 8:55 报新语义: 切到 chat 时记录 in 数,
+  // 红点 = filter in - lastReadIdx[peerId] (切走后对方发 in
+  // 数, 不算 self out). user 期望 1 in 1 红点 / 5 in 5 红点
+  // / 切到 A 清 0 / 切走 A 收 in +1. 14:18 拍板"累计 in"
+  // 在切到 A + 切走 A 后 in 仍算 in, 跟 user 期望"切走新增"
+  // 不一致. 8:55 改回 lastReadIdx 语义. 持久化到
+  // localStorage (line 200+) 让重启后保留.
   lastReadIdx: new Map(),
   groupUnread: new Map(),
+  // v1.2.4+ 08:55 加 state.sending — send 期间 true, 防止
+  // user 8:51-8:53 阶段连敲回车多倍发送 (trace 看到 11 条
+  // 重复消息全发出去). form submit + Enter keydown 都先判
+  // state.sending, 在的话拒绝.
+  sending: false,
   fileBubbles: new Map(),
   historyDrawerOpen: false,
   groupSettingsDrawerOpen: false,
@@ -228,6 +262,46 @@ const state: UIState = {
   // these with a small "已加" pill.
   chatList: new Set<string>(),
 };
+
+// ----- 持久化: selectedId + lastReadIdx -----
+// v1.2.4+ 08:55: user 报"关闭前 selectedId = A,
+// 重启后 selectedId = null" + "关闭前 A 红点 = 0,
+// 重启后 A 红点 = X" — 关闭前的 selectedId / 切到 chat
+// 时记录的 lastReadIdx 必须保留. localStorage 是
+// frontend 持久化最简单方案 (不动 Go 端), 重启后
+// loadPersisted() 读回来, 跟之前 startup 拉 history
+// 同步 unread = filter in - lastReadIdx 配合.
+const PERSIST_KEY = 'innerlink:state:v1';
+
+function loadPersisted(): void {
+  try {
+    const raw = localStorage.getItem(PERSIST_KEY);
+    if (!raw) return;
+    const data = JSON.parse(raw);
+    if (typeof data.selectedId === 'string' && data.selectedId) {
+      state.selectedId = data.selectedId;
+    }
+    if (data.lastReadIdx && typeof data.lastReadIdx === 'object') {
+      for (const [k, v] of Object.entries(data.lastReadIdx)) {
+        if (typeof v === 'number') state.lastReadIdx.set(k, v);
+      }
+    }
+  } catch {
+    // ignore — first launch or corrupt state
+  }
+}
+
+function savePersisted(): void {
+  try {
+    const data = {
+      selectedId: state.selectedId,
+      lastReadIdx: Object.fromEntries(state.lastReadIdx),
+    };
+    localStorage.setItem(PERSIST_KEY, JSON.stringify(data));
+  } catch {
+    // ignore — localStorage 满了或禁用
+  }
+}
 
 // isGroupId reports whether the conversation key is a
 // rendered GroupID ("g_<64hex>"). Used everywhere we have
@@ -310,16 +384,18 @@ function fmtTime(ts: any): string {
   return d.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
 }
 
-// avatarChar picks the first character for the avatar
-// circle. Chinese names use the first character;
-// everything else falls back to the first 1-2 letters
-// uppercased. Falls back to "?" for empty.
+// avatarChar picks characters for the avatar circle.
+// v1.2.4+ 11:23 user 拍板:
+//   - 名字 1 字: 取 1 字
+//   - 名字 2 字: 取最后 1 字 (如 大牛 -> 牛)
+//   - 名字 3+ 字: 取最后 2 字 (如 大牛子 -> 牛子)
+// CJK 跟非 CJK 都按这个规则 (非 CJK 用大写).
+// Fallback ? for empty.
 function avatarChar(name: string): string {
   if (!name) return '?';
-  // CJK ideographs: first code point
-  const c = name.codePointAt(0);
-  if (c && c >= 0x4e00 && c <= 0x9fff) return name.slice(0, 1);
-  return name.slice(0, 2).toUpperCase();
+  if (name.length === 1) return name;
+  if (name.length === 2) return name.slice(-1);
+  return name.slice(-2);
 }
 
 // peerState classifies a peer into one of three states
@@ -543,7 +619,7 @@ function mount() {
         <!-- v1.2.2 hidden IDs (wireEvents + render 函数都引用
              这些 ID；保留在 DOM 中即可，display:none 不影响
              querySelector 找到元素 + render 函数更新文本) -->
-        <span class="me-hidden" hidden>
+         <span class="me-hidden" hidden>
           <span id="me-name">—</span>
           <span id="me-host">本机 · —</span>
           <span id="me-status">启动中…</span>
@@ -551,7 +627,13 @@ function mount() {
           <span id="group-count">0</span>
           <span id="peer-online">0</span>
           <span id="peer-count">0</span>
-          <button id="btn-create-group">+</button>
+          <!-- v1.2.4+ 11:40 恢复: 之前 11:23 删了 #btn-scan /
+               #btn-test-reveal 两个按钮, 但 wireEvents 还引用
+               这俩 (line 3443, 3504), getElementById 返回 null,
+               加 .addEventListener 报 throw, 整个 wireEvents
+               失败, 所有按钮都失效 (user 11:40 报). 加回这两个
+               hidden 按钮, wireEvents 继续能绑. btn-create-group
+               不加回 (search-bar line 644 那个唯一, 已能工作). -->
           <button id="btn-scan">scan</button>
           <button id="btn-test-reveal">测试</button>
         </span>
@@ -770,17 +852,26 @@ function renderMe() {
   const host = document.getElementById('me-host')!;
   const status = document.getElementById('me-status')!;
   const meBox = document.querySelector('.me')!;
+  const rail = document.getElementById('rail-avatar');
   if (!self) {
     name.textContent = '—';
     host.textContent = '本机 · —';
     status.textContent = '启动中…';
     meBox.classList.remove('me-clickable');
+    if (rail) rail.textContent = '?';
     return;
   }
-  // Self display-name: alias wins (set by the user via
-  // SetMyAlias), else hostname. If unset, show a hint
-  // "点我设置" so the user knows they CAN set one.
-  const display = self.SelfAlias || self.Hostname || '';
+  // Self display-name: alias only (set by the user via
+  // SetMyAlias). If unset, show a hint "点我设置" so the
+  // user knows they CAN set one. **No Hostname fallback**
+  // — user 12:13 报"默认不是没有改的情况下是问号么, 主
+  // 机缩写那个是你定义的, 这个就是没改的状态, 应该是问
+  // 号, 你设计有问题" — 用户期望"未设置 alias = ?",
+  // 拿 host 缩写填头像跟"未改"语义冲突 (误导用户以为自
+  // 己改过了). 11:23 当时拍 alias-wins-else-host 是错
+  // 的, 12:13 改回 strict: 没 alias 就 ? (avatarChar('')
+  // 已经 return '?').
+  const display = self.SelfAlias || '';
   if (self.SelfAlias) {
     name.textContent = self.SelfAlias;
     meBox.classList.add('me-set');
@@ -790,6 +881,14 @@ function renderMe() {
     meBox.classList.add('me-clickable');
     meBox.classList.remove('me-set');
   }
+  // v1.2.4+ 12:13 rail-avatar: avatarChar('') 返 '?'
+  // (avatarChar line 395 if (!name) return '?'), 没 alias
+  // 自动就是 ?. 有 alias 走 1/2/3+ 字规则 (avatarChar
+  // line 394-399). 11:55 v1 的"改名前不更新"问题 — 用
+  // alias 直接 (不带 hostname fallback) — renderMe 每次
+  // 都跑, 改名后 rail 立刻同步. 居中问题在 .me CSS
+  // (style.css line 298 改 flex column center) 修.
+  if (rail) rail.textContent = avatarChar(display);
   const ip = self.Addrs[0]?.split(':')[0] || '—';
   // Sub: "本机 · IP · host · peerID-prefix" — peerID is
   // intentionally omitted from the *display* name above
@@ -836,6 +935,29 @@ function renderPeerList() {
     // 16:55 改法 (unread = inCount 永远) 不撤回 — 那是
     // 兜底, 但 selectPeer 末尾清 0 优先。
     const unread = state.unreadCount.get(p.PeerID) || 0;
+    // v1.2.4+ 诊断 (2026-07-11 21:45): +1 累加
+    // trace 1,2,3,4 都对 (state.unreadCount 累加正常),
+    // 但 renderPeerList 算 c 时 p.PeerID 跟 trace
+    // peer 也许不一致导致 4 红点变 1. 加 render trace
+    // 写 c 实际值 + sel, 看是不是 row peer 算错.
+    //
+    // v1.2.4+ 08:55 改回: has_in_state 跟 UI 一致用
+    // filter in (跟 state.unreadCount 算法一致: filter
+    // in - lastReadIdx). user 8:55 报"未读 = 切走 chat
+    // 后对方发 in 数" (不算 self out), trace has_in_state
+    // 也用 filter in. 22:56 改的 list.length 是错的, 改
+    // 回 filter in 跟 UI 算 c = state.unreadCount.get
+    // 算法对齐, 方便诊断 uc != has_in_state 时区分是
+    // lastReadIdx 偏移还是其他.
+    try {
+      (window as any).runtime?.EventsEmit?.('frontend:trace', JSON.stringify({
+        kind: 'render_uc',
+        peer: p.PeerID.slice(0, 12),
+        uc: unread,
+        sel: state.selectedId?.slice(0, 12) ?? '',
+        has_in_state: (state.history.get(p.PeerID) || []).filter(m => m.Direction === 'in').length,
+      }));
+    } catch { /* ignore */ }
     const name = peerDisplay(p);
     // Meta line: <display-name> · IP
     // display-name falls back through alias → hostname
@@ -921,6 +1043,22 @@ function renderGroupList() {
     // （UDP 监听中 + 至少一个 IP；这跟 self header 那边的
     // 判定一致，避免两个地方写两套逻辑）。
     // v1.1.1 (2026-06-30) hotfix.
+    // v1.2.4+ 14:22 user 14:22 拍板: chat list 群 row
+    // (renderGroupList 输出, 也是 #list-chat 里的 .peer
+    // .group) 基础内容"X 在线"不能删. 之前 14:18 / 17:11
+    // 多次拍板的"X 在线"计算方式 (self 在内, UDP 监听中,
+    // 跟 self header 那边的判定一致, 避免两个地方写两套
+    // 逻辑) 是 user 多次修过的, 我 12:13 误以为"3 成员
+    // 重复"删了是错的. 修: 加回 onlineCount + selfOnline
+    // + onlineLabel 计算, meta 保持 "X 成员 · X 在线".
+    //
+    // "X 在线" 数字包含 self —— 因为 self 永远在群里
+    // (这是 sidebar 列出这个群的前提 = g.self === true),
+    // 把 self 排除会让用户看着"群主本人不在线?"——其实
+    // 他只是在看自己的视角, 当然在. self 用 state.selfEntry
+    // 的设备级状态判断在线 (UDP 监听中 + 至少一个 IP; 这
+    // 跟 self header 那边的判定一致, 避免两个地方写两套
+    // 逻辑). v1.1.1 (2026-06-30) hotfix.
     const selfOnline = (state.selfEntry?.Addrs?.length ?? 0) > 0;
     const onlineCount = g.members.filter(m =>
       (m === state.selfId && selfOnline) ||
@@ -930,7 +1068,7 @@ function renderGroupList() {
     const onlineLabel = onlineCount > 0 ? ` · ${onlineCount} 在线` : '';
     return `
       <div class="peer group ${g.group_id === state.selectedId ? 'active' : ''}" data-group="${escapeHtml(g.group_id)}">
-        <span class="peer-dot ${g.self ? 'online' : 'offline'}"></span>
+        <span class="peer-dot">${escapeHtml(avatarChar(g.group_name || ''))}</span>
         <div class="peer-info">
           <div class="peer-name">${escapeHtml(g.group_name || '(未命名群组)')}</div>
           <div class="peer-meta">${memberLabel}${onlineLabel}</div>
@@ -1392,21 +1530,41 @@ async function selectPeer(peerId: string) {
 
   state.selectedId = peerId;
   state.draftsLoaded = true;
-  // Opening a conversation clears its unread badge.
-  state.unreadCount.set(peerId, 0);
-  // v1.2.4 修 (2026-07-11 15:43): 最简方案 — 不用 lastReadIdx,
-  // 渲染时直接 selectedId === peerId ? 0 : inCount。selectPeer
-  // 只需 reload history + renderPeerList, 渲染时自动显示 0。
+  // v1.2.4+ 08:55 重新启用 lastReadIdx 语义 — 切到 chat 时
+  // 记录当前 in 数, 切走后收 in 时 unreadCount[peerId] =
+  // filter in - lastReadIdx[peerId] (切走新增 in). 之前 7/11
+  // 15:43 拍板"selectedId === peerId 时显示 0" 走 selectedId
+  // 特殊清 0 路径, user 8:55 报跟"切走新增" 不一致, 改回
+  // lastReadIdx 显式游标. selectPeer 末尾 set lastReadIdx =
+  // filter in 实现"切到 chat 清 0" + 持久化 lastReadIdx 让
+  // 重启后保留.
   try {
     const h = await History(peerId);
-    state.history.set(peerId, (h as node.Message[]) || []);
+    const msgs = (h as node.Message[]) || [];
+    state.history.set(peerId, msgs);
+    const inCount = msgs.filter(x => x.Direction === 'in').length;
+    state.lastReadIdx.set(peerId, inCount);
     state.unreadCount.set(peerId, 0);
+    savePersisted();
   } catch (e) {
     state.history.set(peerId, []);
+    state.lastReadIdx.set(peerId, 0);
     state.unreadCount.set(peerId, 0);
+    savePersisted();
     toast(`读取历史失败: ${e}`);
   }
   renderPeerList();
+  // v1.2.4+ 16:51 user 报"从群聊点击其他聊天, 群聊还
+  // 是绿色底纹, 还是像被选中的状态" - selectPeer
+  // 末尾漏了 renderGroupList. #group-list 里的
+  // .peer.group active class 还保持上次 selectGroup
+  // 时的 active 状态, renderChatList 把 #group-list
+  // (带 active 群 row) clone 到 #list-chat → 群 row
+  // 仍 active 绿底. selectGroup 末尾 (line 1608-1616)
+  // 3 个都调了 (renderPeerList + renderGroupList +
+  // renderChatList), selectPeer 漏了 renderGroupList.
+  // 修: 加 renderGroupList, 跟 selectGroup 末尾对称.
+  renderGroupList();
   renderChatList();
   renderChatHeader();
   renderMessages();
@@ -1440,20 +1598,33 @@ async function selectGroup(renderedID: string) {
   // Group sidebar entry uses .group class, so we need to
   // re-render both lists (the active highlight lives in
   // different DOM nodes for the two sections).
-  state.groupUnread.set(renderedID, 0);
-  // v1.2.4 修 (2026-07-11 15:43): 跟 selectPeer 同 — 不用
-  // lastReadIdx, 渲染时直接 selectedId === groupId ? 0 : inCount。
+  // v1.2.4+ 08:55 跟 selectPeer 同 — 重新启用 lastReadIdx,
+  // 切到 group chat 时 set lastReadIdx[groupId] = filter in
+  // 实现"切到 chat 清 0" + 持久化.
   try {
     const r = await HistoryGroup(renderedID);
-    state.history.set(renderedID, (r && r.messages) || []);
+    const msgs = (r && r.messages) || [];
+    state.history.set(renderedID, msgs);
+    const inCount = msgs.filter(x => x.Direction === 'in').length;
+    state.lastReadIdx.set(renderedID, inCount);
     state.groupUnread.set(renderedID, 0);
+    savePersisted();
   } catch (e) {
     state.history.set(renderedID, []);
+    state.lastReadIdx.set(renderedID, 0);
     state.groupUnread.set(renderedID, 0);
+    savePersisted();
     toast(`读取群历史失败: ${e}`);
   }
   renderPeerList();
   renderGroupList();
+  // v1.2.4+ 11:55 修 user 11:55 报"建群之后, 消息列表里
+  // 没有出现群消息项" — selectGroup 末尾漏了 renderChatList
+  // (chat view #list-chat 那个列表, 从 #group-list / #peer-list
+  // clone .peer 节点 outerHTML). selectPeer 末尾 (line 1524) 调
+  // 了 renderChatList 但 selectGroup 末尾没调, 建群后 selectGroup
+  // (groupId) 没刷新 #list-chat, 群 row 不出现. 修: 加 renderChatList.
+  renderChatList();
   renderChatHeader();
   renderMessages();
   // Load the draft for the new selection.
@@ -1504,50 +1675,50 @@ function addChatMember(id: string) {
 // the meta line to convey status; chatList membership is
 // a private book-keeping concern that the user does not
 // want surfaced in the UI.
+// v1.2.4+ 修 (2026-07-11 22:15): 加 unread badge
+// 跟 renderPeerList 一样 — user 22:12 报 1 in 0
+// 红点, 真根因是 R 不显示 badge, 1 in 真的 1 红点
+// 但 contacts view 不显示 (跟 chat view #list-chat
+// 走 L clone outerHTML 含 badge 不一样).
 function renderContactList() {
+  // v1.2.4+ 11:23 鏀? contacts view 璺?chat view 瀹屽叏
+  // 鐙珛妯℃澘 - 绱у噾琛? 鍙樉绀?澶村儚 + 鍚嶅瓧 + IP, 涓嶆樉
+  // 绀?status (online/recent/offline) 涔熶笉鏄剧ず badge /
+  // 绾㈢偣. user 11:23 鎶? 閫氳褰曟槸绾ソ鍙嬪睍绀? 涓€琛岀揣鍑?
+  // click handler 璺熶箣鍓嶄竴鏍?(鍔?chatList + 鍒囧埌 chat
+  // view + selectPeer/selectGroup) - 鐐瑰嚮璺宠浆 chat 鍔熻兘涓嶅彉.
   const list = document.getElementById('list-contacts');
   if (!list) return;
-  const rows: string[] = [];
-  // Peers first
+  const rows = [];
   for (const p of state.peers) {
     const display = peerDisplay(p);
     const ip = p.Addrs[0]?.split(':')[0] || '';
-    const st = peerState(p);
-    const ledCls = st === 'online' ? 'online' : (st === 'recent' ? 'recent' : 'offline');
-    const statusText = st === 'online'
-      ? `在线 · ${escapeHtml(ip)}`
-      : (st === 'recent'
-        ? `最近 · ${escapeHtml(ip)}`
-        : (p.LastSeen ? `离线 · 上次在线 ${escapeHtml(timeAgo(p.LastSeen, false))}` : '离线'));
-    rows.push(`
-      <div class="contact-item" data-peer="${escapeHtml(p.PeerID)}">
-        <div class="avatar">${escapeHtml(avatarChar(display))}</div>
-        <div class="info">
-          <div class="name">${escapeHtml(display)}</div>
-          <div class="meta"><span class="status-led ${ledCls}"></span>${statusText}</div>
-        </div>
-      </div>
-    `);
+    rows.push(
+      '<div class="contact-item-v2" data-peer="' + escapeHtml(p.PeerID) + '">'
+      + '<div class="avatar">' + escapeHtml(avatarChar(display)) + '</div>'
+      + '<div class="name">' + escapeHtml(display) + '</div>'
+      + '<div class="ip">' + escapeHtml(ip) + '</div>'
+      + '</div>'
+    );
   }
-  // Then groups
   for (const g of state.groups) {
-    rows.push(`
-      <div class="contact-item" data-group="${escapeHtml(g.group_id)}">
-        <div class="avatar empty">${escapeHtml(avatarChar(g.group_name || '#'))}</div>
-        <div class="info">
-          <div class="name">${escapeHtml(g.group_name || '(未命名群组)')}</div>
-          <div class="meta">${g.members.length} 成员</div>
-        </div>
-      </div>
-    `);
-  }
-  if (rows.length === 0) {
-    list.innerHTML = '';
-    return;
+    const name = g.group_name || '(未命名群组)';
+    // v1.2.4+ 12:13 群 row 重新设计: 4 色 conic-gradient
+    // 圆头像 + 群名 avatarChar 居中白字 (跟 chat view
+    // 群 .peer.group .peer-dot 同步, style.css line 371+).
+    // 取代 11:55 v1 的 9 宫格方块 (user 12:13 报"实在难
+    // 看"+"方块 9 宫格太大空格浪费"+"状态行'3 成员'重复"
+    // ). 4 色圆是群组通用 logo, 紧凑, 整 row 大小不变.
+    rows.push(
+      '<div class="contact-item-v2 group" data-group="' + escapeHtml(g.group_id) + '">'
+      + '<div class="avatar group-avatar">' + escapeHtml(avatarChar(name)) + '</div>'
+      + '<div class="name">' + escapeHtml(name) + '</div>'
+      + '<div class="ip">' + g.members.length + ' 成员</div>'
+      + '</div>'
+    );
   }
   list.innerHTML = rows.join('');
-  // Click a contact row to add to chat list and switch to chat view
-  list.querySelectorAll<HTMLElement>('.contact-item').forEach(el => {
+  list.querySelectorAll('.contact-item-v2').forEach(el => {
     el.addEventListener('click', () => {
       const peer = el.getAttribute('data-peer');
       const group = el.getAttribute('data-group');
@@ -1559,6 +1730,7 @@ function renderContactList() {
     });
   });
 }
+
 
 function renderChatList() {
   // v1.2.4 (2026-07-11): 消息 view 只显示 chatList —
@@ -1615,6 +1787,34 @@ async function refreshAll() {
     // member of is auto-added to chatList so its row shows
     // up in the chat view.
     for (const g of state.groups) if (g.self) addChatMember(g.group_id);
+    // v1.2.4+ 修 (2026-07-11 22:18): chat history
+    // 持久化 — 关闭 innerlink 后 state 全部重置, 重启
+    // 拉 chat.enc 拉 history for each peer, if history
+    // 长度 > 0 addChatMember 让 chat list 显示聊过的
+    // peer row. user 22:12 报"关闭再打开消息框是空的,
+    // 聊过的对话项应该都在". Go 端 chat.enc 是 source
+    // of truth (state.history 同步), 重新拉就行.
+    for (const p of state.peers) {
+      try {
+        const h = await History(p.PeerID);
+        const msgs = (h as node.Message[]) || [];
+        if (msgs.length > 0) {
+          state.history.set(p.PeerID, msgs);
+          // v1.2.4+ 08:55 改回 lastReadIdx 语义: 红点 =
+          // filter in - lastReadIdx[peerId]. startup 时
+          // 拉 history 后用持久化的 lastReadIdx[peerId]
+          // (loadPersisted 启动时已读) 算 unread. 持久化的
+          // lastReadIdx 来自上次 selectPeer / selectGroup
+          // 末尾 set 的值, 跟重启前状态对齐. 没持久化
+          // lastReadIdx 的 peer (第一次启动) 默认 0, 红点
+          // = filter in (切走后对方发 in 数).
+          const inCount = msgs.filter(x => x.Direction === 'in').length;
+          const lastRead = state.lastReadIdx.get(p.PeerID) || 0;
+          state.unreadCount.set(p.PeerID, Math.max(0, inCount - lastRead));
+          addChatMember(p.PeerID);
+        }
+      } catch { /* ignore — peer 也许没 history */ }
+    }
     renderMe();
     renderPeerList();
     renderGroupList();
@@ -1941,6 +2141,17 @@ async function leaveGroup(renderedID: string) {
   await loadGroups();
   renderGroupList();
   renderPeerList();
+  // v1.2.4+ 14:22 user 14:22 报"当前用户退群之后, 聊天框
+  // 变了, 消息列表没有变, 点击一下其他消息, 才会变化.
+  // 应该是主动就变化" - leaveGroup 末尾漏了 renderChatList,
+  // 跟 12:13 v1 修 selectGroup 末尾 (line 1590) 同类问题:
+  // #list-chat 群 row 是 renderChatList 从 #group-list
+  // clone outerHTML 出来的, renderGroupList 改了 #group-
+  // list 里的 .peer.group active class, 但 #list-chat 里
+  // clone 出来的副本不会自动更新, 还得调一遍 renderChatList
+  // 把 #group-list 当前 active class 重新 clone 过来.
+  // 修: leaveGroup 末尾加 renderChatList.
+  renderChatList();
   renderChatHeader();
   renderMessages();
   toast(`已退出群 ${name}`);
@@ -1972,6 +2183,18 @@ async function onGroupEvent(ev: any) {
   // up in the chat view.
   for (const g of state.groups) if (g.self) addChatMember(g.group_id);
   renderGroupList();
+  // v1.2.4+ 14:22 user 14:22 报"切到其他聊天, 群聊天为啥
+  // 绿底不消失" + 退群滞后 - onGroupEvent (group:event
+  // 收: removed/updated/added) 末尾漏 renderChatList, 跟
+  // leaveGroup (line 2143) 同根因: #list-chat 群 row 是
+  // renderChatList 从 #group-list clone outerHTML 出来的,
+  // renderGroupList 改了 #group-list 里的 .peer.group
+  // active class, 但 #list-chat 里 clone 出来的副本不会
+  // 自动更新. 修: onGroupEvent 末尾也加 renderChatList,
+  // 让 #list-chat 在 group:event 来时也立刻刷 (active
+  // class 跟着 state.selectedId 变, 不需要"点其他消息"
+  // 触发才更新).
+  renderChatList();
   if (ev.Type === 'removed') {
     if (state.selectedId === ev.GroupID) {
       state.selectedId = null;
@@ -3210,21 +3433,35 @@ function wireEvents() {
   document.getElementById('composer')!.addEventListener('submit', async (ev) => {
     ev.preventDefault();
     if (!state.selectedId) return;
+    // v1.2.4+ 08:55 修 send 多倍发送 — user 8:51-8:53
+    // 阶段连敲回车 trace 看到 11 条重复消息全发出去
+    // (有 3-4 字节短消息重复 3-5 次). 根因: form submit
+    // 是 async, input.value = '' 在 SendText 完成之后
+    // 才清空, 期间 user 再敲回车 input 还有内容 ->
+    // requestSubmit 多次 -> SendText 多次. 修法: 加
+    // state.sending flag, send 期间 true 拒绝新 submit.
+    // 失败也立即释放 (try/finally).
+    if (state.sending) return;
     const input = document.getElementById('composer-input') as HTMLTextAreaElement;
     const text = input.value.trim();
     if (!text) return;
+    state.sending = true;
     const isGroup = isGroupId(state.selectedId);
     let err = '';
-    if (isGroup) {
-      // SendGroupMessage returns GroupMessageResult
-      // { status, err }; empty err means success.
-      const r = await SendGroupMessage(state.selectedId, text);
-      err = (r && r.err) || '';
-    } else {
-      // SendText returns the error string directly;
-      // empty string means success. (Wails binding
-      // convention: first return value only.)
-      err = await SendText(state.selectedId, text);
+    try {
+      if (isGroup) {
+        // SendGroupMessage returns GroupMessageResult
+        // { status, err }; empty err means success.
+        const r = await SendGroupMessage(state.selectedId, text);
+        err = (r && r.err) || '';
+      } else {
+        // SendText returns the error string directly;
+        // empty string means success. (Wails binding
+        // convention: first return value only.)
+        err = await SendText(state.selectedId, text);
+      }
+    } finally {
+      state.sending = false;
     }
     if (err) {
       toast(`发送失败: ${err}`);
@@ -3253,6 +3490,13 @@ function wireEvents() {
   document.getElementById('composer-input')!.addEventListener('keydown', (ev) => {
     const ke = ev as KeyboardEvent;
     if (ke.key === 'Enter' && !ke.shiftKey) {
+      // v1.2.4+ 08:55 跟 form submit 同 — send 期间
+      // 拒绝新 keydown 触发, 双保险防止 requestSubmit
+      // 排队.
+      if (state.sending) {
+        ke.preventDefault();
+        return;
+      }
       ke.preventDefault();
       (document.getElementById('composer') as HTMLFormElement).requestSubmit();
     }
@@ -3466,9 +3710,20 @@ function wireEvents() {
   // dialog, which surprised users who right-clicked
   // expecting a menu (Windows convention is menu-first
   // → action via menu item, not action-on-right-click).
-  document.getElementById('group-list')!.addEventListener('contextmenu', (ev) => {
+  //
+  // v1.2.4+ 12:13 user 12:13 报"消息列表, 群的消息项上
+  // 有个邮件退群的功能, 现在没有了, 加回去" - 之前 listener
+  // 绑 #group-list, 但 chat list 群 row 是 #list-chat 里
+  // 的 .peer.group (renderChatList 把 #group-list / #peer-
+  // list 里 .peer.outerHTML clone 到 #list-chat, clone
+  // 出的节点不带 addEventListener 注册的 listener), 改
+  // document 委托, 覆盖 #list-chat + #group-list 全部
+  // .peer.group. 也避免 ctx-menu 自身触发再次弹.
+  document.addEventListener('contextmenu', (ev) => {
     const e = ev as MouseEvent;
-    const row = (e.target as HTMLElement).closest<HTMLElement>('.peer.group');
+    const t = e.target as HTMLElement;
+    if (t.closest('.ctx-menu')) return;
+    const row = t.closest<HTMLElement>('.peer.group');
     if (!row) return;
     e.preventDefault();
     const gid = row.getAttribute('data-group');
@@ -3824,26 +4079,48 @@ function wireEvents() {
     // 不加"已加" pill — pill 拍板版已删)。
     if (m.Direction === 'in') {
       addChatMember(m.PeerID);
-      // v1.2.4 修 (2026-07-11 17:11): 14:18 累加 Map
-      // 拍板语义。user 16:58 / 17:10 明确: 新消息永远
-      // +1, 不论 selectedId 是不是 peerId。selectPeer
-      // 末尾已经 set 0 清零 (line 1396) — 这边只负责
-      // +1, 严格只对 in 消息 +1, system 消息 (Direction:
-      // system) 不 +1 (那是 roster / group:event, 不算
-      // in 红点)。
-      if (isGroupId(m.PeerID)) {
-        state.groupUnread.set(
-          m.PeerID,
-          (state.groupUnread.get(m.PeerID) || 0) + 1
-        );
-      } else {
-        state.unreadCount.set(
-          m.PeerID,
-          (state.unreadCount.get(m.PeerID) || 0) + 1
-        );
+      // v1.2.4+ 09:51 修 user 9:51 报 "我在当前会话里,
+      // 收到消息也是会出现未读数字" — 之前 8:55 v3
+      // build 算 state.unreadCount[peer] = filter in -
+      // lastReadIdx[peer], 但 user 切到 chat 后, 其他
+      // peer 的 lastReadIdx 没更新, 收其他 peer in 时
+      // lastReadIdx 仍是 0 (默认), red = filter in - 0
+      // = filter in, 出 1 红点. user 期望在 chat 时
+      // 收其他 peer in 不出红点 (user 切到 chat = "在
+      // 关注当前对话", 其他 peer 的消息可稍后再看).
+      // 修法: 收 in 时如果 state.selectedId ===
+      // m.PeerID (user 在这个 chat), lastReadIdx[m.PeerID]
+      // 跟随 filter in 更新 (user 立即看到, red = 0).
+      // 切走 chat 后 (selectedId !== m.PeerID) 收 in,
+      // lastReadIdx[m.PeerID] 不变, red = filter in -
+      // lastReadIdx (切走新增 in, 累加). 之前 selectPeer
+      // 末尾也 set lastReadIdx = filter in, 跟这里逻辑
+      // 一致 (切到 chat 时 lastReadIdx 同步).
+      const inCount = list.filter(x => x.Direction === 'in').length;
+      if (state.selectedId === m.PeerID) {
+        // v1.2.4+ 09:51: user 在 chat 收 in, lastReadIdx
+        // 跟随 filter in 更新, red 自动 = 0.
+        state.lastReadIdx.set(m.PeerID, inCount);
       }
+      const lastRead = state.lastReadIdx.get(m.PeerID) || 0;
+      const unreadCount = Math.max(0, inCount - lastRead);
+      if (isGroupId(m.PeerID)) {
+        state.groupUnread.set(m.PeerID, unreadCount);
+      } else {
+        state.unreadCount.set(m.PeerID, unreadCount);
+      }
+      // trace 保留
+      try {
+        (window as any).runtime?.EventsEmit?.('frontend:trace', JSON.stringify({
+          kind: 'in_sync',
+          peer: m.PeerID.slice(0, 12),
+          uc: unreadCount,
+          hist: list.length,
+          dir: m.Direction,
+          sel: state.selectedId?.slice(0, 12) ?? '',
+        }));
+      } catch { /* ignore */ }
     }
-    renderChatList();
     // v1.2.4 修 (2026-07-11 14:18): in 消息总是 +1 unread, 即便
     // selectedId === m.PeerID 也算。原因是 7/11 14:18 user 反馈
     // "发了 5 条显示 4 红点" — 之前 selectedId === PeerID 时跳过
@@ -3862,8 +4139,21 @@ function wireEvents() {
     // PeerID 时 selectPeer / selectGroup 把 lastReadIdx[peerId]
     // 推到当前 inCount, 实现"切过去时清 0"。
     //
-    // 这里只 push + set + addChatMember + renderChatList, 不再
-    // +1 累加, 不再兜底。in / out 都不动 unreadCount Map。
+    // 这里只 push + set + addChatMember, 不再 +1 累加,
+    // 不再兜底。in / out 都不动 unreadCount Map。
+    //
+    // v1.2.4+ 关键真根因修 (2026-07-11 22:50): 之前这里
+    // 调 renderChatList() 在 renderPeerList() **之前** —
+    // renderChatList() 是从 #peer-list clone L outerHTML,
+    // 但 #peer-list 是**上一次** L 写的旧版本 (badge=N-1),
+    // clone 出来 #list-chat 显示 N-1, 然后 L 写新 #peer-list
+    // (badge=N) 已经晚一步, #list-chat 不会被刷新。结果:
+    // 1 in 0 红点 / 2 in 1 红点 / 5 in 4 红点 — 永远 -1。
+    // 关闭发送端触发 peer:event -> refreshAll() 走正确顺序
+    // (line 1660 renderPeerList 先 -> line 1664 renderChatList
+    // 后), 所以关闭后变对。修法: 删掉这里的 renderChatList(),
+    // 挪到下面 renderPeerList/renderGroupList 之后调, 让
+    // #peer-list 先刷新到新 badge, #list-chat 再 clone 新版。
     if (m.Direction === 'in') {
       if (isGroupId(m.PeerID)) renderGroupList();
       else renderPeerList();
@@ -3872,6 +4162,14 @@ function wireEvents() {
       if (isGroupId(m.PeerID)) renderGroupList();
       else renderPeerList();
     }
+    // v1.2.4+ 关键修复 (2026-07-11 22:50): 这里调
+    // renderChatList() — 必须在上面 renderPeerList / renderGroupList
+    // **之后**调, 这样 renderChatList clone 的是新写的
+    // #peer-list / #group-list outerHTML (含新 badge),
+    // 而不是上次 L 写的旧版 (badge=N-1)。之前 1 in 0 红点
+    // / 2 in 1 红点 / 5 in 4 红点 — 永远 -1, 关闭发送端
+    // 才显示对就是这个根因。
+    renderChatList();
     // v1.2.4 修 (2026-07-11 15:53): contacts view 也要同步
     // 重渲染 — 上面 placeholder 主动加进 state.peers /
     // state.groups, 但 renderContactList 只在 refreshAll
@@ -3926,9 +4224,40 @@ function wireEvents() {
 
 // ----- bootstrap -----
 async function bootstrap() {
+  // v1.2.4+ 08:55 启动时读 lastReadIdx + selectedId —
+  // user 报关闭前 selectedId = A / lastReadIdx[A] = N,
+  // 重启后必须保留, 不能自己改. loadPersisted 读
+  // localStorage, refreshAll 拉 history 后用持久化
+  // lastReadIdx 算 unread (filter in - lastReadIdx).
+  loadPersisted();
   mount();
   wireEvents();
   await refreshAll();
+
+  // v1.2.4+ 09:51 修 user 9:51 报 "测试关闭, 会话打开
+  // 的状态没有保留, 并没有显示聊天的那个会话页面" —
+  // 之前 8:55 v3 build loadPersisted() 读 selectedId,
+  // 但 refreshAll 末尾没 selectPeer(持久化的 selectedId),
+  // 启动后 state.history[A] 加载了但 renderMessages
+  // 没调, chat pane 空. 修法: refreshAll 后如果持久化
+  // 的 selectedId 不为空且仍存在 (在 state.peers /
+  // state.groups 里找得到), 自动 selectPeer 让 chat
+  // pane 显示历史消息. 群聊的 selectGroup 同理.
+  if (state.selectedId) {
+    const isGroup = isGroupId(state.selectedId);
+    const exists = isGroup
+      ? state.groups.some(g => g.group_id === state.selectedId)
+      : state.peers.some(p => p.PeerID === state.selectedId);
+    if (exists) {
+      if (isGroup) await selectGroup(state.selectedId);
+      else await selectPeer(state.selectedId);
+    } else {
+      // 持久化的 selectedId 已不存在 (peer/group 离开 roster),
+      // 清除持久化状态, 不残留 null.
+      state.selectedId = null;
+      savePersisted();
+    }
+  }
 
   // Wails drag-and-drop: useDropTarget=true tells Wails
   // to only fire OnFileDrop on elements that carry the

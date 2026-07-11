@@ -140,7 +140,22 @@ func (a *App) Startup(ctx context.Context) {
 	go a.pumpMessages()
 	go a.pumpFiles()
 	go a.pumpGroups()
+	go a.pumpFrontendTrace()
 	log.Printf("[INFO  app] Startup RETURN (goroutines=%d)", runtime.NumGoroutine())
+}
+
+// v1.2.4+ (2026-07-11 20:38): 接收 frontend +1
+// 累加 trace event, 写 log. user 报 "1st in 永远
+// 0 红点, 2nd/3rd/4th 显示 1/2/3" — +1 累加 0→0
+// 而不是 0→1, 1st in +1 漏了但 2nd/3rd/4th +1 跑了.
+// 之前 7 次改 +1 代码都对但仍漏. trace 写 innerlink.log
+// 后我能从 128 / 129 端 HTTP /innerlink.log 直接
+// 看 +1 实际跑了几次 (uc 字段).
+func (a *App) pumpFrontendTrace() {
+	log.Printf("[INFO  app] pumpFrontendTrace ENTER (goroutines=%d)", runtime.NumGoroutine())
+	wruntime.EventsOn(a.ctx, "frontend:trace", func(optionalData ...interface{}) {
+		log.Printf("[TRACE app] frontend:trace %v", optionalData)
+	})
 }
 
 // BeforeClose is the Wails OnBeforeClose hook. Wails

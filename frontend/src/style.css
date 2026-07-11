@@ -1,4 +1,4 @@
-/* innerlink frontend CSS — vanilla, no framework.
+﻿/* innerlink frontend CSS — vanilla, no framework.
  *
  * The palette and layout come from the v0.1 UI design
  * mockup (D:\mavis-tmp\innerlink-ui-mockup.html). All
@@ -80,26 +80,44 @@ body {
   gap: 6px;
 }
 .rail-avatar {
-  width: 40px; height: 40px;
+  /* v1.2.4+ 16:55 user 拍板: .rail-avatar 改成跟
+   * .avatar (chat header, line 542-548) 完全一样,
+   * 让头像 UI 一致 (gradient 38px + 14px + grid
+   * center 居中, 跟 chat header "邓" / "牛" 头像看
+   * 着居中 OK 的样式一致). .rail-avatar 跟
+   * .rail-icon 没有任何共享 CSS (各自独立选择器,
+   * 各自不同 DOM 结构, .rail-avatar 用复合 class
+   * "rail-avatar me", .rail-icon 是独立 button
+   * 元素), 改 .rail-avatar 不会影响 .rail-icon 三
+   * 个按钮. 保留 14:22 v3 之前修 .me 18px padding
+   * leak 的 padding 0 + border-bottom none + flex 0
+   * 0 auto (innerlink 用 class="rail-avatar me"
+   * 复合, .avatar (chat header) 用 class="avatar"
+   * 单独 class, 不需要修 leak). 保留 11:55 v1 加的
+   * box-sizing border-box + line-height 1 + renderMe
+   * 字符同步. 保留 cursor pointer (点开自己) +
+   * user-select none. */
+  width: 38px; height: 38px;
   border-radius: 50%;
-  background: var(--primary);
+  background: linear-gradient(135deg, var(--primary), #0e9b6f);
   color: white;
   display: grid; place-items: center;
-  font-size: 16px; font-weight: 600;
-  margin-bottom: 8px;
-  box-shadow: 0 0 0 2px var(--primary-soft);
+  font-weight: 600; font-size: 14px;
+  flex-shrink: 0;
+  /* v1.2.4+ 17:09 user 拍板 A 方案: margin 0 auto 8px
+   * -> 0 auto, 取消 margin-bottom 8px, box 跟 .me
+   * 上下边距都 16px 完全对称 (box 跟 .me 上 16 + 0
+   * = 16, box 跟 .me 下 16 + 0 = 16), 修 user 17:06
+   * 报"上下不居中" 真因 (之前 margin-bottom 8px 加
+   * 剧 box 跟 .me 下边距 60px 不对称). */
+  margin: 0 auto;
   cursor: pointer;
   user-select: none;
-  /* v1.2.4 (2026-07-11): the v1.2.2 .me rules below
-   * (padding 18px / border-bottom / flex 0 0 auto)
-   * leak into rail-avatar because the mount template
-   * also tags it class="rail-avatar me" so the v1.2.2
-   * wireEvents `document.querySelector('.me')` listener
-   * still attaches. Reset those here so the 40x40 round
-   * circle isn't squished by .me's box padding. */
   padding: 0;
   border-bottom: none;
   flex: 0 0 auto;
+  box-sizing: border-box;
+  line-height: 1;
 }
 .rail-icon {
   width: 40px; height: 40px;
@@ -214,6 +232,63 @@ body {
   padding: 1px 6px; border-radius: 4px;
   background: var(--primary-soft); color: var(--primary); font-weight: 500;
 }
+/* v1.2.4+ 11:23: contacts view 紧凑行 - 头像 + 名字 + IP 一行, 行高低 */
+.contact-item-v2 {
+  display: grid;
+  grid-template-columns: 28px 1fr auto;
+  gap: 8px;
+  align-items: center;
+  padding: 4px 12px;
+  cursor: pointer;
+  border-bottom: 1px solid var(--border);
+  font-size: 13px;
+}
+.contact-item-v2:hover { background: var(--hover); }
+.contact-item-v2 .avatar {
+  width: 28px; height: 28px; border-radius: 50%;
+  background: var(--primary); color: white;
+  display: grid; place-items: center;
+  font-size: 12px; font-weight: 600;
+  flex-shrink: 0;
+}
+/* v1.2.4+ 12:13 群 row 重新设计 (跟 chat view .peer.group
+ * .peer-dot 同步, line 371+): 4 色 conic-gradient 圆头像
+ * + 群名 avatarChar 居中白字. 取代 11:55 v1 的 9 宫格方块
+ * 38px (user 12:13 报"实在难看"+"方块太大空格浪费"+"状态
+ * 行'3 成员'重复"). 4 色圆紧凑 + 群组感, 整 row 高度不变.
+ * 28px 比 .peer.group .peer-dot 44px 小 (contact-item-v2
+ * row 整体高 36-40px, 头像不能 44px 撑大 row), 用 4 色圆
+ * 同样效果. */
+.contact-item-v2.group .avatar.group-avatar {
+  width: 28px; height: 28px;
+  border-radius: 50%;
+  background: conic-gradient(
+    from 0deg,
+    #10b981 0 25%, #3b82f6 25% 50%,
+    #f59e0b 50% 75%, #8b5cf6 75% 100%
+  );
+  border: none;
+  display: grid;
+  place-items: center;
+  font-size: 11px;
+  font-weight: 700;
+  color: white;
+  text-shadow: 0 1px 2px rgba(0, 0, 0, 0.35);
+  padding: 0;
+  overflow: hidden;
+}
+.contact-item-v2.group .avatar.group-avatar .cell { display: none; }
+.contact-item-v2 .avatar.empty { background: var(--border-strong); color: var(--muted); }
+.contact-item-v2 .name {
+  font-size: 13px; font-weight: 500;
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+}
+.contact-item-v2 .ip {
+  font-size: 11px; color: var(--muted);
+  font-family: 'JetBrains Mono', monospace;
+  white-space: nowrap;
+}
+
 .status-led {
   display: inline-block; width: 6px; height: 6px; border-radius: 50%; margin-right: 4px;
 }
@@ -228,13 +303,22 @@ body {
   display: none; /* v1.2.4 — no more single-column sidebar;
                   *  .sidebar-rail + .sidebar-list replace it */
 }
-.me {
-  padding: 18px 18px 14px;
-  border-bottom: 1px solid var(--border);
-  flex: 0 0 auto;
-  cursor: default;
-  transition: background-color 0.12s ease;
-}
+/* v1.2.4+ 17:09 user 拍板 A 方案: 删第一个 .me (12:13
+ * v2 我加的 flex column center, 实际没生效因为后面
+ * 第二个 .me 覆盖). 改第二个 .me 加 display: flex
+ * + flex-direction: column + align-items: center +
+ * text-align: center + 改 padding 上下对称 16 18 16
+ * 18 (之前 18 18 14 上下不对称), 让 .me 自身有
+ * flex column 居中机制 + box 跟 .me 上下空间对称
+ * (16 16), 修 .rail-avatar box 跟 .me 上下不对称
+ * (user 17:06 报"上下不居中" 真因). 改 .rail-avatar
+ * margin 0 auto 8px -> 0 auto, 取消 margin-bottom 8px,
+ * box 跟 .me 上下边距都 16px 完全对称. 不影响其他
+ * 元素: .me 唯一显示的子元素是 .rail-avatar (其他
+ * .me-name / .me-host / .me-status 在 .me-hidden hidden
+ * 里不显示, line 622-628 main.ts), .me-label CSS 在
+ * main.ts 0 次出现, 不影响. .rail-icon 三个按钮独立
+ * button 元素 + 独立 CSS 不受 .me 改动影响. */
 .me.me-clickable { cursor: pointer; }
 .me.me-clickable:hover { background-color: rgba(0,0,0,0.04); }
 .me.me-clickable .me-name { color: var(--muted); font-style: italic; font-weight: 500; }
@@ -301,33 +385,35 @@ body {
 .peer-meta .alias { color: var(--text-2); }
 .peer-time { font-size: 11px; color: var(--muted); font-variant-numeric: tabular-nums; }
 
-/* v1.2.4 group 九宫格 (v1.2.2 render 输出 .peer.group) */
+/* v1.2.4+ 12:13 群 row 重新设计: 4 色 conic-gradient 圆
+ * 头像 (绿/蓝/橙/紫 4 段), 居中白字 (群名 avatarChar) +
+ * text-shadow 描边, 4 色上都看得清. 取代 11:55 v1 的 9
+ * 宫格方块 38px (user 12:13 报"实在难看"+"方块 9 宫格
+ * 太大, 成员数 < 9 时空格浪费空间, 状态行'3 成员'重复
+ * 一行又出现在右边"). 4 色圆是群组通用 logo 视觉, 紧凑,
+ * 不重复, 整 row 高度不变 (44px 头像 + .peer 默认 padding).
+ * 设计原则: 1) 整个 row 大小不变 2) 不重复"X 成员" meta
+ * 3) 4 色显眼, 一眼能区分"群"vs"个人" (个人 row 用单色
+ * 圆 .peer-dot 44px). */
 .peer.group .peer-dot {
-  background: transparent; padding: 0;
+  background: conic-gradient(
+    from 0deg,
+    #10b981 0 25%, #3b82f6 25% 50%,
+    #f59e0b 50% 75%, #8b5cf6 75% 100%
+  );
+  border-radius: 50%;
+  border: none;
   display: grid;
-  grid-template-columns: 1fr 1fr 1fr;
-  grid-template-rows: 1fr 1fr 1fr;
-  gap: 1.5px;
-  border-radius: 8px;
-  border: 1px solid var(--bg);
+  place-items: center;
+  font-size: 14px;
+  font-weight: 700;
+  color: white;
+  text-shadow: 0 1px 2px rgba(0, 0, 0, 0.35);
+  overflow: hidden;
 }
 .peer.group .peer-dot::after { display: none; }
-.peer.group .peer-dot > * {
-  display: grid; place-items: center;
-  font-size: 8.5px; font-weight: 600;
-  color: white;
-  min-width: 0; min-height: 0;
-}
-/* 9 宫格配色（demo 拍板 .c1-.c9）—— 通过 :nth-child 给 cell 染色 */
-.peer.group .peer-dot > *:nth-child(1) { background: #10b981; }
-.peer.group .peer-dot > *:nth-child(2) { background: #3b82f6; }
-.peer.group .peer-dot > *:nth-child(3) { background: #f59e0b; }
-.peer.group .peer-dot > *:nth-child(4) { background: #ec4899; }
-.peer.group .peer-dot > *:nth-child(5) { background: #8b5cf6; }
-.peer.group .peer-dot > *:nth-child(6) { background: #14b8a6; }
-.peer.group .peer-dot > *:nth-child(7) { background: #ef4444; }
-.peer.group .peer-dot > *:nth-child(8) { background: #6366f1; }
-.peer.group .peer-dot > *:nth-child(9) { background: #0891b2; }
+/* 之前 9 宫格 .peer-dot > * 配色取消, 群头像不嵌子元素 */
+.peer.group .peer-dot > * { display: none; }
 
 /* Badge 红色 demo 拍板 */
 .badge {
@@ -344,11 +430,31 @@ body {
 .badge.show { display: inline-flex; }
 
 .me {
-  padding: 18px 18px 14px;
+  /* v1.2.4+ 17:09 user 拍板 A 方案: 加 display: flex
+   * + flex-direction: column + align-items: center +
+   * text-align: center, 让 .me 自身有 flex column 居
+   * 中机制 (跟 chat header .chat-header 一样的 flex
+   * align-items: center 居中原理), .rail-avatar box
+   * 在 .me 里水平居中. 改 padding 18 18 14 -> 16 18
+   * 16 18 (上下 16 对称), box 跟 .me 上下空间对称
+   * (16 + box 高度 38 + box margin 0 = box 跟 .me 上
+   * 16 + box 跟 .me 下 16, 之前 18 + 38 + 8 + 14 = 78
+   * 不对称), 修 user 17:06 报"上下不居中" 真因. 唯
+   * 一显示的子元素是 .rail-avatar (其他 .me-name /
+   * .me-host / .me-status 在 .me-hidden hidden 里不
+   * 显示, line 622-628 main.ts), .me-label 在 main.ts
+   * 0 次出现, 不影响. .rail-icon 三个按钮独立 button
+   * 元素 + 独立 CSS (line 115-134) 不受 .me 改动影
+   * 响. */
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  padding: 16px 18px 16px 18px;
   border-bottom: 1px solid var(--border);
-  flex: 0 0 auto;            /* never shrink; stay at content size */
-  cursor: default;           /* default state — alias is set */
+  flex: 0 0 auto;
+  cursor: default;
   transition: background-color 0.12s ease;
+  text-align: center;
 }
 .me.me-clickable {
   cursor: pointer;           /* alias unset → click to set */
