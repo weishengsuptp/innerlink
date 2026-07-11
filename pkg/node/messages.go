@@ -178,6 +178,12 @@ func (n *Node) SendText(peerRef, text string) error {
 	if err := st.ch.SendText(n.ctx, text); err != nil {
 		return err
 	}
+	// v1.2.4+ 修 (2026-07-11 20:30): user 报 4 in 5 秒
+	// 内密集 emit 时 Wails WebView2 内部 event queue
+	// 偶尔 drop 1 in 触发 red 点少 1。发方 send 之间
+	// sleep 200ms 让 Wails 内部有 flush 时间。100ms
+	// 不足以 (4 in 仍触发), 200ms 验证稳。
+	time.Sleep(200 * time.Millisecond)
 	log.Printf("[MSG  ] out >%s> %s", peerHexStr, text)
 	rec := &storage.Record{
 		Timestamp: time.Now().UTC(),
