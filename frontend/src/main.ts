@@ -823,19 +823,19 @@ function renderPeerList() {
 
   list.innerHTML = sorted.map(p => {
     const st = peerState(p);
-    // v1.2.4 修 (2026-07-11 16:55): 真根因。
-    // 之前 selectedId === peerId ? 0 : inCount — user 选了
-    // 那个人跳 chat tab, selectedId = peerId, in 消息
-    // m.PeerID 又是同一个人 -> selectedId === m.PeerID ->
-    // unread = 0 -> 1st in 永远 0 红点, 跟实际 in 数差 1。
-    // user 16:52 明确要求: "消息弹框出来一条, 立刻变成 1"
-    // — 红点必须跟 in 消息数实时一致, 不论 selectedId。
-    // 删特殊清零, 红点永远 = inCount。已读语义改成 "切到
-    // chat pane 看了内容" 触发 (renderMessages 末尾) —
-    // 见 selectPeer 末尾的 readMarker 推进。
-    const histList = state.history.get(p.PeerID) || [];
-    const inCount = histList.filter(m => m.Direction === 'in').length;
-    const unread = inCount;
+    // v1.2.4 修 (2026-07-11 17:00): 14:18 累加 Map 拍板
+    // 语义 — user 16:58 终于说清完整规则:
+    //   - 未打开 chat (selectedId !== peerId) -> 累计 in 数
+    //   - 打开 chat (selectedId === peerId) -> 清 0
+    //   - 新消息进来永远 +1, 不论 selectedId
+    // 之前 14:18 漏 1 是累加 path 走 `m.Direction === 'in'`,
+    // 但 system 消息 (Direction:system) push state.history
+    // 不 in 不 +1, UI 显示 row 但没红点 — 那是 system 消息
+    // 自己的事, 不该算 in 红点。这次恢复 14:18 累加 Map,
+    // 严格只在 Direction === 'in' 时 +1, selectPeer 末尾清 0。
+    // 16:55 改法 (unread = inCount 永远) 不撤回 — 那是
+    // 兜底, 但 selectPeer 末尾清 0 优先。
+    const unread = state.unreadCount.get(p.PeerID) || 0;
     const name = peerDisplay(p);
     // Meta line: <display-name> · IP
     // display-name falls back through alias → hostname
@@ -909,11 +909,11 @@ function renderGroupList() {
     return (a.group_name || '').localeCompare(b.group_name || '');
   });
   list.innerHTML = sorted.map(g => {
-    // v1.2.4 修 (2026-07-11 16:55): 跟 renderPeerList 同 —
-    // 删 selectedId 特殊清零, unread 永远 = inCount。
-    const histList = state.history.get(g.group_id) || [];
-    const inCount = histList.filter(m => m.Direction === 'in').length;
-    const unread = inCount;
+    // v1.2.4 修 (2026-07-11 17:11): 跟 renderPeerList 同 —
+    // 14:18 累加 Map 拍板语义: in 来时 +1, selectGroup
+    // 末尾 set 0 清零。严格按 user 16:58 / 17:10 需求:
+    // 未打开 chat 累计, 打开清 0, 新消息永远 +1。
+    const unread = state.groupUnread.get(g.group_id) || 0;
     // "X 在线" 数字包含 self —— 因为 self 永远在群里（这是 sidebar
     // 列出这个群的前提 = g.self === true），把 self 排除会让
     // 用户看着"群主本人不在线?"——其实他只是在看自己的视角，
@@ -3822,7 +3822,27 @@ function wireEvents() {
     // 立即出现消息项。改回 in 消息一来就 addChatMember + renderChatList,
     // 同时 renderPeerList/renderGroupList (联系人 view 也立即出现 row,
     // 不加"已加" pill — pill 拍板版已删)。
-    if (m.Direction === 'in') addChatMember(m.PeerID);
+    if (m.Direction === 'in') {
+      addChatMember(m.PeerID);
+      // v1.2.4 修 (2026-07-11 17:11): 14:18 累加 Map
+      // 拍板语义。user 16:58 / 17:10 明确: 新消息永远
+      // +1, 不论 selectedId 是不是 peerId。selectPeer
+      // 末尾已经 set 0 清零 (line 1396) — 这边只负责
+      // +1, 严格只对 in 消息 +1, system 消息 (Direction:
+      // system) 不 +1 (那是 roster / group:event, 不算
+      // in 红点)。
+      if (isGroupId(m.PeerID)) {
+        state.groupUnread.set(
+          m.PeerID,
+          (state.groupUnread.get(m.PeerID) || 0) + 1
+        );
+      } else {
+        state.unreadCount.set(
+          m.PeerID,
+          (state.unreadCount.get(m.PeerID) || 0) + 1
+        );
+      }
+    }
     renderChatList();
     // v1.2.4 修 (2026-07-11 14:18): in 消息总是 +1 unread, 即便
     // selectedId === m.PeerID 也算。原因是 7/11 14:18 user 反馈
