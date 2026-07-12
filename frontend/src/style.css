@@ -430,31 +430,36 @@ body {
 .badge.show { display: inline-flex; }
 
 .me {
-  /* v1.2.4+ 17:09 user 拍板 A 方案: 加 display: flex
-   * + flex-direction: column + align-items: center +
-   * text-align: center, 让 .me 自身有 flex column 居
-   * 中机制 (跟 chat header .chat-header 一样的 flex
-   * align-items: center 居中原理), .rail-avatar box
-   * 在 .me 里水平居中. 改 padding 18 18 14 -> 16 18
-   * 16 18 (上下 16 对称), box 跟 .me 上下空间对称
-   * (16 + box 高度 38 + box margin 0 = box 跟 .me 上
-   * 16 + box 跟 .me 下 16, 之前 18 + 38 + 8 + 14 = 78
-   * 不对称), 修 user 17:06 报"上下不居中" 真因. 唯
-   * 一显示的子元素是 .rail-avatar (其他 .me-name /
-   * .me-host / .me-status 在 .me-hidden hidden 里不
-   * 显示, line 622-628 main.ts), .me-label 在 main.ts
-   * 0 次出现, 不影响. .rail-icon 三个按钮独立 button
-   * 元素 + 独立 CSS (line 115-134) 不受 .me 改动影
-   * 响. */
-  display: flex;
-  flex-direction: column;
-  align-items: center;
-  padding: 16px 18px 16px 18px;
+  /* v1.2.4+ 18:08 真因修: 删 padding: 16 18 16 18.
+   * 真因是 <div class="rail-avatar me"> 复合 class
+   * 同一元素, 元素 padding 16 18 16 18 (从 .me)
+   * + box-sizing border-box (从 .rail-avatar) +
+   * width 38 + height 38 = content 区 2x6 (38 - 18*2
+   * = 2 wide, 38 - 16*2 = 6 tall). 字符 character
+   * box 14x14 在 2x6 content 区里 place-items:
+   * center 居中, 字符 visual 中心 = 元素 visual
+   * 中心 - 1px 上 (CJK ascent 占比大), 但用户
+   * 看着字符 character box 14x14 溢出 2x6 content
+   * 区 12px 上下, 看着"字符在圆盒顶部偏上". user
+   * 18:07 在 f12 划掉 padding 16 18 16 18 字符居
+   * 中 OK 是因为 content 区变 38x38, 字符 14x14
+   * 正好居中 12px 上下 (place-items center + (38-
+   * 14)/2 = 12), 看着完美居中. 删 .me padding 后
+   * <div class="rail-avatar me"> 实际 padding 0,
+   * content 区 38x38, 字符 visual 居中. 接受
+   * .me height 变小 (39 vs 划掉前 70, 元素 visual
+   * 跟 .me visual 重合) + sidebar-rail 后面元素
+   * 上移 31px. 18:03 删 .me 4 行 (display: flex +
+   * flex-direction: column + align-items: center
+   * + text-align: center) + 现在删 padding = 真
+   * 因修完整. 保留 border-bottom 1px (sidebar
+   * 分隔线) + flex 0 0 auto (sidebar-rail flex
+   * item) + cursor default (不响应点击) + 
+   * transition (background-color 0.12s ease). */
   border-bottom: 1px solid var(--border);
   flex: 0 0 auto;
   cursor: default;
   transition: background-color 0.12s ease;
-  text-align: center;
 }
 .me.me-clickable {
   cursor: pointer;           /* alias unset → click to set */
