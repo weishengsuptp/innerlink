@@ -1309,6 +1309,26 @@ body {
   flex-direction: column;
   gap: 18px;
 }
+/* 2026-07-13 11:02 user 拍板 #6 退群新位置: 抽屉最右
+ * 下角. body 已经是 flex column, footer 用 margin-top:auto
+ * 把自己推到底部; 跟上面 member list 区域用 border-top
+ * 视觉分隔. 危险按钮红字, 跟 ctx-menu 红色删除项
+ * (.ctx-menu-item.danger) 一致. */
+.group-settings-footer {
+  margin-top: auto;
+  padding-top: 16px;
+  border-top: 1px solid var(--border);
+  display: flex;
+  justify-content: flex-end;
+}
+.group-settings-footer .modal-btn.danger {
+  color: #b91c1c;
+  border-color: #fecaca;
+  background: #fff;
+}
+.group-settings-footer .modal-btn.danger:hover {
+  background: #fee2e2;
+}
 .settings-section {
   display: flex;
   flex-direction: column;

@@ -2106,13 +2106,6 @@ async function submitCreateGroup() {
 
 // ----- leave-group (v1.1, 2026-06-28) -----
 //
-// Right-click on a group row in the sidebar opens a
-// small context menu with "退出群聊" (v1.1, 2026-06-28
-// hotfix; previous version jumped straight to a confirm
-// dialog, surprising users who expected Windows-style
-// menu-first). The menu's click handler calls leaveGroup
-// which prompts + dispatches.
-//
 // leaveGroup prompts the user to confirm, then calls
 // App.LeaveGroup which deletes the local members.json +
 // chat.enc + sender-keys/. We do NOT notify remaining
@@ -2129,46 +2122,15 @@ async function submitCreateGroup() {
 // into a friendly toast. The proper "dissolve group"
 // broadcast lands in DissolveGroup (v1.1.x TODO).
 //
-// showGroupContextMenu builds the right-click popup
-// shown over a group row in the sidebar. Anchored at
-// (clientX, clientY); removed on outside click. v1.1
-// (2026-06-28).
-function showGroupContextMenu(x: number, y: number, gid: string) {
-  // Tear down any previous instance before mounting a
-  // new one (the click outside handler hasn't fired yet
-  // when the user right-clicks a second row).
-  document.getElementById('group-ctx-menu')?.remove();
-  const menu = document.createElement('div');
-  menu.id = 'group-ctx-menu';
-  menu.className = 'ctx-menu';
-  menu.style.left = x + 'px';
-  menu.style.top = y + 'px';
-  // v1.1: only "退出群聊" for now. Future items:
-  // "解散群聊" (creator only), "邀请成员" (creator
-  // only), "群设置". Each would be a new ctx-menu-item.
-  const item = document.createElement('div');
-  item.className = 'ctx-menu-item danger';
-  item.textContent = '退出群聊';
-  item.addEventListener('click', () => {
-    menu.remove();
-    void leaveGroup(gid);
-  });
-  menu.appendChild(item);
-  document.body.appendChild(menu);
-  // Close on outside click — wrap in setTimeout(0) so
-  // the click that opened the menu doesn't immediately
-  // close it (it bubbles after the menu item's listener
-  // fires).
-  setTimeout(() => {
-    const onOutside = (ev: MouseEvent) => {
-      if (menu.contains(ev.target as Node)) return;
-      menu.remove();
-      document.removeEventListener('click', onOutside);
-    };
-    document.addEventListener('click', onOutside);
-  }, 0);
-}
-
+// 2026-07-13 11:02 user 拍板: 退群入口只一个, 改放到群设置
+// 抽屉最右下角 (图 4 黄色圈出位置). 之前 showGroupContextMenu
+// (右键弹"退出群聊") 整个删 — 群右键菜单现在只放置顶 + 分割
+// 线 + 删除, 不放退群. 退群按钮由 openGroupSettings 在
+// drawer body 末尾渲染 <div class="group-settings-footer">
+// 含 <button id="gs-leave-group">, 这里在 gs-leave-group
+// click 时调 leaveGroup (老 confirm + 调 App.LeaveGroup
+// 路径不变).
+//
 // showChatItemContextMenu is the 2026-07-13 user-required
 // right-click menu for any chat list row (个人 + 群共用).
 // Two top items + a separator + the destructive "delete":
@@ -2695,6 +2657,9 @@ function renderGroupSettingsPanel(): void {
       </div>
       <div class="member-list">${memberRowsHtml || '<div class="settings-empty">还没有成员</div>'}</div>
     </div>
+    <div class="group-settings-footer">
+      <button class="modal-btn danger" id="gs-leave-group">退出群聊</button>
+    </div>
   `;
   if (isCreator) {
     document.getElementById('gs-name-save')?.addEventListener('click', () => void saveGroupName());
@@ -2710,6 +2675,16 @@ function renderGroupSettingsPanel(): void {
       openInviteMemberModal();
     });
   }
+  // 2026-07-13 11:02 user 拍板: 退群按钮放抽屉最右下角
+  // (图 4 黄色圈出位置, 群设置 footer). 挂在 body 末尾
+  // 不受 isCreator 限制 — 任何群成员都能退群. 调
+  // leaveGroup(renderedID) 走老 confirm + App.LeaveGroup
+  // 路径 (群主 + 还有其他成员时, Go 端回"群主无法直接退出"
+  // 走 friendly toast, v1.1 (2026-06-28) hotfix).
+  document.getElementById('gs-leave-group')?.addEventListener('click', () => {
+    if (!groupSettingsCache) return;
+    void leaveGroup(groupSettingsCache.renderedID);
+  });
 }
 
 // ----- invite-member modal (v1.1.2, 2026-06-30) -----
@@ -3902,19 +3877,15 @@ function wireEvents() {
   // 绑 #group-list, 但 chat list 群 row 是 #list-chat 里
   // 的 .peer.group (renderChatList 把 #group-list / #peer-
   // list 里 .peer.outerHTML clone 到 #list-chat, clone
-  // 出的节点不带 addEventListener 注册的 listener), 改
-  // document 委托, 覆盖 #list-chat + #group-list 全部
-  // .peer.group. 也避免 ctx-menu 自身触发再次弹.
-  document.addEventListener('contextmenu', (ev) => {
-    const e = ev as MouseEvent;
-    const t = e.target as HTMLElement;
-    if (t.closest('.ctx-menu')) return;
-    const row = t.closest<HTMLElement>('.peer.group');
-    if (!row) return;
-    e.preventDefault();
-    const gid = row.getAttribute('data-group');
-    if (gid) void showGroupContextMenu(e.clientX, e.clientY, gid);
-  });
+  // 2026-07-13 11:02 删 document 上 .peer.group 委托的
+  // showGroupContextMenu — 群右键菜单现在只放 置顶/分割线/
+  // 删除 (showChatItemContextMenu), 不放退群. 退群改放
+  // 群设置抽屉 footer (openGroupSettings 末尾渲染). 之前
+  // 委托覆盖 #list-chat + #group-list 全部 .peer.group
+  // (hidden 容器 row 也能弹), 删了 — 现在 .peer row
+  // 上挂的 contextmenu (renderChatList 末尾) 只覆盖
+  // 可见 #list-chat 行. 隐藏容器的 .peer.row 右键不再
+  // 触发 (实际 hidden 容器 row 不可见, user 触不到).
 
   // 📎 picker: open the native OS file dialog via
   // PickFile. core gets the real on-disk path back and
