@@ -301,6 +301,18 @@ function loadPersisted(): void {
         if (typeof v === 'number') state.lastReadIdx.set(k, v);
       }
     }
+    // 2026-07-13 11:46 user 报 #4: 之前 savePersisted 没存
+    // pinnedAt, 关 exe 再开置顶全清, 顺序也错. 修法: 加载
+    // 时把 { [id]: number } 反序列回 Map, 注意 0/NaN/负数
+    // 视为无效 (PERSIST_KEY v1 schema 还没用, 写错也能容
+    // 错). 读不到 / 类型错就跳过 (不污染 state.pinnedAt).
+    if (data.pinnedAt && typeof data.pinnedAt === 'object') {
+      for (const [k, v] of Object.entries(data.pinnedAt)) {
+        if (typeof v === 'number' && v > 0 && Number.isFinite(v)) {
+          state.pinnedAt.set(k, v);
+        }
+      }
+    }
   } catch {
     // ignore — first launch or corrupt state
   }
@@ -311,6 +323,14 @@ function savePersisted(): void {
     const data = {
       selectedId: state.selectedId,
       lastReadIdx: Object.fromEntries(state.lastReadIdx),
+      // 2026-07-13 11:46 user 报 #4: pinnedAt 必须持久化.
+      // Map 不能 JSON.stringify, 转 Object.fromEntries. 只
+      // 存 0 < ts < Date.now() 的, 滤掉脏数据.
+      pinnedAt: Object.fromEntries(
+        [...state.pinnedAt].filter(([, ts]) =>
+          typeof ts === 'number' && ts > 0 && Number.isFinite(ts) && ts <= Date.now() + 60_000
+        )
+      ),
     };
     localStorage.setItem(PERSIST_KEY, JSON.stringify(data));
   } catch {
@@ -1198,13 +1218,25 @@ function renderChatHeader() {
 
 function renderEmpty() {
   const el = document.getElementById('messages')!;
+  // 2026-07-13 11:46 user 报 #3 默认页: 之前 renderEmpty
+  // 文字提示 + 💬 emoji, user 想要跟"刚打开 exe 一样"
+  // 默认页 (图 4) — 中间一个灰色聊天气泡图标 (图 5
+  // 风格, 圆角矩形 + 3 个点), 啥文字都没有. 群/个人
+  // 区分: selectedId null = 刚打开 (显示气泡 + nothing else),
+  // selectedId 非 null + history 空 = 已选 chat 但没消息
+  // (同样显示气泡, 引导 user 发消息). 文字提示在
+  // search-bar / 群空 pill 等其他地方已经有了, 这里不加
+  // 文字不冗余. SVG 用 currentColor (继承父 .empty 灰色
+  // color), 矩形 fill = none + stroke = currentColor 描边,
+  // 三个点 fill = currentColor — 跟图 5 风格一致.
   el.innerHTML = `
     <div class="empty">
-      <div>
-        <div class="ico">💬</div>
-        <h3>${state.selectedId ? '还没有消息' : '选一个 peer 开始聊天'}</h3>
-        <p>${state.selectedId ? '说点啥 👋' : '左侧列表选人，或点你的名字给自己起个对外称呼'}</p>
-      </div>
+      <svg class="empty-bubble" viewBox="0 0 80 80" fill="none" stroke="currentColor" stroke-width="3" stroke-linejoin="round" stroke-linecap="round" aria-hidden="true">
+        <path d="M16 22a8 8 0 0 1 8-8h32a8 8 0 0 1 8 8v22a8 8 0 0 1-8 8H32l-10 8v-8h-2a8 8 0 0 1-4-1.5"/>
+        <circle cx="32" cy="33" r="2.5" fill="currentColor" stroke="none"/>
+        <circle cx="40" cy="33" r="2.5" fill="currentColor" stroke="none"/>
+        <circle cx="48" cy="33" r="2.5" fill="currentColor" stroke="none"/>
+      </svg>
     </div>
   `;
 }
@@ -1781,20 +1813,45 @@ function renderChatList() {
   const p = document.getElementById('peer-list');
   const out = document.getElementById('list-chat');
   if (!out) { renderGroupList(); return; }
-  const rows: string[] = [];
+  // 2026-07-13 11:46 user 报 #1 排序 bug: 之前 renderChatList
+  // 实际是 gHtml + pHtml 拼接, 群永远在前, 个人永远在
+  // 后, 跟 lastMessageAt 排序脱节. 修法: 收集所有 (id,
+  // isGroup, html, lastMessageAt, pinnedAt) 数组, 一起
+  // 按 置顶 (pinnedAt 升序, 多置顶先置顶在前) + lastMessageAt
+  // 降序 排序, 群/个人一视同仁. 已置顶但 chatList 没这个
+  // id 的 (删除 + 置顶 残留) 也跳过 (chatList 已是 SOT).
+  const items: Array<{
+    id: string; isGroup: boolean; html: string;
+    ts: number; pinned: number;
+  }> = [];
   if (g) {
     g.querySelectorAll<HTMLElement>('.peer').forEach(el => {
       const id = el.getAttribute('data-group');
-      if (id && state.chatList?.has(id)) rows.push(el.outerHTML);
+      if (!id || !state.chatList?.has(id)) return;
+      items.push({
+        id, isGroup: true, html: el.outerHTML,
+        ts: getLastMessageAt(id),
+        pinned: getPinnedRank(id),
+      });
     });
   }
   if (p) {
     p.querySelectorAll<HTMLElement>('.peer').forEach(el => {
       const id = el.getAttribute('data-peer');
-      if (id && state.chatList?.has(id)) rows.push(el.outerHTML);
+      if (!id || !state.chatList?.has(id)) return;
+      items.push({
+        id, isGroup: false, html: el.outerHTML,
+        ts: getLastMessageAt(id),
+        pinned: getPinnedRank(id),
+      });
     });
   }
-  out.innerHTML = rows.join('');
+  items.sort((a, b) => {
+    if (a.pinned !== b.pinned) return a.pinned - b.pinned;
+    if (a.ts !== b.ts) return b.ts - a.ts;
+    return 0;
+  });
+  out.innerHTML = items.map(it => it.html).join('');
   // 2026-07-13 11:02 user 拍板 #4 右键菜单: 给 chat list
   // 里的 .peer row 挂 contextmenu 事件, 弹通用
   // showChatItemContextMenu(x, y, id, isGroup). 触发器放
@@ -2322,6 +2379,12 @@ async function leaveGroup(renderedID: string) {
   renderChatList();
   renderChatHeader();
   renderMessages();
+  // 2026-07-13 11:46 user 报 #3: 退群后右侧抽屉 (3 个点打开
+  // 的群设置) 没关, 用户还能看到旧群名 + 旧成员列表. 修法:
+  // 末尾 closeGroupSettings(), 把抽屉硬关掉. 配合前面
+  // state.selectedId = null, 渲染回到默认页 (中间灰色聊天
+  // 气泡). 抽屉不存在 / 已经在关 状态都是 no-op, 安全.
+  closeGroupSettings();
   toast(`已退出群 ${name}`);
 }
 

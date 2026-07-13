@@ -885,6 +885,21 @@ body {
 .empty h3 { font-size: 15px; color: var(--text-2); margin-bottom: 6px; font-weight: 600; }
 .empty p { font-size: 12.5px; }
 
+/* 2026-07-13 11:46 user 报 #3: 退群/删除消息后 chat pane
+ * 默认页要像"刚打开 exe 一样" — 中间一个灰色聊天气泡
+ * (图 5 风格), 不要文字提示. 这里给 .empty-bubble 配色:
+ * 灰色描边 + 灰色 3 个点 (currentColor 继承 .empty 的
+ * --muted), 撑大到 96x96, 不透明度 0.45 让它融进背景别太
+ * 抢戏. 描边 3.5px 配合 80 viewBox 是图 5 那种圆角矩形 +
+ * 尾巴 + 3 点的比例. 之前的 .empty .ico 蓝紫色块 (52x52
+ * + primary-soft) 不再用, 但保留避免改其他兄弟引用. */
+.empty-bubble {
+  width: 96px; height: 96px;
+  opacity: 0.45;
+  color: var(--muted);
+  display: block;
+}
+
 /* ========== Toast ==========
  * v1.1 (2026-06-27): redesigned the toast surface. The
  * previous version was warn-orange on a soft-amber
