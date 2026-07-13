@@ -174,6 +174,22 @@ body {
 .chat-pane-spacer {
   flex: 1;
   background: var(--bg);
+  /* 2026-07-13 17:01 user 报图 1 + 图 4 反馈: 退群/删除
+   * 聊天后, spacer 显示在右侧 (灰色背景), 中间居中一个
+   * 灰色聊天气泡图标 (图 5 风格). 跟 .empty-bubble 同款
+   * 96x96 + currentColor + 0.45 不透明度, flex 居中
+   * (align-items + justify-content: center) 让气泡垂直
+   * 水平都居中. 注意 spacer 默认就显示 (没 hidden), 只
+   * 选过 peer 才被 selectPeer/selectGroup 切 hidden; 退
+   * 群后 renderChatHeader 没选 peer 分支会把 spacer 切
+   * 回显示 — 这时气泡已经在 DOM 里了, 不靠 JS 重新生成. */
+  display: flex; align-items: center; justify-content: center;
+  color: var(--muted);
+}
+.spacer-bubble {
+  width: 96px; height: 96px;
+  opacity: 0.45;
+  display: block;
 }
 
 /* v1.2.4: 双视图切换 — data-view flips which .list-* is

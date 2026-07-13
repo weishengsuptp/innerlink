@@ -710,7 +710,24 @@ function mount() {
       <!-- v1.2.4: 右侧 chat pane hidden。chat-demo.html
            拍板是空 section 灰色占位 — 不显示 chat pane。选
            peer 后 JS 把 chat-pane 取消 hidden 切出来。 -->
-      <section class="chat-pane-spacer" id="chat-pane-spacer"></section>
+      <section class="chat-pane-spacer" id="chat-pane-spacer">
+        <!-- 2026-07-13 17:01 user 报图 1 + 图 4 反馈: 退群 /
+             删除聊天后, 右侧应该跟"刚打开 exe 啥都没选" 一
+             样 = 灰色占位 (#chat-pane-spacer, var(--bg)) +
+             中间一个灰色聊天气泡 (图 5 风格, 圆角矩形 + 3 个
+             点). renderChatHeader 没选 peer 分支会把 chat-
+             pane hidden + spacer 显示, 这里静态写气泡,
+             永远在, 不靠 JS 重新生成. 跟 renderEmpty 的
+             .empty-bubble SVG 一样 viewBox 0 0 80 80 + 描
+             边 + 3 个点, currentColor 继承 .chat-pane-
+             spacer 灰色. -->
+        <svg class="spacer-bubble" viewBox="0 0 80 80" fill="none" stroke="currentColor" stroke-width="3" stroke-linejoin="round" stroke-linecap="round" aria-hidden="true">
+          <path d="M16 22a8 8 0 0 1 8-8h32a8 8 0 0 1 8 8v22a8 8 0 0 1-8 8H32l-10 8v-8h-2a8 8 0 0 1-4-1.5"/>
+          <circle cx="32" cy="33" r="2.5" fill="currentColor" stroke="none"/>
+          <circle cx="40" cy="33" r="2.5" fill="currentColor" stroke="none"/>
+          <circle cx="48" cy="33" r="2.5" fill="currentColor" stroke="none"/>
+        </svg>
+      </section>
       <section class="chat" id="chat-pane" data-empty="true" hidden>
         <div class="chat-header">
           <div class="avatar" id="chat-avatar">?</div>
@@ -1183,14 +1200,32 @@ function renderChatHeader() {
   }
 
   if (!p) {
+    // 2026-07-13 17:01 user 报图 1 反馈: 退群/删除后, 之前
+    // selectedPeer() 走了 fallback 填"未选择 peer" /
+    // "先选一个 peer..." 还把整个 chat-pane 显示着 — user
+    // 想要"跟刚打开 exe 啥都没选" 一样 (灰色占位 spacer +
+    // 聊天气泡, header + composer 全不显示). 真因 =
+    // selectPeer/selectGroup 选过之后 pane.hidden = false
+    // + spacer.hidden = true, 后续 selectedId 清掉时, 这里
+    // 没把 pane 切回 hidden, 也没把 spacer 切回显示, 所以
+    // 看到的是半残 chat-pane (header + 中间气泡 + composer
+    // placeholder). 修法: 这里直接 pane.hidden = true +
+    // spacer.hidden = false, 跟初始 HTML 默认状态一致. 选
+    // peer 时 selectPeer/selectGroup 末尾会把 pane/spacer
+    // 切回, 这里只管"没选" 一边. avatar/name/sub 还要填就
+    // 填 (虽然 pane hidden 看不到), 保持状态一致.
+    const pane = document.getElementById('chat-pane');
+    const spacer = document.getElementById('chat-pane-spacer');
+    if (pane) pane.hidden = true;
+    if (spacer) spacer.hidden = false;
     avatar.textContent = '?';
-    name.textContent = '未选择 peer';
-    sub.textContent = '—';
+    name.textContent = '';
+    sub.textContent = '';
     attachBtn.disabled = true;
     input.disabled = true;
     send.disabled = true;
     groupSetBtn.disabled = true;
-    input.placeholder = '先选一个 peer…';
+    input.placeholder = '';
     return;
   }
   avatar.textContent = avatarChar(peerDisplay(p));
@@ -1578,29 +1613,40 @@ async function selectPeer(peerId: string) {
 
   state.selectedId = peerId;
   state.draftsLoaded = true;
-  // v1.2.4+ 08:55 重新启用 lastReadIdx 语义 — 切到 chat 时
-  // 记录当前 in 数, 切走后收 in 时 unreadCount[peerId] =
-  // filter in - lastReadIdx[peerId] (切走新增 in). 之前 7/11
-  // 15:43 拍板"selectedId === peerId 时显示 0" 走 selectedId
-  // 特殊清 0 路径, user 8:55 报跟"切走新增" 不一致, 改回
-  // lastReadIdx 显式游标. selectPeer 末尾 set lastReadIdx =
-  // filter in 实现"切到 chat 清 0" + 持久化 lastReadIdx 让
-  // 重启后保留.
-  try {
-    const h = await History(peerId);
-    const msgs = (h as node.Message[]) || [];
-    state.history.set(peerId, msgs);
-    const inCount = msgs.filter(x => x.Direction === 'in').length;
-    state.lastReadIdx.set(peerId, inCount);
-    state.unreadCount.set(peerId, 0);
-    savePersisted();
-  } catch (e) {
-    state.history.set(peerId, []);
-    state.lastReadIdx.set(peerId, 0);
-    state.unreadCount.set(peerId, 0);
-    savePersisted();
-    toast(`读取历史失败: ${e}`);
+  // 2026-07-13 17:01 user 报 C 真因: 之前 selectPeer 末尾
+  // 调 History(peerId) 重新拉 history, 拉回后
+  // state.history.set(peerId, msgs) 覆盖 in-memory 缓存。
+  // 多次切来切去, 每次切都重新拉, 期间 n.history 跨 peer
+  // 顺序可能微变 (新 in 消息 push, Go 端跨 peer ts 升序排),
+  // 拉回的 msgs 顺序不稳定, lastMessageAt 跟着变, 排序乱。
+  // 修法: select 末尾**不**重新拉 history, 依赖启动时
+  // refreshAll (line 1944-1964) 已经拉过的 in-memory 缓存。
+  // 新 in 消息通过 message:event handler (line 4326) push 到
+  // state.history[id] 末尾, 顺序按 ts 升序 (新消息 ts 较新
+  // 必在末位) — lastMessageAt 稳定。
+  // 唯一例外: state.history[peerId] 还没 init (启动后
+  // refreshAll 没拉到, 比如新 peer 刚 message:event 1st in
+  // 触发 placeholder, 但还没 select 过), 这时拉一次填充。
+  if (!state.history.has(peerId)) {
+    try {
+      const h = await History(peerId);
+      const msgs = (h as node.Message[]) || [];
+      state.history.set(peerId, msgs);
+    } catch (e) {
+      state.history.set(peerId, []);
+      toast(`读取历史失败: ${e}`);
+    }
   }
+  // 切到 chat 清 0 (lastReadIdx = filter in, 配合 message:event
+  // selectedId === m.PeerID 时 lastReadIdx 跟随 filter in 的
+  // 路径 (line 4355-4358), 红点 = 0). inCount 用**当前** in-
+  // memory state.history[peerId] 算 (不依赖重新拉, 跟切后
+  // 持久化 lastReadIdx 对齐).
+  const inMsgs = state.history.get(peerId) ?? [];
+  const inCount = inMsgs.filter(x => x.Direction === 'in').length;
+  state.lastReadIdx.set(peerId, inCount);
+  state.unreadCount.set(peerId, 0);
+  savePersisted();
   renderPeerList();
   // v1.2.4+ 16:51 user 报"从群聊点击其他聊天, 群聊还
   // 是绿色底纹, 还是像被选中的状态" - selectPeer
@@ -1646,24 +1692,26 @@ async function selectGroup(renderedID: string) {
   // Group sidebar entry uses .group class, so we need to
   // re-render both lists (the active highlight lives in
   // different DOM nodes for the two sections).
-  // v1.2.4+ 08:55 跟 selectPeer 同 — 重新启用 lastReadIdx,
-  // 切到 group chat 时 set lastReadIdx[groupId] = filter in
-  // 实现"切到 chat 清 0" + 持久化.
-  try {
-    const r = await HistoryGroup(renderedID);
-    const msgs = (r && r.messages) || [];
-    state.history.set(renderedID, msgs);
-    const inCount = msgs.filter(x => x.Direction === 'in').length;
-    state.lastReadIdx.set(renderedID, inCount);
-    state.groupUnread.set(renderedID, 0);
-    savePersisted();
-  } catch (e) {
-    state.history.set(renderedID, []);
-    state.lastReadIdx.set(renderedID, 0);
-    state.groupUnread.set(renderedID, 0);
-    savePersisted();
-    toast(`读取群历史失败: ${e}`);
+  // 2026-07-13 17:01 user 报 C 真因: 跟 selectPeer 同 — 切到
+  // 群 chat 不重新拉 history, 依赖 in-memory 缓存 (启动时
+  // refreshAll 拉过, 后续 message:event push 新 in 消息)。
+  // lastMessageAt 稳定, 排序不乱。
+  // 唯一例外: state.history[renderedID] 还没 init, 拉一次。
+  if (!state.history.has(renderedID)) {
+    try {
+      const r = await HistoryGroup(renderedID);
+      const msgs = (r && r.messages) || [];
+      state.history.set(renderedID, msgs);
+    } catch (e) {
+      state.history.set(renderedID, []);
+      toast(`读取群历史失败: ${e}`);
+    }
   }
+  const inMsgs = state.history.get(renderedID) ?? [];
+  const inCount = inMsgs.filter(x => x.Direction === 'in').length;
+  state.lastReadIdx.set(renderedID, inCount);
+  state.groupUnread.set(renderedID, 0);
+  savePersisted();
   renderPeerList();
   renderGroupList();
   // v1.2.4+ 11:55 修 user 11:55 报"建群之后, 消息列表里
@@ -1899,6 +1947,38 @@ async function refreshAll() {
     // member of is auto-added to chatList so its row shows
     // up in the chat view.
     for (const g of state.groups) if (g.self) addChatMember(g.group_id);
+    // 2026-07-13 17:01 user 报 B 真因: 之前启动时只 addChatMember
+    // **有 history 的** peer (msgs.length > 0 才加) — 没
+    // 聊过的新 peer row 启动时不显示, 3-5 秒后 message:event
+    // 1st in 触发 placeholder 才显示 (用户看着是"个人消息 3-5
+    // 秒后才出现"). 修法: 启动时**所有** discovered peer 都
+    // addChatMember, 不管有没有 history. 群同样所有 self 群
+    // 都加 (line 1936 已经做了, OK). row 启动时**就**显示,
+    // 跟"群先 / 个人后" 同步 race 无关了. history 部分继续拉
+    // (下面循环), 没历史的 peer 拉到 msgs = [], state.history
+    // 设为空数组, lastMessageAt = 0, 排序走末尾 — OK.
+    for (const p of state.peers) {
+      addChatMember(p.PeerID);
+    }
+    // 2026-07-13 17:01: 启动时也拉群 history, 跟 selectGroup
+    // 同路径 (state.history.set + filter in + lastReadIdx),
+    // 这样群 row 也有 lastMessageAt, 排序稳定. 之前群 row
+    // lastMessageAt = 0 (history 没 init) 排最后, 切到群后
+    // 才拉到 (line 1966 selectGroup 末尾), 切到群前/切到
+    // 个人时群 row 排最末, 看着是"群聊穿插到个人消息中".
+    // 现在启动时一次拉好, state.history 缓存 in-memory, 后
+    // 续 selectGroup 不重拉 (line 1966 修过)。
+    for (const g of state.groups) {
+      if (!g.self) continue;
+      try {
+        const r = await HistoryGroup(g.group_id);
+        const msgs = (r && r.messages) || [];
+        state.history.set(g.group_id, msgs);
+        const inCount = msgs.filter(x => x.Direction === 'in').length;
+        const lastRead = state.lastReadIdx.get(g.group_id) || 0;
+        state.groupUnread.set(g.group_id, Math.max(0, inCount - lastRead));
+      } catch { /* ignore */ }
+    }
     // v1.2.4+ 修 (2026-07-11 22:18): chat history
     // 持久化 — 关闭 innerlink 后 state 全部重置, 重启
     // 拉 chat.enc 拉 history for each peer, if history
@@ -1910,21 +1990,18 @@ async function refreshAll() {
       try {
         const h = await History(p.PeerID);
         const msgs = (h as node.Message[]) || [];
-        if (msgs.length > 0) {
-          state.history.set(p.PeerID, msgs);
-          // v1.2.4+ 08:55 改回 lastReadIdx 语义: 红点 =
-          // filter in - lastReadIdx[peerId]. startup 时
-          // 拉 history 后用持久化的 lastReadIdx[peerId]
-          // (loadPersisted 启动时已读) 算 unread. 持久化的
-          // lastReadIdx 来自上次 selectPeer / selectGroup
-          // 末尾 set 的值, 跟重启前状态对齐. 没持久化
-          // lastReadIdx 的 peer (第一次启动) 默认 0, 红点
-          // = filter in (切走后对方发 in 数).
-          const inCount = msgs.filter(x => x.Direction === 'in').length;
-          const lastRead = state.lastReadIdx.get(p.PeerID) || 0;
-          state.unreadCount.set(p.PeerID, Math.max(0, inCount - lastRead));
-          addChatMember(p.PeerID);
-        }
+        state.history.set(p.PeerID, msgs);
+        // v1.2.4+ 08:55 改回 lastReadIdx 语义: 红点 =
+        // filter in - lastReadIdx[peerId]. startup 时
+        // 拉 history 后用持久化的 lastReadIdx[peerId]
+        // (loadPersisted 启动时已读) 算 unread. 持久化的
+        // lastReadIdx 来自上次 selectPeer / selectGroup
+        // 末尾 set 的值, 跟重启前状态对齐. 没持久化
+        // lastReadIdx 的 peer (第一次启动) 默认 0, 红点
+        // = filter in (切走后对方发 in 数).
+        const inCount = msgs.filter(x => x.Direction === 'in').length;
+        const lastRead = state.lastReadIdx.get(p.PeerID) || 0;
+        state.unreadCount.set(p.PeerID, Math.max(0, inCount - lastRead));
       } catch { /* ignore — peer 也许没 history */ }
     }
     renderMe();
