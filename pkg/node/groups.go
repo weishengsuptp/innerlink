@@ -832,6 +832,55 @@ func (n *Node) deleteGroupDirsLocal(renderedID string) error {
 // next reconnect via a future TypeGroupRosterSync-pull
 // API (v1.1.x TODO). This is not new in 1.1.2 — the same
 // caveat applies to the accept path CreatorOnAccept.
+// DeleteGroupChat clears the chat.enc file under a group
+// directory WITHOUT touching members.json / sender-keys/
+// or broadcasting a roster update. Differs from LeaveGroup
+// (full leave) in that the group itself stays visible in
+// the sidebar; the user keeps their membership / contact
+// way, the only thing that disappears is the message
+// history. New messages from any member cause the row to
+// reappear naturally (frontend message:event handler
+// addChatMember-if-missing path).
+//
+// 2026-07-13 user requirement: "delete chat item clears the
+// message history but keeps the contact way intact — when
+// someone in the group sends a new message, the row
+// reappears". The clear path is "soft": not a real leave,
+// just a wipe of the visible message log on this device.
+func (n *Node) DeleteGroupChat(renderedID string) error {
+	if n.ctx == nil {
+		return errors.New("node: not started")
+	}
+	// Parse just to validate the renderedID format. We
+	// don't need rawID — storage.DeleteGroupChat works on
+	// the rendered form (it builds the on-disk path from
+	// renderedGroupID directly).
+	if _, err := group.ParseGroupID(renderedID); err != nil {
+		return err
+	}
+	if n.chatStore == nil {
+		return errors.New("node: chat store not initialised")
+	}
+	if err := n.chatStore.DeleteGroupChat(renderedID); err != nil {
+		return fmt.Errorf("delete group chat: %w", err)
+	}
+	// Drop the in-memory cache slice for this group so the
+	// next History() / message:event reflects the wipe
+	// without a ReadAll refresh (same pattern as
+	// DeleteHistory for peers).
+	n.historyMu.Lock()
+	filtered := n.history[:0:0]
+	for _, rec := range n.history {
+		if rec.GroupID == renderedID {
+			continue
+		}
+		filtered = append(filtered, rec)
+	}
+	n.history = filtered
+	n.historyMu.Unlock()
+	return nil
+}
+
 func (n *Node) LeaveGroup(renderedID string) error {
 	rawID, err := group.ParseGroupID(renderedID)
 	if err != nil {

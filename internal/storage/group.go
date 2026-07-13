@@ -137,6 +137,29 @@ func (s *Store) HistoryGroup(renderedGroupID string) ([]*Record, error) {
 // here forces openGroupFile's MkdirAll + fresh-handle path
 // to run on the next AppendGroup, so re-join recovers
 // cleanly.
+// DeleteGroupChat deletes ONLY the chat.enc file under the
+// group directory, leaving members.json + sender-keys/ + the
+// directory itself intact. Used by the 2026-07-13 user
+// requirement: "delete chat item clears the message history
+// but keeps the group membership / contact way intact —
+// when someone in the group sends a new message, the row
+// reappears naturally". Distinguishes from DeleteGroup
+// (full leave) which nukes the entire group directory.
+//
+// Evicts the cached groupFile handle so the next AppendGroup
+// recreates chat.enc on demand. Returns nil if chat.enc
+// didn't exist (idempotent — "delete what's there").
+func (s *Store) DeleteGroupChat(renderedGroupID string) error {
+	s.groupMu.Lock()
+	delete(s.groupFiles, renderedGroupID)
+	s.groupMu.Unlock()
+	chatPath := filepath.Join(s.SaveDir(), GroupDirName, renderedGroupID, GroupChatFileName)
+	if err := os.Remove(chatPath); err != nil && !os.IsNotExist(err) {
+		return fmt.Errorf("storage: delete group chat %s: %w", renderedGroupID, err)
+	}
+	return nil
+}
+
 func (s *Store) DeleteGroup(renderedGroupID string) error {
 	// Evict FIRST so a concurrent AppendGroup that arrives
 	// after our os.RemoveAll but races on groupMu can't find

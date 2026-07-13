@@ -967,6 +967,28 @@ func (a *App) ClearHistory(peerRef string) string {
 	return ""
 }
 
+// ClearGroupChat deletes the chat.enc file under a group
+// directory without touching members.json or sender-keys/.
+// Distinct from ClearHistory (peer-only) and from leaving
+// the group — this is the "soft wipe" the 2026-07-13 user
+// requirement: "delete the chat row clears the message
+// history but the contact way stays intact — when someone
+// in the group sends a new message, the row reappears
+// naturally". Returns "" on success, error message on
+// failure.
+func (a *App) ClearGroupChat(renderedID string) string {
+	if a.nd == nil {
+		return "node not started"
+	}
+	if renderedID == "" {
+		return "rendered group id is empty"
+	}
+	if err := a.nd.DeleteGroupChat(renderedID); err != nil {
+		return err.Error()
+	}
+	return ""
+}
+
 // CancelFile aborts an in-flight outbound file transfer.
 // fileID matches the data-file-id on the sender's
 // progress bubble. Returns "" on success, error message

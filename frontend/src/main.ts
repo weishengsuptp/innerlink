@@ -44,6 +44,8 @@ import './app.css';
 
 import {
   CancelFile,
+  ClearGroupChat,
+  ClearHistory,
   CreateGroup,
   DebugReveal,
   History,
@@ -1793,6 +1795,28 @@ function renderChatList() {
     });
   }
   out.innerHTML = rows.join('');
+  // 2026-07-13 11:02 user 拍板 #4 右键菜单: 给 chat list
+  // 里的 .peer row 挂 contextmenu 事件, 弹通用
+  // showChatItemContextMenu(x, y, id, isGroup). 触发器放
+  // 在 renderChatList 末尾 (每次重渲染都重新挂, 不会
+  // 漏新 row). isGroup 看 row 是不是 .peer.group class
+  // (line 1792 group-list data-group / line 1798 peer-list
+  // data-peer). 同一 row 多次渲染会重复挂 listener —
+  // 因为 outerHTML clone 出来的新元素, 旧 listener 跟旧
+  // DOM 一起被 innerHTML 替换清掉, 不重复触发. 不用
+  // removeEventListener 显式清.
+  out.querySelectorAll<HTMLElement>('.peer').forEach(el => {
+    el.addEventListener('contextmenu', (ev) => {
+      ev.preventDefault();
+      ev.stopPropagation();
+      const isGroup = el.classList.contains('group');
+      const id = isGroup
+        ? el.getAttribute('data-group')
+        : el.getAttribute('data-peer');
+      if (!id) return;
+      showChatItemContextMenu(ev.clientX, ev.clientY, id, isGroup);
+    });
+  });
 }
 
 async function refreshAll() {
@@ -2135,6 +2159,157 @@ function showGroupContextMenu(x: number, y: number, gid: string) {
   // the click that opened the menu doesn't immediately
   // close it (it bubbles after the menu item's listener
   // fires).
+  setTimeout(() => {
+    const onOutside = (ev: MouseEvent) => {
+      if (menu.contains(ev.target as Node)) return;
+      menu.remove();
+      document.removeEventListener('click', onOutside);
+    };
+    document.addEventListener('click', onOutside);
+  }, 0);
+}
+
+// showChatItemContextMenu is the 2026-07-13 user-required
+// right-click menu for any chat list row (个人 + 群共用).
+// Two top items + a separator + the destructive "delete":
+//   1. 置顶 (if state.pinnedAt.has(id)) / 取消置顶 (else)
+//   2. <separator> (CSS .ctx-menu-sep)
+//   3. 删除 (red .danger)
+//
+// Differences from the older showGroupContextMenu (which
+// currently only shows "退出群聊" for group rows):
+//   - Generic for peer + group; the same id resolution
+//     path is used (peer = data-peer, group = data-group).
+//   - No "退出群聊" — per the 2026-07-13 09:37 user
+//     feedback, the leave-group affordance moves to the
+//     chat-header ⋯ + group-settings drawer footer (a
+//     separate #6 commit). The right-click menu no longer
+//     carries it.
+//   - Pin / unpin writes state.pinnedAt (Date.now()) and
+//     triggers renderChatList / renderGroupList /
+//     renderPeerList to re-sort.
+//   - Delete wipes the chat.enc file (peer → App.ClearHistory,
+//     group → App.ClearGroupChat) and removes the id from
+//     state.chatList. New messages from this peer/group
+//     cause the row to reappear via the existing
+//     message:event addChatMember-if-missing path (the
+//     same one fixed in 4934caa for the "1 in 0 红点"
+//     1st-in漏红点 bug).
+async function showChatItemContextMenu(
+  x: number, y: number, id: string, isGroup: boolean,
+) {
+  // Tear down any previous menu (group-ctx-menu + chat-ctx-menu
+  // share the same id namespace to keep this simple).
+  document.getElementById('chat-ctx-menu')?.remove();
+  document.getElementById('group-ctx-menu')?.remove();
+  const menu = document.createElement('div');
+  menu.id = 'chat-ctx-menu';
+  menu.className = 'ctx-menu';
+  menu.style.left = x + 'px';
+  menu.style.top = y + 'px';
+
+  // 1) Pin / unpin — toggles state.pinnedAt and re-renders
+  // the three lists (chat list + peer list + group list) so
+  // the sort reflects the new pinnedAt ordering.
+  const isPinned = state.pinnedAt.has(id);
+  const pinItem = document.createElement('div');
+  pinItem.className = 'ctx-menu-item';
+  pinItem.textContent = isPinned ? '取消置顶' : '置顶';
+  pinItem.addEventListener('click', () => {
+    menu.remove();
+    if (isPinned) {
+      state.pinnedAt.delete(id);
+    } else {
+      state.pinnedAt.set(id, Date.now());
+    }
+    savePersisted();
+    renderPeerList();
+    renderGroupList();
+    renderChatList();
+  });
+  menu.appendChild(pinItem);
+
+  // 2) Separator — visual divider between the pin/unpin
+  // action and the destructive delete. CSS .ctx-menu-sep
+  // adds a 1px line + vertical margins.
+  const sep = document.createElement('div');
+  sep.className = 'ctx-menu-sep';
+  menu.appendChild(sep);
+
+  // 3) Delete — red destructive action. The confirmation
+  // dialog uses window.confirm (same UX as leaveGroup).
+  // The Go call is what does the on-disk wipe:
+  //   peer: App.ClearHistory(peerRef)  (alias or 32-hex)
+  //   group: App.ClearGroupChat(renderedID)
+  // We then drop the in-memory state.history[id] and
+  // remove id from state.chatList so the row disappears
+  // immediately. Subsequent messages from this peer/group
+  // trigger message:event → addChatMember-if-missing
+  // (line 4934caa 修过的) → re-render → row reappears
+  // naturally. This matches the user requirement: "delete
+  // the chat item clears the message history but the
+  // contact way stays intact — when someone sends a new
+  // message, the row reappears".
+  const delItem = document.createElement('div');
+  delItem.className = 'ctx-menu-item danger';
+  delItem.textContent = '删除';
+  delItem.addEventListener('click', async () => {
+    menu.remove();
+    const label = isGroup
+      ? (state.groups.find(g => g.group_id === id)?.group_name || id)
+      : (state.peers.find(p => p.PeerID === id)?.SelfAlias || id);
+    const ok = window.confirm(
+      isGroup
+        ? `删除群 "${label}" 的聊天记录？群本身和成员保留，新消息会重新显示。`
+        : `删除与 "${label}" 的聊天记录？对方和你都不会再看到这些消息（仅本机）。`,
+    );
+    if (!ok) return;
+    let err = '';
+    if (isGroup) {
+      const r = await ClearGroupChat(id);
+      err = r || '';
+    } else {
+      // ClearHistory expects peerRef (alias or 32-hex). We
+      // pass the peerID directly — the Go side resolves
+      // either form via resolvePeerRef.
+      const r = await ClearHistory(id);
+      err = r || '';
+    }
+    if (err) {
+      toast(`删除失败: ${err}`, 'error');
+      return;
+    }
+    // Drop the in-memory message cache so any open chat
+    // panel for this id renders empty after the wipe.
+    state.history.delete(id);
+    state.unreadCount.delete(id);
+    state.groupUnread.delete(id);
+    state.lastReadIdx.delete(id);
+    // Pull the id from the chat list so the row is gone
+    // immediately. New messages re-add it via the
+    // message:event addChatMember path.
+    if (state.chatList) state.chatList.delete(id);
+    savePersisted();
+    renderPeerList();
+    renderGroupList();
+    renderChatList();
+    if (state.selectedId === id) {
+      // The user just deleted the currently-open chat.
+      // Close the chat pane rather than show an empty
+      // pane. (Same as how LeaveGroup handles the
+      // currently-selected case.)
+      state.selectedId = null;
+      renderChatHeader();
+      renderMessages();
+    }
+    toast(isGroup ? '群消息已删除' : '聊天记录已删除');
+  });
+  menu.appendChild(delItem);
+
+  document.body.appendChild(menu);
+  // Close on outside click — wrap in setTimeout(0) so the
+  // opening right-click doesn't immediately close the
+  // menu before the user can move the cursor over an item.
   setTimeout(() => {
     const onOutside = (ev: MouseEvent) => {
       if (menu.contains(ev.target as Node)) return;

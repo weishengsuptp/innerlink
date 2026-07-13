@@ -1192,6 +1192,14 @@ body {
 .ctx-menu-item:hover { background: var(--bg); }
 .ctx-menu-item.danger { color: #b91c1c; }
 .ctx-menu-item.danger:hover { background: #fee2e2; }
+/* 2026-07-13 11:02 user 拍板 #4 右键菜单: 置顶/取消置顶
+ * 跟 红色的"删除" 之间用分割线区分. 1px 横线 + 上下
+ * 4px margin, 跟 ctx-menu 圆角 + 内部 padding 协调. */
+.ctx-menu-sep {
+  height: 1px;
+  margin: 4px 6px;
+  background: var(--border);
+}
 .history-item-meta {
   display: flex;
   justify-content: space-between;
