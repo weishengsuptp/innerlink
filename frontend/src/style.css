@@ -352,11 +352,18 @@ body {
   align-items: center;
   padding: 10px 14px;
   border-radius: 8px;
-  cursor: pointer;
+  /* 2026-07-13 10:55 user 拍板 #2 hover 样式: 鼠标指针
+   * (cursor) 保持默认箭头 (不是手指, 因为点 row 是切换
+   * chat 不算"链接"), hover 时给浅色底纹 (rgba 0,0,0,0.04)
+   * 做标识. cursor: default + 浅色 hover 是微信 / IM 风格
+   * 列表行交互标准, 比 cursor: pointer 跟 hover 同时
+   * 出现更"稳重". .peer.active 主色背景优先级 > hover. */
+  cursor: default;
   transition: background 0.12s;
 }
 .peer:hover { background: rgba(0,0,0,0.04); }
 .peer.active { background: var(--primary-soft); }
+.peer.active:hover { background: var(--primary-soft); }
 .peer.active .peer-name { color: var(--text); font-weight: 600; }
 
 /* v1.2.2 render 输出用 .peer-dot（圆点状态），demo 拍板用
@@ -504,11 +511,18 @@ body {
   align-items: center;
   padding: 10px;
   border-radius: 8px;
-  cursor: pointer;
+  /* 2026-07-13 10:55 user 拍板 #2 hover 样式: 跟 chat view
+   * 同一规则 cursor: default (默认箭头, 不是手指) +
+   * hover 浅色 (rgba 0,0,0,0.04, 跟 chat view 一致).
+   * 之前 contacts view 0.025 比 chat view 0.04 浅一半,
+   * user 8:48 没说分, 统一用 0.04 更明显. .peer.active
+   * 主色背景优先级 > hover (line 360 跟 518 同样保留). */
+  cursor: default;
   transition: background 0.12s;
 }
-.peer:hover { background: rgba(0,0,0,0.025); }
+.peer:hover { background: rgba(0,0,0,0.04); }
 .peer.active { background: var(--primary-soft); }
+.peer.active:hover { background: var(--primary-soft); }
 .peer.active .peer-name { color: var(--text); font-weight: 600; }
 .peer-dot {
   width: 8px; height: 8px; border-radius: 50%; justify-self: center;
