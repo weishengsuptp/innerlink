@@ -313,6 +313,25 @@ function loadPersisted(): void {
         }
       }
     }
+    // 2026-07-13 17:47 user 报新 bug: 之前 chatList (Set)
+    // 没持久化, 关 exe 再开, 之前在通讯录点过 / 聊过 / 收
+    // 过 in 消息的所有 chat (含个人) 全部丢失 — 启动时
+    // refreshAll 只 addChatMember 当前 ListPeers 拉到的
+    // discovered peer, UDP 还没扫到的 peer (比如 user 启
+    // 动时"大刘"还没被发现, log 显示只 a07db75e + 2a9a6c13
+    // 2 个 peer) 不会进 chatList, 聊天列表 view 看不见。
+    // 群 OK 是因为 line 1949 `if (g.self) addChatMember`
+    // 直接 addChatMember, 不依赖 UDP discovery — 个人没
+    // 这条路径。修法: chatList 持久化到 PERSIST_KEY, 加
+    // 载时反序列回 Set (过滤 0/空字符串/非字符串 id, 防
+    // 脏数据)。Set 不能 JSON.stringify, 存 Array。
+    if (Array.isArray(data.chatList)) {
+      for (const id of data.chatList) {
+        if (typeof id === 'string' && id.length > 0) {
+          state.chatList.add(id);
+        }
+      }
+    }
   } catch {
     // ignore — first launch or corrupt state
   }
@@ -330,6 +349,19 @@ function savePersisted(): void {
         [...state.pinnedAt].filter(([, ts]) =>
           typeof ts === 'number' && ts > 0 && Number.isFinite(ts) && ts <= Date.now() + 60_000
         )
+      ),
+      // 2026-07-13 17:47 user 报新 bug: 之前 chatList 没
+      // 持久化。修法: Set 转 Array 存 (Set 不能 JSON.stringify),
+      // 加载时反序列回 Set。注意 12d4ff9 时定的 chatList
+      // 填充路径: (1) refreshAll 启动时 if (msgs.length > 0)
+      // addChatMember (有 history 的 peer) (2) message:event
+      // in 兜底 addChatMember (3) 群 line 1949 self 群都加
+      // (4) 通讯录点 → selectPeer/selectGroup addChatMember。
+      // 之前关 exe 再开 (1)(2)(3)(4) 全部不重跑 (除了 (3)
+      // 群), 个人 chat 全部丢。现在存 PERSIST_KEY 保留,
+      // 启动时 loadPersisted 直接还原 — 跟 pinnedAt 同思路。
+      chatList: Array.from(state.chatList).filter(id =>
+        typeof id === 'string' && id.length > 0
       ),
     };
     localStorage.setItem(PERSIST_KEY, JSON.stringify(data));
