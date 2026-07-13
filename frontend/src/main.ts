@@ -46,7 +46,6 @@ import {
   CancelFile,
   CreateGroup,
   DebugReveal,
-  DialAddr,
   History,
   HistoryGroup,
   InviteToGroup,
@@ -56,7 +55,6 @@ import {
   ListPeers,
   OpenPath,
   PickFile,
-  Ping,
   ReceivedFilePath,
   RevealInFolder,
   Scan,
@@ -684,12 +682,6 @@ function mount() {
             <div class="sub" id="chat-id">—</div>
           </div>
           <div class="header-actions">
-            <button class="icon-btn" id="btn-ping" title="ping" disabled>
-              <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M22 12h-4l-3 9L9 3l-3 9H2"/></svg>
-            </button>
-            <button class="icon-btn" id="btn-dial" title="发文件" disabled>
-              <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="m21.44 11.05-9.19 9.19a6 6 0 0 1-8.49-8.49l9.19-9.19a4 4 0 0 1 5.66 5.66l-9.2 9.19a2 2 0 0 1-2.83-2.83l8.49-8.48"/></svg>
-            </button>
             <button class="icon-btn" id="btn-group-settings" title="群设置" disabled>
               <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2"><circle cx="12" cy="5" r="1.5"/><circle cx="12" cy="12" r="1.5"/><circle cx="12" cy="19" r="1.5"/></svg>
             </button>
@@ -1095,8 +1087,6 @@ function renderChatHeader() {
   const avatar = document.getElementById('chat-avatar')!;
   const name = document.getElementById('chat-name')!;
   const sub = document.getElementById('chat-id')!;
-  const pingBtn = document.getElementById('btn-ping') as HTMLButtonElement;
-  const dialBtn = document.getElementById('btn-dial') as HTMLButtonElement;
   // v1.1: btn-more removed — history lives in composer
   // toolbar now (📜 button + drawer).
   const attachBtn = document.getElementById('btn-attach') as HTMLButtonElement;
@@ -1116,11 +1106,6 @@ function renderChatHeader() {
     avatar.textContent = '#';
     name.textContent = g.group_name || '(未命名群组)';
     sub.textContent = `${g.members.length} 成员${g.self ? '' : ' · 只读'}`;
-    // Ping/dial aren't meaningful for groups (we don't
-    // call Ping / DialAddr on a group ID — they're per
-    // member channels handled internally by the Go side).
-    pingBtn.disabled = true;
-    dialBtn.disabled = true;
     // v1.1.1: enable group settings when we're in a
     // group conversation. WeChat-style ⋯ → 群设置
     // panel. Disabled for "g_<id> not in state.groups"
@@ -1146,8 +1131,6 @@ function renderChatHeader() {
     avatar.textContent = '?';
     name.textContent = '未选择 peer';
     sub.textContent = '—';
-    pingBtn.disabled = true;
-    dialBtn.disabled = true;
     attachBtn.disabled = true;
     input.disabled = true;
     send.disabled = true;
@@ -1169,8 +1152,6 @@ function renderChatHeader() {
   }
   if (p.Addrs[0]) subParts.push(p.Addrs[0]);
   sub.textContent = subParts.join(' · ') || '—';
-  pingBtn.disabled = !p.Online;
-  dialBtn.disabled = !p.Online;
   attachBtn.disabled = false;
   input.disabled = false;
   send.disabled = false;
@@ -2318,20 +2299,6 @@ async function promptScan() {
   if (!cidr) return;
   const r = await Scan(cidr.trim());
   if (r) toast(`扫描: ${r}`);
-}
-
-async function promptDial() {
-  if (!state.selectedId) return;
-  const p = selectedPeer();
-  if (!p || p.Addrs.length === 0) {
-    const addr = window.prompt(`手动填 ${shortId(state.selectedId)} 的 ip:port:`);
-    if (!addr) return;
-    const r = await DialAddr(addr.trim());
-    if (r) toast(`连接: ${r}`);
-  } else {
-    const r = await DialAddr(p.Addrs[0]);
-    if (r) toast(`连接: ${r}`);
-  }
 }
 
 // ----- group settings panel (v1.1.1, 2026-06-29) -----
@@ -3503,12 +3470,6 @@ function wireEvents() {
   });
 
   // Header icon buttons.
-  document.getElementById('btn-ping')!.addEventListener('click', async () => {
-    if (!state.selectedId) return;
-    const r = await Ping(state.selectedId);
-    if (r) toast(`ping: ${r}`);
-  });
-  document.getElementById('btn-dial')!.addEventListener('click', () => promptDial());
   document.getElementById('btn-history')!.addEventListener('click', () => toggleHistoryDrawer());
   // v1.1.1 (2026-06-29): group settings (⋯) button →
   // open the WeChat-style right-side panel.
