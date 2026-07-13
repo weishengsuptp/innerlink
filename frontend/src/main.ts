@@ -205,6 +205,16 @@ interface UIState {
   // hex or group id) that have been chatted with —
   // drives chat view rows + "已加" pill in contacts view.
   chatList: Set<string>;
+  // 2026-07-13 11:02 user 拍板 #3 排序 + #4 置顶: pinnedAt 是
+  // 渲染置顶排序的时间戳 (Date.now() ms). 排序规则 (user
+  // 9:37 明确): chat list 行按最后一条 in/out 消息时间
+  // (lastMessageAt) 降序, 越新越上; 置顶项排最顶层, 多个
+  // 置顶按 pinnedAt 升序 (先置顶在前, 后置顶在后). 取消
+  // 置顶从 pinnedAt 删, 回到未置顶组按 lastMessageAt 排序.
+  // 持久化: localStorage (跟 unreadCount 一样, 改时调
+  // savePersisted, 重启后保留). 右键菜单 (#4) 触发
+  // pinnedAt.set(id, Date.now()) / pinnedAt.delete(id).
+  pinnedAt: Map<string, number>;
 }
 
 interface FileBubbleState {
@@ -259,6 +269,11 @@ const state: UIState = {
   // set. Drives the chat view; the contacts view marks
   // these with a small "已加" pill.
   chatList: new Set<string>(),
+  // 2026-07-13 11:02 user 拍板 #3 排序 + #4 置顶: 置顶
+  // 时间戳 map. 渲染 (renderGroupList + renderPeerList
+  // + renderContactList) 比较 pinnedAt.get(id) || Infinity
+  // 升序 (置顶在最上, 多置顶先置顶在前, 未置顶排后).
+  pinnedAt: new Map(),
 };
 
 // ----- 持久化: selectedId + lastReadIdx -----
@@ -901,15 +916,22 @@ function renderMe() {
 
 function renderPeerList() {
   const list = document.getElementById('peer-list')!;
-  // Sort: online first, then recent, then offline; within
-  // each group, most recently seen first.
-  const order = { online: 0, recent: 1, offline: 2 } as const;
+  // 2026-07-13 11:02 user 拍板 #3 排序: 置顶 (pinnedAt
+  // 升序) + lastMessageAt 降序 (越新越上). 之前 online
+  // 优先 + LastSeen 降序 (line 906-913 旧版) 取消 —
+  // user 9:37 明确"任何场景都是这套排序" (online / offline
+  // / recent 不再分组, 全部按 lastMessageAt 排). 没消息
+  // 的 peer (getLastMessageAt = 0) 排最后. LastSeen 仍
+  // 保留字段 (online 状态判断还用, line 1024-1025 显示用),
+  // 只是不再决定排序位置. 多个置顶按 pinnedAt 升序.
   const sorted = [...state.peers].sort((a, b) => {
-    const sa = order[peerState(a)], sb = order[peerState(b)];
-    if (sa !== sb) return sa - sb;
-    const at = a.LastSeen ? new Date(a.LastSeen).getTime() : 0;
-    const bt = b.LastSeen ? new Date(b.LastSeen).getTime() : 0;
-    return bt - at;
+    const pa = getPinnedRank(a.PeerID);
+    const pb = getPinnedRank(b.PeerID);
+    if (pa !== pb) return pa - pb;
+    const ta = getLastMessageAt(a.PeerID);
+    const tb = getLastMessageAt(b.PeerID);
+    if (ta !== tb) return tb - ta;
+    return 0;
   });
 
   list.innerHTML = sorted.map(p => {
@@ -1016,10 +1038,21 @@ function lastMessageTs(peerId: string, fallback?: string): string {
 function renderGroupList() {
   const list = document.getElementById('group-list');
   if (!list) return;
+  // 2026-07-13 11:02 user 拍板 #3 排序: 置顶 (pinnedAt
+  // 升序, 先置顶在前) + lastMessageAt 降序 (越新越上).
+  // 之前 self 群优先 + group_name 字典序 (line 1019-1024
+  // 旧版) 取消 — user 9:37 明确"任何场景都是这套排序"
+  // (不论群 / 个人, 不论 self 还是加入, 不论有名还是匿名).
+  // 没消息的群 (getLastMessageAt = 0) 排最后. group_name
+  // localeCompare 留作兜底 (lastMessageAt 相同的两群按
+  // 名字排, 不会乱).
   const sorted = [...state.groups].sort((a, b) => {
-    const sa = a.self ? 0 : 1;
-    const sb = b.self ? 0 : 1;
-    if (sa !== sb) return sa - sb;
+    const pa = getPinnedRank(a.group_id);
+    const pb = getPinnedRank(b.group_id);
+    if (pa !== pb) return pa - pb;
+    const ta = getLastMessageAt(a.group_id);
+    const tb = getLastMessageAt(b.group_id);
+    if (ta !== tb) return tb - ta;
     return (a.group_name || '').localeCompare(b.group_name || '');
   });
   list.innerHTML = sorted.map(g => {
@@ -1712,6 +1745,23 @@ function renderContactList() {
   });
 }
 
+
+// 2026-07-13 11:02 user 拍板 #3 排序: chat list 行按
+// 最后一条 in/out 消息时间 (不论收到还是发出, 越新越上)
+// 排序. 置顶项排最顶层, 多个置顶按 pinnedAt 升序 (先置顶
+// 在前). helper getLastMessageAt(id) 看 state.history[id]
+// 最后一条消息的 Timestamp 转 ms, 没有消息返回 0 (没活跃
+// 排最后). getPinnedRank(id) 返回 sorted 时用的复合 key
+// (pinnedAt 数小优先; Infinity = 未置顶, 排未置顶后).
+function getLastMessageAt(id: string): number {
+  const hist = state.history.get(id);
+  if (!hist || hist.length === 0) return 0;
+  const last = hist[hist.length - 1];
+  return last.Timestamp ? new Date(last.Timestamp).getTime() : 0;
+}
+function getPinnedRank(id: string): number {
+  return state.pinnedAt.get(id) ?? Infinity;
+}
 
 function renderChatList() {
   // v1.2.4 (2026-07-11): 消息 view 只显示 chatList —
