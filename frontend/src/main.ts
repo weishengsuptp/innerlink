@@ -1947,19 +1947,18 @@ async function refreshAll() {
     // member of is auto-added to chatList so its row shows
     // up in the chat view.
     for (const g of state.groups) if (g.self) addChatMember(g.group_id);
-    // 2026-07-13 17:01 user 报 B 真因: 之前启动时只 addChatMember
-    // **有 history 的** peer (msgs.length > 0 才加) — 没
-    // 聊过的新 peer row 启动时不显示, 3-5 秒后 message:event
-    // 1st in 触发 placeholder 才显示 (用户看着是"个人消息 3-5
-    // 秒后才出现"). 修法: 启动时**所有** discovered peer 都
-    // addChatMember, 不管有没有 history. 群同样所有 self 群
-    // 都加 (line 1936 已经做了, OK). row 启动时**就**显示,
-    // 跟"群先 / 个人后" 同步 race 无关了. history 部分继续拉
-    // (下面循环), 没历史的 peer 拉到 msgs = [], state.history
-    // 设为空数组, lastMessageAt = 0, 排序走末尾 — OK.
-    for (const p of state.peers) {
-      addChatMember(p.PeerID);
-    }
+    // 2026-07-13 17:38 user 拍板回退: 17:01 我加的
+    // "for (p of state.peers) addChatMember" 错了 — user
+    // 明确"聊天都是通过通讯录点击对应的好友, 然后在聊天
+    // 窗口自动出现对应的聊天列表, 现在我直接打开自动就
+    // 出现了, 你这么改就不对了". 通讯录 view (#list-contacts)
+    // 才显示所有 discovered peer, 聊天列表 view (#list-chat)
+    // 只显示**点过/聊过**的 chat. 修法: 删掉那一行, 恢复
+    // 12d4ff9 时定的 `if (msgs.length > 0) addChatMember` 逻辑
+    // — 只 addChatMember **有 history 的 peer** (即聊过/在通
+    // 讯录点过切到 chat 触发了 selectPeer). 新 peer 第一次 in
+    // 消息来时, message:event handler (line 4336) addChatMember
+    // 兜底, 让 row 出现 — 跟 17:01 之前的行为一致。
     // 2026-07-13 17:01: 启动时也拉群 history, 跟 selectGroup
     // 同路径 (state.history.set + filter in + lastReadIdx),
     // 这样群 row 也有 lastMessageAt, 排序稳定. 之前群 row
