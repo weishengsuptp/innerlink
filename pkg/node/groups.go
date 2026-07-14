@@ -1139,7 +1139,7 @@ func (n *Node) SendGroupFile(rawGroupID []byte, filePath, baseFileID string) ([]
 			memberShort = memberShort[:8]
 		}
 		memberFileID := baseFileID + "_" + memberShort
-		if err := n.sendGroupFileToOne(st.ch, filePath, name, size, memberFileID, rendered); err != nil {
+		if err := n.sendGroupFileToOne(st.ch, filePath, name, size, memberFileID, rendered, st.rcv.WaitForReply); err != nil {
 			log.Printf("[WARN  ] SendGroupFile send to %s: %v", mem.PeerID, err)
 			continue
 		}
@@ -1166,7 +1166,7 @@ func (n *Node) SendGroupFile(rawGroupID []byte, filePath, baseFileID string) ([]
 // reads until EOF. We use os.Open (not os.OpenFile)
 // so the default perms match what SendFile does for
 // 1:1 sends.
-func (n *Node) sendGroupFileToOne(ch *protocol.Channel, filePath, name string, size int64, memberFileID, renderedGroupID string) error {
+func (n *Node) sendGroupFileToOne(ch *protocol.Channel, filePath, name string, size int64, memberFileID, renderedGroupID string, waitForReply filetransfer.WaitForReplyFunc) error {
 	f, err := os.Open(filePath)
 	if err != nil {
 		return fmt.Errorf("open: %w", err)
@@ -1215,7 +1215,7 @@ func (n *Node) sendGroupFileToOne(ch *protocol.Channel, filePath, name string, s
 		lastFlush = now
 		windowBytes = 0
 	}
-	if err := filetransfer.Send(n.ctx, ch, f, size, name, memberFileID, renderedGroupID, progressFn, nil); err != nil {
+	if err := filetransfer.Send(n.ctx, ch, f, size, name, memberFileID, renderedGroupID, progressFn, waitForReply); err != nil {
 		// Surface the per-member failure to the GUI. The
 		// bubble will get a 'done' event with ok=false; the
 		// GUI's existing file:event 'done' handler shows
